@@ -1,0 +1,40 @@
+services:
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    env_file:
+      - ../.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - tapestry-data:/app/data
+      - ${TAPESTRY_WORKSPACE_ROOT}:/workspace
+      - ~/.gitconfig:/root/.gitconfig:ro
+      # macOS Docker Desktop's ssh-agent forwarding socket — commits/pushes from inside the
+      # container use the host's real SSH identity, per the git-credentials setup note in
+      # project_structure.md's Docker section
+      - /run/host-services/ssh-auth.sock:/ssh-agent
+    environment:
+      TAPESTRY_DB_PATH: /app/data/tapestry.sqlite
+      TAPESTRY_CHECKPOINT_PATH: /app/data/tapestry_checkpoints.sqlite
+      TAPESTRY_WORKSPACE_ROOT: /workspace
+      SSH_AUTH_SOCK: /ssh-agent
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  web:
+    build:
+      context: ../web
+      dockerfile: Dockerfile
+    env_file:
+      - ../.env
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://backend:8000
+    depends_on:
+      - backend
+
+volumes:
+  tapestry-data:
