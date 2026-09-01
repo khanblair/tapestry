@@ -154,7 +154,9 @@ tapestry/
 │       │   └── test_terminal.py
 │       └── adapters/
 │           ├── test_discord_adapter.py
-│           └── test_telegram_adapter.py
+│           ├── test_telegram_adapter.py
+│           └── test_web_adapter.py             # was missing before this pass — the web_adapter had no
+│                                               # backend-side test at all
 │
 ├── web/                                        # Next.js frontend — all ten screens from the prototype,
 │   │                                           # not the four the first draft of this doc actually listed
