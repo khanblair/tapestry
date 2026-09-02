@@ -61,6 +61,41 @@ async def _run_graph(tmp_path, conversation_id: str):
 
 
 # ---------------------------------------------------------------------------
+# graph_thread_id -- the real LangGraph checkpoint thread a turn ran on
+# (tapestry_mentions_concurrency_status_spec.md §2.2/§2.3's foundation)
+# ---------------------------------------------------------------------------
+
+
+async def test_turn_start_records_the_real_graph_thread_id_not_the_conversation_id():
+    """Foundational to fan-out (§2.2): a turn/start's `graph_thread_id`
+    must reflect the ACTUAL LangGraph checkpoint thread this invocation
+    ran on, sourced from LangGraph's own injected `RunnableConfig` -- not
+    assumed to equal `conversation_id`. Proven here by deliberately using
+    a DIFFERENT thread_id than conversation_id, exactly the shape a
+    fan-out leg will have (its own thread, same conversation's event log).
+    """
+    import tempfile
+
+    conversation_id = "conv-graph-thread-id-1"
+    fanout_thread_id = "conv-graph-thread-id-1::mention::rex::msg-1"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        graph = await build.build_graph(f"{tmp}/checkpoint.sqlite")
+        try:
+            call_model_mock = AsyncMock(return_value=_plain_response("hi"))
+            with patch.object(build, "call_model", call_model_mock):
+                state = build.new_state(conversation_id, "rex")
+                config = {"configurable": {"thread_id": fanout_thread_id}}
+                await graph.ainvoke(state, config)
+
+            logged = events_module.read_events(conversation_id)
+            turn_start = next(e for e in logged if e.type == "turn/start")
+            assert turn_start.payload["graph_thread_id"] == fanout_thread_id
+        finally:
+            await graph.checkpointer.conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Static registry/schema sanity
 # ---------------------------------------------------------------------------
 
@@ -413,7 +448,7 @@ async def test_turn_budget_exceeded_raises_before_any_side_effect(tmp_path):
     state["turn_count"] = 10  # DEFAULT_MAX_TURNS
 
     with pytest.raises(TurnBudgetExceeded):
-        await build.persona_node(state)
+        await build.persona_node(state, {"configurable": {"thread_id": conversation_id}})
 
     # Never got far enough to write anything -- the check runs before any
     # event-log write.

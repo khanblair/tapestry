@@ -130,6 +130,7 @@ import uuid
 from pathlib import Path
 from typing import Awaitable, Callable, Literal, TypedDict
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
@@ -861,9 +862,19 @@ def _chat_messages_from_log(conversation_id: str, persona: Persona) -> list[dict
 # ---------------------------------------------------------------------------
 
 
-async def persona_node(state: TapestryGraphState) -> dict:
+async def persona_node(state: TapestryGraphState, config: RunnableConfig) -> dict:
     conversation_id = state["conversation_id"]
     turn_count = state.get("turn_count", 0)
+    # The REAL LangGraph checkpoint thread this invocation is running on --
+    # `conversation_id` for an ordinary turn, or a tag-all fan-out leg's own
+    # thread (see web_adapter/api.py's fan-out spawner and
+    # tapestry_mentions_concurrency_status_spec.md §2.2). Sourced from
+    # LangGraph's own `RunnableConfig` rather than a second, hand-threaded
+    # field on `TapestryGraphState` -- verified directly (a real node
+    # invocation asserting this matches the `thread_id` passed into
+    # `.astream()`/`.ainvoke()`) that LangGraph actually injects `config`
+    # into a node function declaring this exact type, before relying on it.
+    graph_thread_id = config["configurable"]["thread_id"]
 
     # persona lookup moved ahead of the turn-cap check (previously first)
     # specifically so persona.max_turns can override the global default —
@@ -893,7 +904,10 @@ async def persona_node(state: TapestryGraphState) -> dict:
     turn_id = state.get("turn_id")
     if turn_id is None:
         turn_start_event = events.append_event(
-            conversation_id, "turn/start", actor=persona.id, payload=_with_thread(state, {})
+            conversation_id,
+            "turn/start",
+            actor=persona.id,
+            payload=_with_thread(state, {"graph_thread_id": graph_thread_id}),
         )
         turn_id = turn_start_event.id
 
