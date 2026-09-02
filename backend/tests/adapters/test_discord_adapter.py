@@ -77,6 +77,7 @@ def make_client(graph: object | None = None) -> bot.TapestryDiscordClient:
     client.graph = graph
     client._known_conversations = set()
     client._in_flight_resumes = set()
+    client._turns_in_flight = set()
     client._connection = SimpleNamespace(user=SimpleNamespace(id=999))
     client.add_view = MagicMock()
     return client
@@ -842,6 +843,94 @@ class TestDriveGraphAgainstARealGraph:
                 )
                 ask_answered = next(e for e in logged_after if e.type == "ask/answered")
                 assert ask_answered.payload["answers"][0]["selected"] == ["approve"]
+        finally:
+            await graph.checkpointer.conn.close()
+
+    async def test_second_on_message_rejected_while_first_paused_and_original_still_resumable(
+        self, tmp_path
+    ):
+        """`tapestry_mentions_concurrency_status_spec.md` §1's concurrency
+        bug, through the real `on_message` entry point rather than
+        `drive_graph` directly (`test_pause_then_resume_end_to_end` above
+        proves resume mechanics against a real graph; this proves the
+        concurrency GUARD sitting in front of it). Before the fix, a second
+        message arriving while the first is paused at a real approval
+        silently clobbered that checkpoint instead of erroring.
+        """
+        from unittest.mock import patch
+
+        from tapestry.graph import build as graph_build
+        from tapestry.tools.file_editor import ToolResult
+
+        conversation_id = "discord-42"
+        checkpoint_path = str(tmp_path / "checkpoint.sqlite")
+        graph = await graph_build.build_graph(checkpoint_path)
+        try:
+            propose = _tool_call_model_response(
+                "I'll edit the file.",
+                "file_editor",
+                {"command": "create", "path": "/tmp/x.txt", "file_text": "hi"},
+            )
+            final = _plain_model_response("All done, file created.")
+            call_model_mock = AsyncMock(side_effect=[propose, final])
+
+            async def fake_file_editor(arguments: dict) -> ToolResult:
+                return ToolResult(text="wrote it", is_error=False)
+
+            client = make_client(graph)
+            channel = make_channel(discord.DMChannel, 42)
+
+            with patch.object(graph_build, "call_model", call_model_mock), patch.dict(
+                graph_build.TOOL_REGISTRY, {"file_editor": fake_file_editor}
+            ):
+                # "Rex" (matches the fixture persona's `.name`, see
+                # resolve_persona_id) -- the default persona (Ada) has no
+                # mutating tools and would never pause on an approval.
+                first_message = make_message("Rex, please create /tmp/x.txt", channel=channel)
+                await bot.TapestryDiscordClient.on_message(client, first_message)
+
+                # Paused: a real ApproveReject prompt went out.
+                logged = events_module.read_events(conversation_id)
+                assert any(e.type == "ask/requested" for e in logged)
+                assert not any(e.type == "tool/result" for e in logged)
+
+                # A second, unrelated message arrives while that approval
+                # is still pending -- must be rejected, not silently
+                # clobber the paused checkpoint.
+                channel.send.reset_mock()
+                second_message = make_message("never mind, ignore that", channel=channel)
+                await bot.TapestryDiscordClient.on_message(client, second_message)
+
+                channel.send.assert_awaited_once()
+                (warning_text,), _ = channel.send.await_args
+                assert "still working" in warning_text or "waiting" in warning_text
+
+                logged_after_second = events_module.read_events(conversation_id)
+                assert not any(
+                    e.payload.get("text") == "never mind, ignore that"
+                    for e in logged_after_second
+                    if e.type == "user/message"
+                ), "the rejected second message must never have been recorded"
+
+                # The ORIGINAL approval must still be exactly where it was
+                # -- resume it the same way handle_approval_click does, and
+                # confirm it's still the real pending interrupt, not
+                # something a clobber silently replaced.
+                placeholder = MagicMock()
+                placeholder.edit = AsyncMock()
+                placeholder.delete = AsyncMock()
+                post_as_persona = AsyncMock()
+                with patch.object(webhook_identity, "post_as_persona", post_as_persona):
+                    await bot.TapestryDiscordClient.drive_graph(
+                        client, channel, conversation_id, Command(resume=True), placeholder
+                    )
+
+                post_as_persona.assert_awaited_once()
+                args, _ = post_as_persona.await_args
+                assert args[2] == "All done, file created."
+
+                logged_final = events_module.read_events(conversation_id)
+                assert any(e.type == "tool/result" for e in logged_final)
         finally:
             await graph.checkpointer.conn.close()
 

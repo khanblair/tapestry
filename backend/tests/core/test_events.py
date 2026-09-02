@@ -5,6 +5,7 @@ from tapestry.core.events import (
     TapestryEvent,
     append_event,
     close_orphaned_turns,
+    find_open_turns,
     read_events,
     read_recent_events,
 )
@@ -108,6 +109,69 @@ def test_close_orphaned_turns_only_closes_the_orphan_among_several():
 
     assert len(closed) == 1
     assert closed[0].payload["turn_id"] == open_start.id
+
+
+def test_find_open_turns_empty_log_returns_empty_dict():
+    assert find_open_turns([]) == {}
+
+
+def test_find_open_turns_closed_turn_is_not_open():
+    start = append_event("conv-1", "turn/start", "human", {})
+    append_event("conv-1", "turn/end", "ada", {"turn_id": start.id, "reason": "done"})
+
+    assert find_open_turns(read_events("conv-1")) == {}
+
+
+def test_find_open_turns_returns_the_unmatched_start():
+    start = append_event("conv-1", "turn/start", "human", {})
+
+    open_turns = find_open_turns(read_events("conv-1"))
+
+    assert list(open_turns.keys()) == [start.id]
+    assert open_turns[start.id] == start
+
+
+def test_find_open_turns_multiple_closed_one_open():
+    closed_start = append_event("conv-1", "turn/start", "human", {})
+    append_event("conv-1", "turn/end", "ada", {"turn_id": closed_start.id, "reason": "done"})
+    open_start = append_event("conv-1", "turn/start", "human", {})
+
+    open_turns = find_open_turns(read_events("conv-1"))
+
+    assert list(open_turns.keys()) == [open_start.id]
+
+
+def test_find_open_turns_several_open_at_once_are_all_returned():
+    # Pre-fan-out this shouldn't occur in practice (see the module docstring's
+    # documented-not-enforced invariant), but the scan itself makes no
+    # assumption about how many are open -- that's what makes it reusable
+    # once concurrent fan-out legs exist.
+    first = append_event("conv-1", "turn/start", "human", {})
+    second = append_event("conv-1", "turn/start", "human", {})
+
+    open_turns = find_open_turns(read_events("conv-1"))
+
+    assert list(open_turns.keys()) == [first.id, second.id]
+
+
+def test_find_open_turns_ignores_turn_end_with_no_turn_id():
+    start = append_event("conv-1", "turn/start", "human", {})
+    append_event("conv-1", "turn/end", "system", {"reason": ORPHAN_REPAIR_REASON})
+
+    open_turns = find_open_turns(read_events("conv-1"))
+
+    assert list(open_turns.keys()) == [start.id]
+
+
+def test_close_orphaned_turns_still_works_after_sharing_find_open_turns():
+    # Regression guard for the refactor onto find_open_turns: same behavior,
+    # not just "the new function works in isolation."
+    start = append_event("conv-1", "turn/start", "human", {})
+
+    closed = close_orphaned_turns("conv-1")
+
+    assert len(closed) == 1
+    assert closed[0].payload["turn_id"] == start.id
 
 
 def test_read_recent_events_spans_every_conversation():

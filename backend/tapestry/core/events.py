@@ -211,20 +211,22 @@ def read_recent_events(types: set[str] | None = None, limit: int = 50) -> list[T
     ]
 
 
-def close_orphaned_turns(conversation_id: str) -> list[TapestryEvent]:
-    """Close any `turn/start` in this conversation with no matching `turn/end`.
+def find_open_turns(events: list[TapestryEvent]) -> dict[str, TapestryEvent]:
+    """Return every `turn/start` in `events` with no matching `turn/end`,
+    keyed by the `turn/start` event's own id, in the order each was opened.
 
     A `turn/start` is "matched" when some later `turn/end` event's
-    `payload["turn_id"]` equals the `turn/start` event's `id`. Any
-    `turn/start` left unmatched after scanning the whole log gets a
-    synthetic `turn/end` appended, with `actor="system"` and
-    `payload={"turn_id": <start id>, "reason": ORPHAN_REPAIR_REASON}`.
+    `payload["turn_id"]` equals its id. This is the one shared scan
+    `close_orphaned_turns` (crash-recovery repair) and the turn-concurrency
+    guard (`web_adapter/api.py`'s `send_message` and the Discord/Telegram
+    equivalents — reject a new turn while one is already open) both need;
+    extracted so the matching logic exists in exactly one place instead of
+    being hand-rolled at each call site.
 
-    Returns the list of synthetic repair events created (empty if nothing
-    was orphaned). Intended to be called once per conversation at
-    startup/resume, before any new turn begins.
+    Pre-fan-out (see `graph_thread_id`, added alongside tag-all), at most
+    one entry is ever returned per conversation — that invariant is
+    documented, not enforced, at the top of this module.
     """
-    events = read_events(conversation_id)
     open_starts: dict[str, TapestryEvent] = {}
     for event in events:
         if event.type == "turn/start":
@@ -233,6 +235,22 @@ def close_orphaned_turns(conversation_id: str) -> list[TapestryEvent]:
             turn_id = event.payload.get("turn_id")
             if turn_id is not None:
                 open_starts.pop(turn_id, None)
+    return open_starts
+
+
+def close_orphaned_turns(conversation_id: str) -> list[TapestryEvent]:
+    """Close any `turn/start` in this conversation with no matching `turn/end`.
+
+    Any `turn/start` left unmatched after scanning the whole log (see
+    `find_open_turns`) gets a synthetic `turn/end` appended, with
+    `actor="system"` and
+    `payload={"turn_id": <start id>, "reason": ORPHAN_REPAIR_REASON}`.
+
+    Returns the list of synthetic repair events created (empty if nothing
+    was orphaned). Intended to be called once per conversation at
+    startup/resume, before any new turn begins.
+    """
+    open_starts = find_open_turns(read_events(conversation_id))
 
     closed: list[TapestryEvent] = []
     for turn_id in open_starts:

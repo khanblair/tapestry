@@ -376,6 +376,117 @@ def test_full_turn_over_websocket_with_approval_interrupt_and_resume(client, mon
     assert sum(1 for e in logged if e.type == "tool/result") == 1
 
 
+def test_second_message_rejected_while_first_turn_still_running(client, monkeypatch):
+    """`tapestry_mentions_concurrency_status_spec.md` §1's concurrency bug,
+    the "actively running" half: proven (before the fix) to silently
+    overwrite the checkpoint rather than error. `call_model` hangs so the
+    first turn's `turn/start` is durably logged and the background task is
+    genuinely still executing when the second `send_message` call arrives.
+    """
+    hang = asyncio.Event()
+
+    async def never_returns(*args, **kwargs):
+        await hang.wait()
+        return _plain_response("finally done")
+
+    monkeypatch.setattr(graph_build, "call_model", never_returns)
+
+    conversation_id = "dm-rex"
+    first = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "first"}
+    )
+    assert first.status_code == 201
+
+    second = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "second"}
+    )
+    assert second.status_code == 409
+    assert "turn in progress" in second.json()["detail"]
+
+    # only the first message was ever recorded -- the rejected send must
+    # not have appended anything to the log.
+    logged_texts = [
+        e.payload.get("text") for e in events_module.read_events(conversation_id)
+        if e.type == "user/message"
+    ]
+    assert logged_texts == ["first"]
+
+    hang.set()  # let the background task unwind before the DB closes
+
+
+def test_second_message_rejected_while_first_turn_paused_at_approval_and_original_still_resumable(
+    client, monkeypatch
+):
+    """The exact clobber scenario this bug was found from: before the fix,
+    a fresh `new_state()` while a turn is paused at a real approval
+    `interrupt()` silently overwrote the checkpoint (`pending_tool_call` ->
+    `None`, `interrupts` -> `[]`, no exception) and orphaned the original
+    approval so resuming it later returned an unrelated turn's result
+    instead of erroring or honoring the human's actual decision.
+    """
+    call_count = {"file_editor": 0}
+
+    async def fake_file_editor(arguments: dict) -> ToolResult:
+        call_count["file_editor"] += 1
+        return ToolResult(text="wrote the file", is_error=False)
+
+    propose = _tool_call_response(
+        "I'll create the file.",
+        "file_editor",
+        {"command": "create", "path": "/tmp/x.txt", "file_text": "hi"},
+    )
+    final = _plain_response("Done, file created.")
+    monkeypatch.setattr(graph_build, "call_model", AsyncMock(side_effect=[propose, final]))
+    monkeypatch.setitem(graph_build.TOOL_REGISTRY, "file_editor", fake_file_editor)
+
+    conversation_id = "dm-rex"
+    send_res = client.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "please create /tmp/x.txt"},
+    )
+    assert send_res.status_code == 201
+
+    import time
+
+    pending_id = None
+    for _ in range(50):
+        messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+        approvals = [m for m in messages if m.get("approval")]
+        if approvals:
+            pending_id = approvals[0]["approval"]["id"]
+            break
+        time.sleep(0.05)
+    assert pending_id is not None, "approval never appeared"
+    assert call_count["file_editor"] == 0
+
+    # A second, unrelated message arrives while that approval is still
+    # pending -- must be rejected, not silently clobber the checkpoint.
+    clobber_res = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "never mind, ignore that"}
+    )
+    assert clobber_res.status_code == 409
+
+    # The ORIGINAL approval must still be exactly where it was and still
+    # correctly resumable -- proving nothing overwrote it.
+    answer_res = client.post(
+        f"/api/conversations/{conversation_id}/ask/{pending_id}/answer",
+        json={"selected": ["approve"]},
+    )
+    assert answer_res.status_code == 204
+
+    texts: list[str] = []
+    for _ in range(50):
+        messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+        texts = [m["text"] for m in messages]
+        if "Done, file created." in texts:
+            break
+        time.sleep(0.05)
+    assert call_count["file_editor"] == 1, "the original approval's tool call must actually run"
+    assert "Done, file created." in texts
+    # the rejected second send must never have been recorded or answered
+    assert "never mind, ignore that" not in texts
+
+
 def test_answer_ask_batch_endpoint_resumes_too(client, monkeypatch):
     call_count = {"terminal": 0}
 

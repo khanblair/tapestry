@@ -383,6 +383,14 @@ class TapestryDiscordClient(discord.Client):
         # always re-check every conversation it touches for real.
         self._known_conversations: set[str] = set()
         self._in_flight_resumes: set[tuple[str, str]] = set()
+        # In-memory guard against the concurrency bug documented in
+        # `tapestry_mentions_concurrency_status_spec.md` §1 -- mirrors
+        # web_adapter/api.py's `app.state.turns_in_flight`. Closes the
+        # narrow window a pure event-log read can't: two near-simultaneous
+        # messages before the first turn's own `turn/start` event even
+        # lands in the log. `drive_graph` clears an entry in a `finally` on
+        # every exit path.
+        self._turns_in_flight: set[str] = set()
 
     # -- startup -------------------------------------------------------
 
@@ -447,6 +455,37 @@ class TapestryDiscordClient(discord.Client):
         conversation_id = conversation_id_for_channel(channel)
         thread_id = thread_id_for_channel(channel)
         await self.ensure_conversation(conversation_id, is_dm=is_dm)
+
+        # Concurrency guard -- see web_adapter/api.py's
+        # `_reject_if_turn_in_progress` and
+        # tapestry_mentions_concurrency_status_spec.md §1: a fresh
+        # `new_state()` on a conversation that already has a turn running or
+        # paused at an approval silently clobbers the LangGraph checkpoint
+        # instead of erroring. `ensure_conversation` just above only repairs
+        # CRASHED turns; a turn open here is real, in-flight-or-paused
+        # state. Two checks, same split as the web adapter's: the in-memory
+        # set catches this process actively mid-turn (including the window
+        # before its `turn/start` event has even landed in the log); the
+        # log scan catches a turn left open by a previous process.
+        if conversation_id in self._turns_in_flight:
+            await channel.send(
+                "_Still working on the last message here -- send this again in a "
+                "moment._"
+            )
+            return
+        open_turns = events.find_open_turns(events.read_events(conversation_id))
+        if open_turns:
+            stalled_persona = list(open_turns.values())[-1].actor
+            await channel.send(
+                f"_{stalled_persona} is still working on the last message (or waiting "
+                "on your approval) -- send this again once that's done._"
+            )
+            return
+        # Marked synchronously, no `await` since the checks above -- so a
+        # second near-simultaneous on_message can't slip through before
+        # this one's `turn/start` lands in the log. `drive_graph` clears it
+        # in a `finally` on every exit path.
+        self._turns_in_flight.add(conversation_id)
 
         persona_id = resolve_persona_id(content)
         payload = {"text": content}
@@ -539,38 +578,47 @@ class TapestryDiscordClient(discord.Client):
         config = {"configurable": {"thread_id": conversation_id}}
 
         try:
-            async for frame in self.graph.astream(
-                graph_input, config=config, stream_mode="custom"
-            ):
-                await self._apply_stream_frame(placeholder, frame)
-            snapshot = await self.graph.aget_state(config)
-        except Exception as exc:  # noqa: BLE001 -- see docstring above
-            await self._apply_error(placeholder, exc)
-            return
+            try:
+                async for frame in self.graph.astream(
+                    graph_input, config=config, stream_mode="custom"
+                ):
+                    await self._apply_stream_frame(placeholder, frame)
+                snapshot = await self.graph.aget_state(config)
+            except Exception as exc:  # noqa: BLE001 -- see docstring above
+                await self._apply_error(placeholder, exc)
+                return
 
-        persona_id = snapshot.values.get("persona_id", DEFAULT_PERSONA_ID)
-        persona = PERSONAS.get(persona_id)
+            persona_id = snapshot.values.get("persona_id", DEFAULT_PERSONA_ID)
+            persona = PERSONAS.get(persona_id)
 
-        if snapshot.interrupts:
-            await self._post_approval_request(
-                channel, conversation_id, persona, snapshot.interrupts[0], placeholder
+            if snapshot.interrupts:
+                await self._post_approval_request(
+                    channel, conversation_id, persona, snapshot.interrupts[0], placeholder
+                )
+                return
+
+            final_text = last_assistant_text(snapshot.values.get("messages", [])) or (
+                "(no response)"
             )
-            return
+            try:
+                await placeholder.delete()
+            except discord.HTTPException:
+                pass
 
-        final_text = last_assistant_text(snapshot.values.get("messages", [])) or (
-            "(no response)"
-        )
-        try:
-            await placeholder.delete()
-        except discord.HTTPException:
-            pass
+            if persona is None:
+                await channel.send(final_text)
+                return
 
-        if persona is None:
-            await channel.send(final_text)
-            return
-
-        webhook_channel, extra_kwargs = _webhook_target(channel)
-        await webhook_identity.post_as_persona(webhook_channel, persona, final_text, **extra_kwargs)
+            webhook_channel, extra_kwargs = _webhook_target(channel)
+            await webhook_identity.post_as_persona(
+                webhook_channel, persona, final_text, **extra_kwargs
+            )
+        finally:
+            # Mirrors web_adapter/api.py's `_drive_turn` finally: this
+            # conversation is no longer "actively executing in this
+            # process" once this function returns, whatever the reason --
+            # see `on_message`'s `_turns_in_flight` guard docstring.
+            self._turns_in_flight.discard(conversation_id)
 
     async def _apply_stream_frame(self, placeholder: discord.Message, frame: dict) -> None:
         text = render_stream_frame(frame)

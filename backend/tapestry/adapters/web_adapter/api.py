@@ -700,6 +700,57 @@ def _ensure_orphans_closed(conversation_id: str, app: FastAPI) -> None:
     closed.add(conversation_id)
 
 
+def _reject_if_turn_in_progress(app: FastAPI, conversation_id: str) -> None:
+    """Guard against the concurrency bug found while scoping tag-all (see
+    `tapestry_mentions_concurrency_status_spec.md` §1): `graph_build.
+    new_state()` + a fresh turn on a conversation that already has one
+    running or paused at an approval `interrupt()` silently CLOBBERS the
+    LangGraph checkpoint instead of erroring — proven directly against a
+    real graph, not assumed.
+
+    Two checks, covering two different gaps:
+    - `app.state.turns_in_flight` (in-memory, this process only) — catches
+      a turn between "about to spawn" and "`_drive_turn` returned," closing
+      the narrow window a pure event-log read can't: two near-simultaneous
+      sends (a double-click, a client retry) before the first turn's own
+      `turn/start` event even lands in the log.
+    - `find_open_turns` (`core/events.py`) — the same open-turn/close-turn
+      scan `close_orphaned_turns` already uses for crash recovery, reading
+      the durable log. A turn open here is NOT a crash artifact (orphans
+      are already repaired by `_ensure_orphans_closed`, called just before
+      this from every caller) — it's real in-flight-or-paused state, and
+      it's what still catches a turn left open by a *previous* process
+      (`turns_in_flight` is empty again after any restart).
+
+    409, not silently dropping or queueing the new message: queueing is
+    explicitly deferred (see the spec doc) as more work than a v1 needs —
+    honest failure first, on the message that triggered it, not some later
+    resume click.
+    """
+    if conversation_id in app.state.turns_in_flight:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"conversation {conversation_id!r} already has a turn in progress "
+                "-- wait for it to finish before sending another message"
+            ),
+        )
+    open_turns = events.find_open_turns(events.read_events(conversation_id))
+    if not open_turns:
+        return
+    # Most recently opened, for the error message -- see find_open_turns'
+    # own docstring: pre-fan-out at most one is ever open anyway.
+    turn = list(open_turns.values())[-1]
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"conversation {conversation_id!r} already has a turn in progress "
+            f"(persona {turn.actor!r} is still running or waiting on your approval) "
+            "-- wait for it to finish before sending another message"
+        ),
+    )
+
+
 def _ensure_conversation(conversation_id: str, app: FastAPI) -> sqlite3.Row:
     row = _get_conversation_row(conversation_id)
     if row is None:
@@ -1006,6 +1057,16 @@ async def _drive_turn(app: FastAPI, conversation_id: str, graph_input: Any) -> N
             app, conversation_id, {"type": "turn/error", "payload": {"error": str(exc)}}
         )
         raise
+    finally:
+        # See `_spawn_turn`'s docstring / `_reject_if_turn_in_progress`:
+        # this conversation is no longer "actively executing in this
+        # process" the moment this function returns, whether that's a
+        # natural end, a pause at an approval interrupt, or a raised
+        # exception -- all three are legitimate reasons a NEW message
+        # should be allowed to try again (the interrupt case still gets
+        # caught by `find_open_turns`' durable log check, which this
+        # in-memory set was never meant to replace).
+        app.state.turns_in_flight.discard(conversation_id)
 
 
 _RESUME_POLL_INTERVAL_SECONDS = 0.1
@@ -1023,7 +1084,15 @@ def _spawn_turn(app: FastAPI, conversation_id: str, graph_input: Any) -> None:
     with no corresponding cleanup. Tracking + cancel-and-await at shutdown
     is correct resource hygiene on its own terms, independent of whether
     any specific downstream test is sensitive to it.
+
+    Also where `conversation_id` is marked in `app.state.turns_in_flight`
+    (see `_reject_if_turn_in_progress`) — every path that starts or resumes
+    a turn (`send_message`, `_resume_with_answer`) goes through here, so
+    marking it once in this shared spot covers both rather than repeating
+    it at each caller. `_drive_turn` clears it in a `finally` on every exit
+    path (natural end, paused at an interrupt, or a raised exception).
     """
+    app.state.turns_in_flight.add(conversation_id)
     task = asyncio.create_task(_drive_turn(app, conversation_id, graph_input))
     app.state.background_tasks.add(task)
     task.add_done_callback(app.state.background_tasks.discard)
@@ -1094,6 +1163,18 @@ async def create_app() -> FastAPI:
         # records a tool call's FINAL result (tool/result), never "still
         # running" — see _record_running_activity and GET /api/activity.
         app.state.running_activity = {}
+        # In-memory, per-process guard against the concurrency bug in
+        # `_reject_if_turn_in_progress`'s own docstring: `conversation_id`s
+        # with a turn currently between "about to spawn" and "_drive_turn
+        # has returned." Closes the narrow TOCTOU gap a pure event-log scan
+        # can't -- two near-simultaneous sends (a double-click, a client
+        # retry) racing the moment before the first turn's own `turn/start`
+        # event is even committed. Added to synchronously (no `await`
+        # between the check and the add — see `send_message`), so within
+        # one process this is exact, not best-effort; the event-log scan
+        # alongside it is what still catches a turn left open by a
+        # *previous* process (this set is empty again after any restart).
+        app.state.turns_in_flight = set()
         try:
             yield
         finally:
@@ -1234,6 +1315,7 @@ async def create_app() -> FastAPI:
                 status_code=422,
                 detail=f"conversation {conversation_id!r} has no personas to respond",
             )
+        _reject_if_turn_in_progress(app, conversation_id)
         message = _append_user_message(conversation_id, body.text)
 
         # Judgment call 3: the lead/entry persona for this turn.
