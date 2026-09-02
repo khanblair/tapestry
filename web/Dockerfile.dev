@@ -1,0 +1,17 @@
+# Dev image: installs dependencies into the image, then docker-compose.dev.yml
+# bind-mounts the real web/ source over /app at runtime — Next.js Fast Refresh
+# picks up changes live, no rebuild. node_modules and .next live in their own
+# anonymous volumes (see compose file) so the bind mount doesn't wipe out
+# installed dependencies or Next's build cache.
+
+FROM node:22-slim
+WORKDIR /app
+RUN corepack enable
+ENV CI=true
+
+COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml* ./
+RUN pnpm install --frozen-lockfile || pnpm install
+
+EXPOSE 3000
+
+CMD ["pnpm", "dev"]

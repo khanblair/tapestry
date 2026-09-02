@@ -1,0 +1,28 @@
+# Dev image. Build context is the REPO ROOT (see docker-compose.dev.yml),
+# same reason and same host-mirroring layout as the production Dockerfile
+# (/app == repo root, /app/backend == this directory, /app/personas and
+# /app/skills siblings of it) -- see that file's comment for why this
+# layout is load-bearing, not stylistic.
+#
+# docker-compose.dev.yml bind-mounts backend/, personas/, and skills/ over
+# their COPY'd counterparts at runtime, so code and content changes are
+# live immediately; the COPY here exists only so `uv sync` has something
+# to build against during the image build itself.
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir uv
+
+COPY backend/pyproject.toml backend/uv.lock* backend/
+COPY personas ./personas
+COPY skills ./skills
+
+WORKDIR /app/backend
+COPY backend/tapestry ./tapestry
+RUN uv sync --frozen || uv sync
+
+EXPOSE 8000
+
+CMD ["uv", "run", "python", "-m", "tapestry.main"]

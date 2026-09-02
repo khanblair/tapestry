@@ -1,14 +1,21 @@
 services:
   backend:
     build:
-      context: ../backend
-      dockerfile: Dockerfile
+      context: .. # repo root -- backend/Dockerfile also needs personas/ and skills/, siblings of backend/
+      dockerfile: backend/Dockerfile
     env_file:
       - ../.env
     ports:
       - "8000:8000"
     volumes:
       - tapestry-data:/app/data
+      # Bind-mounted from the host, not baked into the image: persona edits
+      # made through the running app (core.personas.save_persona, via the
+      # web adapter's create/update endpoints) write back to these YAML
+      # files. Without this mount those writes would land on the
+      # container's own ephemeral filesystem layer and vanish on recreate.
+      - ../personas:/app/personas
+      - ../skills:/app/skills
       - ${TAPESTRY_WORKSPACE_ROOT}:/workspace
       - ~/.gitconfig:/root/.gitconfig:ro
       # macOS Docker Desktop's ssh-agent forwarding socket — commits/pushes from inside the

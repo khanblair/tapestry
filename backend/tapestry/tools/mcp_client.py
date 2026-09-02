@@ -77,6 +77,10 @@ __all__ = ["ToolResult", "MetaMCPClient"]
 _DEFAULT_METAMCP_URL = "http://localhost:12008/metamcp/tapestry/mcp"
 
 
+class MetaMCPConfigurationError(Exception):
+    """Raised when connecting without a configured METAMCP_API_KEY."""
+
+
 class MetaMCPClient:
     """Client for one metamcp Endpoint, using the official ``mcp`` SDK.
 
@@ -94,6 +98,16 @@ class MetaMCPClient:
 
     @asynccontextmanager
     async def _session(self) -> AsyncIterator[ClientSession]:
+        # An empty api_key produces a literal "Bearer " header value, which
+        # httpx2 rejects at request time with an opaque LocalProtocolError
+        # ("Illegal header value") deep inside a TaskGroup — found by
+        # actually testing an unconfigured client, not anticipated up
+        # front. Fail loud and clear here instead, before that point.
+        if not self.api_key:
+            raise MetaMCPConfigurationError(
+                "METAMCP_API_KEY is not set — configure it in .env before connecting "
+                "(see docs/vendor-research/ANALYSIS-metamcp.md for how to provision one)."
+            )
         http_client = httpx2.AsyncClient(headers={"Authorization": f"Bearer {self.api_key}"})
         async with streamable_http_client(self.url, http_client=http_client) as (read, write):
             async with ClientSession(read, write) as session:

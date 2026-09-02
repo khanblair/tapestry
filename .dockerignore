@@ -1,0 +1,13 @@
+# Build context is the repo root (needed so backend's Dockerfiles can also
+# reach the root-level personas/ and skills/ content directories) -- keep
+# out everything a backend or web image build doesn't need.
+.git
+docs/
+web/node_modules
+web/.next
+web/test-results
+web/playwright-report
+backend/.venv
+backend/tests
+**/__pycache__
+**/*.pyc
