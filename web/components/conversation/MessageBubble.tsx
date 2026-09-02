@@ -1,10 +1,13 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { AskQuestion, Message, Persona } from "@/lib/api";
 import { PersonaAvatar, YouAvatar } from "@/components/persona/PersonaAvatar";
 import { ActivityBlock } from "./ActivityBlock";
 import { DiffChip } from "./DiffChip";
 import { formatClockTime } from "@/lib/time";
+import { remarkMentions } from "@/lib/remarkMentions";
 
 export interface MessageBubbleProps {
   message: Message;
@@ -25,22 +28,22 @@ export interface MessageBubbleProps {
   renderApproval?: (approval: AskQuestion) => ReactNode;
 }
 
-/** Very small inline formatter for the prototype's two message-text conventions: `@Mention` and `` `code` ``. */
+/**
+ * Full markdown rendering for message text (bold/italic, lists, headers,
+ * code blocks/spans, links, tables via remark-gfm) plus this app's own
+ * `@handle` mention highlighting, via a custom remark plugin
+ * (lib/remarkMentions.ts) that wraps each mention in a real `span.mention`
+ * element at the AST level — see that file's own comment for why this
+ * needs `data.hName`/`hProperties` rather than a `components` override —
+ * so react-markdown renders it natively, no special-casing needed here.
+ *
+ * Replaces the previous plain-text `` `code` ``/`@mention`-only formatter:
+ * LLM replies routinely include real markdown (headers, bullet lists,
+ * bold text) that was rendering as literal `**text**`/`- item` before
+ * this — found via real browser testing, not in the original scope doc.
+ */
 function renderMessageText(text: string) {
-  const parts = text.split(/(`[^`]+`|@\w+)/g);
-  return parts.map((part, i) => {
-    if (part.startsWith("`") && part.endsWith("`")) {
-      return <code key={i}>{part.slice(1, -1)}</code>;
-    }
-    if (part.startsWith("@")) {
-      return (
-        <span key={i} className="mention">
-          {part}
-        </span>
-      );
-    }
-    return part;
-  });
+  return <ReactMarkdown remarkPlugins={[remarkGfm, remarkMentions]}>{text}</ReactMarkdown>;
 }
 
 export function MessageBubble({ message, actorPersona, renderApproval }: MessageBubbleProps) {

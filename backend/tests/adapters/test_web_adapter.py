@@ -557,6 +557,52 @@ def test_second_message_rejected_while_first_turn_still_running(client, monkeypa
     hang.set()  # let the background task unwind before the DB closes
 
 
+def test_a_crashed_turn_self_heals_instead_of_wedging_the_conversation(client, monkeypatch):
+    """Found via real browser testing (not in the original scope doc): a
+    turn that raises inside `graph.astream` (a bad provider API key here,
+    but any unhandled exception behaves the same) left its own `turn/start`
+    open forever before this fix -- the actor stayed "busy" and every
+    subsequent message to this conversation 409'd from
+    `_reject_if_turn_in_progress`, with no repair short of a full process
+    restart. `_drive_turn`'s except-block now calls
+    `events.close_turn_on_thread` right there, so the very next send
+    succeeds instead of 409ing.
+    """
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("simulated provider failure (e.g. bad API key)")
+
+    monkeypatch.setattr(graph_build, "call_model", boom)
+
+    conversation_id = "dm-rex"
+    first = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "first"}
+    )
+    assert first.status_code == 201
+
+    import time
+
+    for _ in range(50):
+        logged = events_module.read_events(conversation_id)
+        if any(e.type == "turn/end" for e in logged):
+            break
+        time.sleep(0.05)
+
+    turn_ends = [e for e in logged if e.type == "turn/end"]
+    assert len(turn_ends) == 1
+    assert turn_ends[0].payload["reason"] == events_module.TURN_ERROR_REASON
+
+    # Without the fix, this second send 409s ("turn in progress") forever --
+    # the crashed turn's own `turn/start` was never matched, so
+    # `_reject_if_turn_in_progress`'s `find_open_turns` scan still sees it
+    # as open.
+    monkeypatch.setattr(graph_build, "call_model", AsyncMock(return_value=_plain_response("recovered")))
+    second = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "second"}
+    )
+    assert second.status_code == 201
+
+
 def test_second_message_rejected_while_first_turn_paused_at_approval_and_original_still_resumable(
     client, monkeypatch
 ):
@@ -1263,11 +1309,11 @@ def test_activity_running_survives_two_concurrent_fanout_legs(client, monkeypatc
     vex_hang = asyncio.Event()
 
     async def smart_call_model(model, messages, tools=None, **kwargs):
-        if model == "claude-opus-4-6":  # ada
+        if model == "openrouter/meta-llama/llama-3.3-70b-instruct":  # ada
             return _tool_call_response(
                 "Checking status.", "terminal_read_only", {"command": "git status # ada"}
             )
-        if model == "claude-sonnet-5":  # vex
+        if model == "openrouter/qwen/qwen-2.5-72b-instruct":  # vex
             return _tool_call_response(
                 "Checking status too.", "terminal_read_only", {"command": "git status # vex"}
             )
@@ -1619,9 +1665,9 @@ def test_tag_all_fanout_one_persona_pauses_others_complete_independently(client,
                     {"command": "create", "path": "/tmp/x.txt", "file_text": "hi"},
                 )
             return _plain_response("Rex is done after approval.")
-        if model == "claude-opus-4-6":  # ada
+        if model == "openrouter/meta-llama/llama-3.3-70b-instruct":  # ada
             return _plain_response("Ada says hi.")
-        if model == "claude-sonnet-5":  # vex
+        if model == "openrouter/qwen/qwen-2.5-72b-instruct":  # vex
             return _plain_response("Vex says hi.")
         raise AssertionError(f"unexpected model {model!r}")
 
@@ -1711,6 +1757,40 @@ def test_tag_all_skips_a_paused_persona_and_reports_it_fans_out_to_the_rest(
     assert "ada" in actors
     assert "vex" in actors
     assert "rex" not in actors, "the paused persona must never have run"
+
+
+def test_tag_all_mentioned_and_skipped_ids_survive_a_reload(client, personas_dir, monkeypatch):
+    """Found via real browser testing (not in the original scope doc): the
+    previous test above only checks `mentionedPersonaIds`/`skippedPersonaIds`
+    on the immediate POST response. Before this fix, those two fields were
+    set on the returned `MessageOut` object but never written into the
+    `user/message` event's own payload -- so they were only ever visible
+    in that one response and silently reverted to `None` on the very next
+    `GET .../messages` (a page reload, or a fresh WS connection). This
+    proves they're actually durable.
+    """
+    conversation_id = _make_group(client, ["ada", "rex", "vex"])
+    from tapestry.core.personas import load_personas, save_persona
+
+    personas = load_personas(str(personas_dir))
+    save_persona(personas["rex"].model_copy(update={"status": "paused"}), str(personas_dir))
+    api._refresh_graph_personas(str(personas_dir))
+
+    monkeypatch.setattr(graph_build, "call_model", AsyncMock(return_value=_plain_response("hi")))
+
+    post_res = client.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "@all @rex hey team"},
+    )
+    assert post_res.status_code == 201
+
+    # A completely independent GET, simulating a reload/reconnect -- must
+    # see the same mentioned/skipped ids the POST response carried, not
+    # None.
+    messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+    sent = next(m for m in messages if m["text"] == "@all @rex hey team")
+    assert set(sent["mentionedPersonaIds"]) == {"ada", "vex"}
+    assert sent["skippedPersonaIds"] == ["rex"]
 
 
 def test_tag_all_rejects_when_every_mentioned_persona_is_paused(client, personas_dir):

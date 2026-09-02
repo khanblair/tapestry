@@ -332,6 +332,47 @@ def is_main_thread_turn(event: TapestryEvent, conversation_id: str) -> bool:
     return event.payload.get("graph_thread_id", conversation_id) == conversation_id
 
 
+TURN_ERROR_REASON = "turn_error"
+
+
+def close_turn_on_thread(conversation_id: str, graph_thread_id: str) -> TapestryEvent | None:
+    """Close the one open `turn/start` running on `graph_thread_id`, right
+    after catching a live exception from that same turn (see
+    `web_adapter/api.py`'s `_drive_turn`) — as opposed to
+    `close_orphaned_turns`, which repairs a turn abandoned by a *previous*
+    process, discovered later from a cold log scan.
+
+    Appends `turn/end` with `payload["reason"] == TURN_ERROR_REASON` — a
+    distinct string from `ORPHAN_REPAIR_REASON`, since that one is reserved
+    exclusively for `close_orphaned_turns`'s own synthetic repair path (see
+    this module's docstring). Without this, a turn that dies mid-flight
+    (a bad API key, a provider outage, an unhandled tool error) leaves its
+    `turn/start` open with no repair until some later process restart or
+    `close_orphaned_turns` sweep finds it — during that whole window the
+    conversation is durably wedged: the actor shows "busy" forever and
+    `_reject_if_turn_in_progress` 409s every new message to it.
+
+    Safe to call for a fan-out leg's own thread too, unlike
+    `close_orphaned_turns` (which deliberately skips those) — this only
+    ever closes the exact thread that just raised in THIS process, so
+    there's no risk of mistaking a live, still-paused sibling leg for one
+    to close.
+
+    No-op (returns `None`) if there's no open turn on that thread — the
+    exception could originate before any `turn/start` was even appended.
+    """
+    open_starts = find_open_turns(read_events(conversation_id))
+    for turn_id, start_event in open_starts.items():
+        if start_event.payload.get("graph_thread_id", conversation_id) == graph_thread_id:
+            return append_event(
+                conversation_id=conversation_id,
+                type="turn/end",
+                actor="system",
+                payload={"turn_id": turn_id, "reason": TURN_ERROR_REASON},
+            )
+    return None
+
+
 def close_orphaned_turns(conversation_id: str) -> list[TapestryEvent]:
     """Close any MAIN-THREAD `turn/start` in this conversation with no
     matching `turn/end`.

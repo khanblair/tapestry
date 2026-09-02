@@ -1036,6 +1036,8 @@ def _project_messages(conversation_id: str) -> list[MessageOut]:
                     timestamp=event.timestamp,
                     event_type=event.type,
                     thread_id=event.payload.get("thread_id"),
+                    mentioned_persona_ids=event.payload.get("mentioned_persona_ids"),
+                    skipped_persona_ids=event.payload.get("skipped_persona_ids"),
                 )
             )
         elif event.type == "ask/requested" and event.id not in answered_request_ids:
@@ -1063,10 +1065,27 @@ def _project_messages(conversation_id: str) -> list[MessageOut]:
     return out
 
 
-def _append_user_message(conversation_id: str, text: str) -> MessageOut:
-    event = events.append_event(
-        conversation_id, "user/message", actor="you", payload={"text": text}
-    )
+def _append_user_message(
+    conversation_id: str,
+    text: str,
+    mentioned_persona_ids: list[str] | None = None,
+    skipped_persona_ids: list[str] | None = None,
+) -> MessageOut:
+    """`mentioned_persona_ids`/`skipped_persona_ids` are written straight
+    into the event payload (not just set on the returned `MessageOut`) so
+    a tag-all send's fan-out targets survive a page reload / WS reconnect
+    -- `_project_messages` reads them back the same way it already does
+    for `thread_id`. Found in review: the POST handler used to set these
+    two fields on the object it returned but never persisted them, so
+    they were only ever visible in that one immediate response and
+    silently vanished from every subsequent `GET .../messages`.
+    """
+    payload: dict[str, Any] = {"text": text}
+    if mentioned_persona_ids is not None:
+        payload["mentioned_persona_ids"] = mentioned_persona_ids
+    if skipped_persona_ids is not None:
+        payload["skipped_persona_ids"] = skipped_persona_ids
+    event = events.append_event(conversation_id, "user/message", actor="you", payload=payload)
     return MessageOut(
         id=event.id,
         conversation_id=event.conversation_id,
@@ -1074,6 +1093,8 @@ def _append_user_message(conversation_id: str, text: str) -> MessageOut:
         text=text,
         timestamp=event.timestamp,
         event_type=event.type,
+        mentioned_persona_ids=mentioned_persona_ids,
+        skipped_persona_ids=skipped_persona_ids,
     )
 
 
@@ -1269,6 +1290,18 @@ async def _drive_turn(
         # and this is the only other place that turn's failure is
         # guaranteed to pass through.
         app.state.running_activity.pop(thread_id, None)
+        # Found via real browser testing: a turn that raises here (a bad
+        # provider API key, an outage, an unhandled tool error) otherwise
+        # leaves its own `turn/start` open forever -- the actor stays
+        # "busy" and every new message to this thread 409s from
+        # `_reject_if_turn_in_progress`, with no repair short of a full
+        # process restart. `close_turn_on_thread` appends the missing
+        # `turn/end` right here, on the one thread that actually just
+        # failed, so the conversation self-heals immediately instead of
+        # staying durably wedged. Also `except Exception`, not `raise`'s
+        # `BaseException` -- a `CancelledError` (cooperative shutdown) is
+        # never mistaken for a real crash here.
+        events.close_turn_on_thread(conversation_id, thread_id)
         await _broadcast(
             app, conversation_id, {"type": "turn/error", "payload": {"error": str(exc)}}
         )
@@ -1654,9 +1687,12 @@ async def create_app() -> FastAPI:
                 status_code=409,
                 detail=f"every tagged persona is paused ({names}) -- resume at least one first",
             )
-        message = _append_user_message(conversation_id, body.text)
-        message.mentioned_persona_ids = active
-        message.skipped_persona_ids = skipped
+        message = _append_user_message(
+            conversation_id,
+            body.text,
+            mentioned_persona_ids=active,
+            skipped_persona_ids=skipped,
+        )
         _spawn_fanout_turns(app, conversation_id, active, message.id)
         return message
 

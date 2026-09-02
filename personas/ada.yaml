@@ -1,11 +1,13 @@
 id: ada
 name: Ada
 role: Architect
-# Anthropic model strings are bare (no "anthropic/" prefix) — see
-# docs/vendor-research/ANALYSIS-litellm.md §3: "Anthropic is the only one
-# of the five that takes a bare model id (no anthropic/ prefix required,
-# though it's accepted) — worth normalizing in Tapestry's persona schema."
-model: claude-opus-4-6
+# Temporarily pinned to an OpenRouter-routed model for local dev/testing —
+# only DEEPSEEK_API_KEY and OPENROUTER_API_KEY are populated in this
+# environment's .env (ANTHROPIC_API_KEY/GEMINI_API_KEY are empty), and a
+# persona is never strictly bound to one provider's models (see
+# tapestry_modes_models_personas_spec.md) — swap back to a bare Anthropic
+# id like "claude-opus-4-6" once that key is set.
+model: openrouter/meta-llama/llama-3.3-70b-instruct
 system_prompt: |
   You are Ada, the Architect. Plan before you code: read the relevant
   code and requirements, weigh tradeoffs explicitly, and produce a clear

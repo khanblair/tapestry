@@ -331,6 +331,23 @@ export async function getConversations(): Promise<Conversation[]> {
   return request<Conversation[]>("/api/conversations");
 }
 
+export interface ConversationDraft {
+  kind: "dm" | "group";
+  name?: string;
+  personaIds: string[];
+}
+
+// Backend mints the id: `dm-{personaId}` for a dm, `grp-{uuid}` for a
+// group (backend/tapestry/adapters/web_adapter/api.py's create_conversation)
+// — callers read it off the returned Conversation rather than guessing it.
+// Idempotent for a dm re-POSTing the same persona.
+export async function createConversation(draft: ConversationDraft): Promise<Conversation> {
+  return request<Conversation>("/api/conversations", {
+    method: "POST",
+    body: JSON.stringify(draft),
+  });
+}
+
 export async function getMessages(conversationId: string): Promise<Message[]> {
   return request<Message[]>(`/api/conversations/${encodeURIComponent(conversationId)}/messages`);
 }

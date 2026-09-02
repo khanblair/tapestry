@@ -5,21 +5,21 @@
 // screen (desktop centered / mobile full-cover), same pattern as
 // app/profile/[personaId]/PersonaProfileView.tsx.
 //
-// Contract gap: lib/api.ts has no createConversation()/createGroup() —
-// there's no way to actually persist a new group conversation yet. "Create
-// group" demo-navigates to the existing seeded `grp-auth` conversation,
-// mirroring the prototype's own newConvoScreen() (which does the exact same
-// thing — `data-nav="convo:grp-auth"` on its Create group button, since it
-// never had a real backend either). Flagged in the final report.
+// Both tabs now call the real POST /api/conversations (lib/api.ts's
+// createConversation) rather than demo-navigating to a fixed id: the DM
+// tab's own links already relied on lazy-vivification (see api.py judgment
+// call 5) and still do for the zero-click case, but "Create group" has no
+// such fallback -- a group only exists once this call succeeds.
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { Modal } from "@/components/ui/Modal";
 import { PersonaAvatar } from "@/components/persona/PersonaAvatar";
 import { PlusIcon } from "@/components/ui/icons";
 import { safeGetPersonas } from "@/lib/safeApi";
-import type { Persona } from "@/lib/api";
+import { createConversation, type Persona } from "@/lib/api";
+import { useEffect } from "react";
 
 type Tab = "dm" | "group";
 
@@ -30,6 +30,7 @@ export default function NewConversationPage() {
   const [groupName, setGroupName] = useState("#new-project");
   const [picked, setPicked] = useState<string[]>([]);
   const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     safeGetPersonas().then(setPersonas);
@@ -41,8 +42,16 @@ export default function NewConversationPage() {
 
   async function handleCreateGroup() {
     setCreating(true);
+    setError(null);
     try {
-      router.push("/conversation/grp-auth");
+      const conversation = await createConversation({
+        kind: "group",
+        name: groupName.trim() || undefined,
+        personaIds: picked,
+      });
+      router.push(`/conversation/${conversation.id}`);
+    } catch {
+      setError("Couldn't create the group. Try again.");
     } finally {
       setCreating(false);
     }
@@ -114,6 +123,9 @@ export default function NewConversationPage() {
           >
             <PlusIcon size={13} /> {creating ? "Creating…" : "Create group"}
           </button>
+          {error && (
+            <div style={{ marginTop: 8, fontSize: 12, color: "var(--danger, #dc2626)" }}>{error}</div>
+          )}
         </>
       )}
     </Modal>

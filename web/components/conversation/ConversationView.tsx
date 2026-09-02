@@ -54,7 +54,14 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
       // (a new Message arriving live). Anything else is ignored rather
       // than guessed at.
       if (event.type === "message" && event.payload) {
-        setMessages((prev) => [...prev, event.payload as Message]);
+        const incoming = event.payload as Message;
+        // The backend broadcasts every message it appends over this
+        // socket, including the human's own (see api.py's
+        // _broadcast_new_messages) -- Composer's onSent below already
+        // appended that same message optimistically for instant
+        // feedback, so without this id check it renders twice once the
+        // WS frame for it arrives.
+        setMessages((prev) => (prev.some((m) => m.id === incoming.id) ? prev : [...prev, incoming]));
       }
     });
     return unsubscribe;
@@ -168,7 +175,9 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
       <Composer
         conversationId={conversation.id}
         recipientName={headerName}
-        onSent={(message) => setMessages((prev) => [...prev, message])}
+        onSent={(message) =>
+          setMessages((prev) => (prev.some((m) => m.id === message.id) ? prev : [...prev, message]))
+        }
       />
     </div>
   );
