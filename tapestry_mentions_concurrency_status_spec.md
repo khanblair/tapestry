@@ -1,20 +1,26 @@
 # Tapestry: Group Mentions, Turn Concurrency, and Live Status
 
-**Status: §1 and §4 built and tested; §2 (tag-all itself) not yet built.**
-Follow-on to `tapestry_scoped_spec.md` (built) and
-`tapestry_modes_models_personas_spec.md` (built). Scopes three things the
-user asked about, plus one severe pre-existing bug found while scoping the
-first one — the bug has to be fixed before tag-all can be built safely, so
-it's promoted to its own section and built first, alone.
+**Status: all four sections built and tested.** Follow-on to
+`tapestry_scoped_spec.md` (built) and `tapestry_modes_models_personas_spec.md`
+(built). Scopes three things the user asked about, plus one severe
+pre-existing bug found while scoping the first one — the bug had to be
+fixed before tag-all could be built safely, so it was promoted to its own
+section and built first, alone.
 
 - §1 (concurrency guard) — built, tested, committed.
 - §3 (persona↔model) — confirmed, no code needed.
 - §4 (derived status + paused-gating, including the delegation-gating and
   per-persona-resume additions caught in review) — built, tested,
   committed.
-- §2 (tag-all / mention-routing / concurrent fan-out) — scoped in full
-  below, not yet built. The largest remaining piece; §6's build order
-  explains why it's last.
+- §2 (tag-all / mention-routing / concurrent fan-out, including the
+  graph_thread_id foundation, the delegation round-cap fix, and
+  thread-aware approval routing it depends on) — built, tested, committed,
+  for the **web adapter only** — see §2's own note on why Discord/Telegram
+  are out of scope for the fan-out mechanism itself. The frontend has NOT
+  been updated for any of this yet (no `@mention` UI, no multi-approval
+  banner, no fan-out confirmation dialog) — the backend contract is
+  additive and every existing client keeps working unchanged in the
+  meantime; building the frontend for it is a stated, separate follow-up.
 
 Origin, verbatim: *"i create a group, send a message like 'hey guys, let's
 chat about tech' what will happen? then i tag all... also is a persona
@@ -178,6 +184,16 @@ turns aware of it, mirroring the pattern `_resume_with_answer` already uses
 
 Builds directly on §1's guard — the guard *is* the sequencing mechanism, not
 a separate thing bolted alongside it.
+
+**Built for the web adapter's group conversations only.** Discord and
+Telegram each already resolve ONE persona per message by name-matching
+(`resolve_persona_id`/`match_named_persona`) — that's a form of addressing,
+not fan-out, and neither platform has this app's "one conversation, several
+member personas" model to `@all` across. Extending tag-all there would mean
+designing a genuinely different mechanism (e.g. spinning up N separate
+replies in one Discord channel), not reusing this one — out of scope for
+this pass, and not something the user's own example (a web-app group
+conversation) asked for.
 
 ### 2.1 Syntax and resolution
 
@@ -527,3 +543,35 @@ Each lands with its own tests passing before the next starts, same
 verify-before-trusting discipline as every fix earlier this session: write
 the fix, write the test, confirm it fails without the fix and passes with
 it, run the full suite, commit in focused increments.
+
+## 7. Found during implementation, fixed in the same pass
+
+Three gaps a post-build review caught that this doc's own scoping missed —
+recorded here rather than silently folded in, since they change real
+behavior beyond what §1–§6 originally specified:
+
+1. **`running_activity` was keyed by `conversation_id`.** With concurrent
+   fan-out, two legs of one conversation running tools at once wrote the
+   same key — the second write clobbered the first, and whichever leg
+   finished first popped the row out from under every leg still running.
+   Fixed by keying on the actual thread id instead (each dict value still
+   carries its own `conversation_id` so `GET /api/activity` can still
+   resolve a real conversation label).
+2. **A mention resolving to zero active personas (a lone `@rex` where rex
+   is paused, or `@all` where everyone happens to be) silently 201'd with
+   an empty active list.** Skip-and-report is right when *some* mentioned
+   personas are active; it degenerates into "sent a message nobody will
+   ever answer" when none are. Fixed to reject with 409 (same intent as
+   the DM path's existing paused rejection) whenever the active list is
+   empty after filtering — skip-and-report otherwise unchanged for the
+   case that motivated it (some active, some paused).
+3. **A crashed fan-out leg would wedge that persona's derived status as
+   "busy" forever.** §1 deliberately has `close_orphaned_turns` skip
+   fan-out-leg turns (closing the wrong one would silently orphan a real,
+   resumable interrupt) — but left unbounded, that same leniency means
+   `list_open_turns()` never stops counting a crashed leg as open. Fixed
+   with an age bound (`STALE_OPEN_TURN_AGE_SECONDS`, default 1 hour):
+   `list_open_turns()` excludes an open turn older than that from "busy"
+   status specifically, while `close_orphaned_turns` itself is unchanged
+   (still never auto-closes a fan-out leg's log entry — only the STATUS
+   *derivation* is bounded, not the underlying repair decision).

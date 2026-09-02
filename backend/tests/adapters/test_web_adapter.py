@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -212,6 +213,62 @@ def test_get_personas_reflects_a_currently_open_turn_as_busy(client, monkeypatch
     assert ada["status"] == "online", "an unrelated persona must not be affected"
 
     hang.set()  # let the background task unwind before the DB closes
+
+
+# ---------------------------------------------------------------------------
+# _resolve_mentions / _split_paused_mentions -- tag-all mention parsing
+# (tapestry_mentions_concurrency_status_spec.md §2.1)
+# ---------------------------------------------------------------------------
+
+_GROUP_PERSONAS = {
+    "ada": _test_persona("ada"),
+    "rex": _test_persona("rex"),
+    "vex": _test_persona("vex"),
+}
+_GROUP_PERSONA_IDS = ["ada", "rex", "vex"]
+
+
+def test_resolve_mentions_no_mention_returns_empty_list():
+    assert api._resolve_mentions("hey guys, let's chat about tech", _GROUP_PERSONA_IDS, _GROUP_PERSONAS) == []
+
+
+def test_resolve_mentions_at_all_expands_to_every_conversation_persona():
+    resolved = api._resolve_mentions("@all let's chat", _GROUP_PERSONA_IDS, _GROUP_PERSONAS)
+    assert resolved == ["ada", "rex", "vex"]
+
+
+def test_resolve_mentions_explicit_handles_preserve_order_and_dedupe():
+    resolved = api._resolve_mentions("@rex @vex @rex go", _GROUP_PERSONA_IDS, _GROUP_PERSONAS)
+    assert resolved == ["rex", "vex"]
+
+
+def test_resolve_mentions_matches_by_display_name_case_insensitively():
+    resolved = api._resolve_mentions("@Rex can you look", _GROUP_PERSONA_IDS, _GROUP_PERSONAS)
+    assert resolved == ["rex"]
+
+
+def test_resolve_mentions_unknown_handle_is_ignored_not_a_failure():
+    resolved = api._resolve_mentions("@nobody @rex", _GROUP_PERSONA_IDS, _GROUP_PERSONAS)
+    assert resolved == ["rex"]
+
+
+def test_resolve_mentions_handle_outside_this_conversation_is_ignored():
+    # "nova" is a real persona id/name but not a member of this group.
+    resolved = api._resolve_mentions(
+        "@nova @rex", _GROUP_PERSONA_IDS, {**_GROUP_PERSONAS, "nova": _test_persona("nova")}
+    )
+    assert resolved == ["rex"]
+
+
+def test_split_paused_mentions_skips_paused_keeps_active_in_order():
+    personas = {
+        "ada": _test_persona("ada", "online"),
+        "rex": _test_persona("rex", "paused"),
+        "vex": _test_persona("vex", "online"),
+    }
+    active, skipped = api._split_paused_mentions(["ada", "rex", "vex"], personas)
+    assert active == ["ada", "vex"]
+    assert skipped == ["rex"]
 
 
 def test_get_personas_returns_the_real_yaml_backed_roster(client, personas_dir):
@@ -1189,6 +1246,87 @@ def test_activity_running_reflects_a_real_in_flight_tool_call(client, monkeypatc
         raise AssertionError("running entry never cleared after the tool call finished")
 
 
+def test_activity_running_survives_two_concurrent_fanout_legs(client, monkeypatch):
+    """Caught in review: keying `running_activity` by `conversation_id`
+    means two fan-out legs of the SAME conversation running tools at once
+    corrupt each other -- the second leg's write clobbers the first's (one
+    shared key), and whichever leg finishes first pops the row out from
+    under the leg still running. Both legs' entries must coexist and clear
+    independently.
+    """
+    # ada and vex are the only two seed personas that share a common,
+    # NOT-approval-gated tool (`terminal_read_only`) -- needed so both
+    # legs reach execute_node directly, with no interrupt to negotiate,
+    # keeping this test to one exchange per leg.
+    conversation_id = _make_group(client, ["ada", "vex"])
+    ada_hang = asyncio.Event()
+    vex_hang = asyncio.Event()
+
+    async def smart_call_model(model, messages, tools=None, **kwargs):
+        if model == "claude-opus-4-6":  # ada
+            return _tool_call_response(
+                "Checking status.", "terminal_read_only", {"command": "git status # ada"}
+            )
+        if model == "claude-sonnet-5":  # vex
+            return _tool_call_response(
+                "Checking status too.", "terminal_read_only", {"command": "git status # vex"}
+            )
+        raise AssertionError(f"unexpected model {model!r}")
+
+    # Dispatch by the tool call's OWN argument (set per-persona above),
+    # not ambient state -- both legs' execute_node can call this at
+    # essentially the same time, so each must block on its own event
+    # regardless of call order.
+    async def slow_terminal_read_only(arguments: dict) -> ToolResult:
+        if arguments.get("command", "").endswith("# ada"):
+            await ada_hang.wait()
+            return ToolResult(text="ada's check passed", is_error=False)
+        await vex_hang.wait()
+        return ToolResult(text="vex's check passed", is_error=False)
+
+    monkeypatch.setattr(graph_build, "call_model", smart_call_model)
+    monkeypatch.setitem(graph_build.TOOL_REGISTRY, "terminal_read_only", slow_terminal_read_only)
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "@ada @vex check status"}
+    )
+    assert res.status_code == 201
+
+    # Both legs' running entries must appear as two DISTINCT rows -- if
+    # keyed by conversation_id alone, the second leg's write would
+    # clobber the first's and only one row would ever be visible. (Both
+    # legs' `actor`/`label` are identical here -- `_record_running_
+    # activity`'s own documented, separate simplification always
+    # attributes to the conversation's lead persona -- so distinctness is
+    # asserted by count, the only thing that actually differs.)
+    running_count = 0
+    for _ in range(100):
+        activity = client.get("/api/activity").json()
+        running = [r for r in activity["running"] if r["conversationId"] == conversation_id]
+        running_count = len(running)
+        if running_count == 2:
+            break
+        time.sleep(0.05)
+    assert running_count == 2, "both fan-out legs must show as running independently, not clobbered"
+
+    ada_hang.set()  # let ada's leg finish
+
+    # Exactly ONE entry must remain -- ada's "done" must only pop ITS OWN
+    # row, never vex's too (the bug: popping by conversation_id alone
+    # clears whichever leg happens to share that key).
+    for _ in range(50):
+        activity = client.get("/api/activity").json()
+        running = [r for r in activity["running"] if r["conversationId"] == conversation_id]
+        if len(running) == 1:
+            break
+        time.sleep(0.05)
+    activity = client.get("/api/activity").json()
+    running = [r for r in activity["running"] if r["conversationId"] == conversation_id]
+    assert len(running) == 1, "vex's entry must survive rex's leg finishing"
+
+    vex_hang.set()  # let vex's leg finish too, unwinding cleanly
+
+
 # ---------------------------------------------------------------------------
 # System status
 # ---------------------------------------------------------------------------
@@ -1446,6 +1584,243 @@ def test_set_conversation_model_once_scope_overrides_the_next_turns_model_call(
     # persona/model_switched event, unlike session scope above.
     logged = events_module.read_events(conversation_id)
     assert not any(e.type == "persona/model_switched" for e in logged)
+
+
+# ---------------------------------------------------------------------------
+# Tag-all fan-out, end to end (tapestry_mentions_concurrency_status_spec.md §2)
+# ---------------------------------------------------------------------------
+
+
+def _make_group(client, persona_ids: list[str]) -> str:
+    res = client.post(
+        "/api/conversations",
+        json={"kind": "group", "name": "#tag-all-test", "personaIds": persona_ids},
+    )
+    assert res.status_code == 201
+    return res.json()["id"]
+
+
+def test_tag_all_fanout_one_persona_pauses_others_complete_independently(client, monkeypatch):
+    """The actual point of the concurrent fan-out redesign (spec §2.2): a
+    rare mutating tool call from one tagged persona pauses ONLY that leg --
+    the others complete without waiting on it or being blocked by it.
+    """
+    conversation_id = _make_group(client, ["ada", "rex", "vex"])
+
+    call_counts: dict[str, int] = {}
+
+    async def smart_call_model(model, messages, tools=None, **kwargs):
+        call_counts[model] = call_counts.get(model, 0) + 1
+        if model == "deepseek/deepseek-chat":  # rex
+            if call_counts[model] == 1:
+                return _tool_call_response(
+                    "I'll create the file.",
+                    "file_editor",
+                    {"command": "create", "path": "/tmp/x.txt", "file_text": "hi"},
+                )
+            return _plain_response("Rex is done after approval.")
+        if model == "claude-opus-4-6":  # ada
+            return _plain_response("Ada says hi.")
+        if model == "claude-sonnet-5":  # vex
+            return _plain_response("Vex says hi.")
+        raise AssertionError(f"unexpected model {model!r}")
+
+    monkeypatch.setattr(graph_build, "call_model", smart_call_model)
+
+    async def fake_file_editor(arguments: dict) -> ToolResult:
+        return ToolResult(text="wrote the file", is_error=False)
+
+    monkeypatch.setitem(graph_build.TOOL_REGISTRY, "file_editor", fake_file_editor)
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "@all hey guys, let's chat about tech"},
+    )
+    assert res.status_code == 201
+    body = res.json()
+    assert set(body["mentionedPersonaIds"]) == {"ada", "rex", "vex"}
+    assert body["skippedPersonaIds"] == []
+
+    texts: list[str] = []
+    for _ in range(100):
+        messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+        texts = [m["text"] for m in messages]
+        if "Ada says hi." in texts and "Vex says hi." in texts:
+            break
+        time.sleep(0.05)
+    assert "Ada says hi." in texts, "ada must complete without waiting on rex's approval"
+    assert "Vex says hi." in texts, "vex must complete without waiting on rex's approval"
+    assert "Rex is done after approval." not in texts, "rex must still be paused"
+
+    pending_id = None
+    for _ in range(50):
+        messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+        approvals = [m for m in messages if m.get("approval")]
+        if approvals:
+            pending_id = approvals[0]["approval"]["id"]
+            break
+        time.sleep(0.05)
+    assert pending_id is not None, "rex's approval must still have been raised"
+
+    answer_res = client.post(
+        f"/api/conversations/{conversation_id}/ask/{pending_id}/answer",
+        json={"selected": ["approve"]},
+    )
+    assert answer_res.status_code == 204
+
+    for _ in range(100):
+        messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+        texts = [m["text"] for m in messages]
+        if "Rex is done after approval." in texts:
+            break
+        time.sleep(0.05)
+    assert "Rex is done after approval." in texts
+
+
+def test_tag_all_skips_a_paused_persona_and_reports_it_fans_out_to_the_rest(
+    client, personas_dir, monkeypatch
+):
+    conversation_id = _make_group(client, ["ada", "rex", "vex"])
+    # Pause rex specifically, via the same edit-form path a human would use.
+    from tapestry.core.personas import load_personas, save_persona
+
+    personas = load_personas(str(personas_dir))
+    save_persona(personas["rex"].model_copy(update={"status": "paused"}), str(personas_dir))
+    api._refresh_graph_personas(str(personas_dir))
+
+    monkeypatch.setattr(graph_build, "call_model", AsyncMock(return_value=_plain_response("hi")))
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "@all @rex hey team"},
+    )
+    assert res.status_code == 201
+    body = res.json()
+    assert set(body["mentionedPersonaIds"]) == {"ada", "vex"}
+    assert body["skippedPersonaIds"] == ["rex"]
+
+    texts: list[str] = []
+    for _ in range(100):
+        messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+        texts = [m["actor"] for m in messages]
+        if texts.count("ada") >= 1 and texts.count("vex") >= 1:
+            break
+        time.sleep(0.05)
+    messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+    actors = {m["actor"] for m in messages}
+    assert "ada" in actors
+    assert "vex" in actors
+    assert "rex" not in actors, "the paused persona must never have run"
+
+
+def test_tag_all_rejects_when_every_mentioned_persona_is_paused(client, personas_dir):
+    """Caught in review: skip-and-report is right when SOME mentioned
+    personas are active, but a mention resolving to ZERO active personas
+    (a single `@rex` where rex is paused, or `@all` where everyone
+    happens to be paused) must not silently 201 with an empty active
+    list -- that records a message nobody will ever answer, with the only
+    signal buried in a response field no client reads yet. Same intent as
+    a DM to a paused persona (`_reject_if_persona_paused`'s 409); this is
+    the tag-all path's equivalent.
+    """
+    conversation_id = _make_group(client, ["ada", "rex"])
+    from tapestry.core.personas import load_personas, save_persona
+
+    personas = load_personas(str(personas_dir))
+    save_persona(personas["rex"].model_copy(update={"status": "paused"}), str(personas_dir))
+    api._refresh_graph_personas(str(personas_dir))
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "@rex do the deploy"}
+    )
+    assert res.status_code == 409
+    assert "paused" in res.json()["detail"]
+    # nothing was recorded -- unlike the skip-and-report case, there is no
+    # active recipient at all, so nothing should have been sent either.
+    assert not any(
+        e.type == "user/message" for e in events_module.read_events(conversation_id)
+    )
+
+
+def test_tag_all_above_confirm_threshold_needs_confirmation_first(client, monkeypatch):
+    # Only 4 seed personas exist to build a real group from -- lower the
+    # threshold to 2 (rather than fabricate personas) so @all's resolved
+    # count of 4 is genuinely over it, exercising the same boundary logic
+    # at whatever count a real deployment's own threshold sits at.
+    conversation_id = _make_group(client, ["ada", "rex", "vex", "nova"])
+    client.post("/api/agents/nova/resume")  # nova ships paused by default
+    monkeypatch.setattr(api, "FANOUT_CONFIRM_THRESHOLD", 2)
+    monkeypatch.setattr(
+        graph_build, "call_model", AsyncMock(return_value=_plain_response("hi"))
+    )
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "@all hey everyone"},
+    )
+    assert res.status_code == 202
+    body = res.json()
+    assert body["needsConfirmation"] is True
+    assert set(body["personaIds"]) == {"ada", "rex", "vex", "nova"}
+    assert body["count"] == 4
+
+    # Nothing was sent or spawned yet.
+    logged = events_module.read_events(conversation_id)
+    assert not any(e.type == "user/message" for e in logged)
+
+    confirmed = client.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "@all hey everyone", "confirmFanOut": True},
+    )
+    assert confirmed.status_code == 201
+    assert set(confirmed.json()["mentionedPersonaIds"]) == {"ada", "rex", "vex", "nova"}
+
+
+def test_tag_all_above_hard_cap_is_rejected_outright(client, monkeypatch):
+    conversation_id = _make_group(client, ["ada", "rex", "vex", "nova"])
+    monkeypatch.setattr(api, "FANOUT_HARD_CAP", 2)
+    monkeypatch.setattr(
+        graph_build, "call_model", AsyncMock(return_value=_plain_response("hi"))
+    )
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "@all hey everyone", "confirmFanOut": True},
+    )
+    assert res.status_code == 422
+    assert "4" in res.json()["detail"]
+
+    logged = events_module.read_events(conversation_id)
+    assert not any(e.type == "user/message" for e in logged)
+
+
+def test_no_mention_group_message_still_only_reaches_the_lead_persona(client, monkeypatch):
+    """Spec §2.1: no mention at all -> today's unchanged behavior. This is
+    the exact scenario the user originally asked about: "hey guys, let's
+    chat about tech" with no @all -- only persona_ids[0] should respond.
+    """
+    conversation_id = _make_group(client, ["ada", "rex", "vex"])
+    monkeypatch.setattr(
+        graph_build, "call_model", AsyncMock(return_value=_plain_response("hi from ada"))
+    )
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "hey guys, let's chat about tech"},
+    )
+    assert res.status_code == 201
+    body = res.json()
+    assert body["mentionedPersonaIds"] is None
+    assert body["skippedPersonaIds"] is None
+
+    actors: set[str] = set()
+    for _ in range(50):
+        messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+        actors = {m["actor"] for m in messages}
+        if "ada" in actors:
+            break
+        time.sleep(0.05)
+    assert actors == {"you", "ada"}, "only the lead persona (ada) should ever have responded"
 
 
 # ---------------------------------------------------------------------------

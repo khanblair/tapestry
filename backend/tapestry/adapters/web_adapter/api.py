@@ -361,6 +361,16 @@ class MessageDiffOut(CamelModel):
     deletions: int = Field(alias="del")
 
 
+# Tag-all fan-out scale controls (tapestry_mentions_concurrency_status_spec.md
+# §2.5) -- config, not load-bearing constants; sensible defaults to build
+# against, not a claim about what's correct for every deployment. Declared
+# here (ahead of MessageOut/SendMessageIn below, which reference the
+# threshold) rather than down with the rest of §2's helpers.
+FANOUT_CONCURRENCY_LIMIT = 10
+FANOUT_CONFIRM_THRESHOLD = 5
+FANOUT_HARD_CAP = 50
+
+
 class MessageOut(CamelModel):
     id: str
     conversation_id: str
@@ -374,10 +384,34 @@ class MessageOut(CamelModel):
     activity: MessageActivityOut | None = None
     diff: MessageDiffOut | None = None
     approval: AskQuestionOut | None = None
+    # Populated only when this send resolved a multi-persona tag-all
+    # mention (spec §2) — both None for an ordinary, unmentioned send, so
+    # this is purely additive and doesn't change today's response shape.
+    mentioned_persona_ids: list[str] | None = None
+    skipped_persona_ids: list[str] | None = None
 
 
 class SendMessageIn(CamelModel):
     text: str
+    # Set by the client to actually spawn a fan-out whose resolved count
+    # exceeded FANOUT_CONFIRM_THRESHOLD on a first, un-confirmed attempt
+    # (spec §2.5) — see send_message. Defaulting to False keeps every
+    # existing client (which never sends this field) exactly as
+    # frictionless as before for the common, small-mention-count case.
+    confirm_fan_out: bool = False
+
+
+class FanOutConfirmationOut(CamelModel):
+    """Returned instead of `MessageOut` (still 201, but nothing was sent
+    yet) when a resolved mention count exceeds `FANOUT_CONFIRM_THRESHOLD` —
+    spec §2.5. The client resends the identical request with
+    `confirm_fan_out: true` to actually spawn it.
+    """
+
+    needs_confirmation: bool = True
+    persona_ids: list[str]
+    count: int
+    threshold: int = FANOUT_CONFIRM_THRESHOLD
 
 
 class AskAnswerIn(CamelModel):
@@ -742,6 +776,77 @@ def _ensure_orphans_closed(conversation_id: str, app: FastAPI) -> None:
     closed.add(conversation_id)
 
 
+# ---------------------------------------------------------------------------
+# Tag-all / mention-routing (tapestry_mentions_concurrency_status_spec.md §2)
+# ---------------------------------------------------------------------------
+
+# Word-boundary token, e.g. "@all", "@rex" -- deliberately `\w+`, not
+# something that also matches spaces: a persona whose display name has a
+# space in it is only reliably taggable by its id (see spec §2.1's own
+# stated limitation; verified against all four seed personas' single-word
+# id/name pairs, so this covers today's roster exactly).
+_MENTION_RE = re.compile(r"@(\w+)")
+
+
+def _resolve_mentions(text: str, persona_ids: list[str], personas: dict[str, Persona]) -> list[str]:
+    """Parse `@all` / `@<persona-id-or-name>` mentions in `text`, resolved
+    ONLY against `persona_ids` -- this conversation's own members, never a
+    persona outside it even if `@`-mentioned by name.
+
+    Returns the ordered, de-duplicated list of persona ids to fan out to;
+    empty if no mention was found at all (the caller falls back to
+    `persona_ids[0]`, today's unchanged default -- spec §2.1).
+
+    `@all` expands to every persona in `persona_ids`, in that order. An
+    explicit `@<handle>` matches a member persona's id first, then its
+    display name, case-insensitively. An unknown handle, or one naming a
+    real persona who simply isn't in THIS conversation, is silently
+    ignored -- a typo (or a stray `@` in ordinary prose) must never fail
+    the whole send; see spec §2.1.
+    """
+    handles = _MENTION_RE.findall(text)
+    if not handles:
+        return []
+    resolved: list[str] = []
+    for handle in handles:
+        lowered = handle.lower()
+        if lowered == "all":
+            for persona_id in persona_ids:
+                if persona_id not in resolved:
+                    resolved.append(persona_id)
+            continue
+        for persona_id in persona_ids:
+            if persona_id in resolved:
+                continue
+            persona = personas.get(persona_id)
+            name_matches = persona is not None and persona.name.lower() == lowered
+            if persona_id.lower() == lowered or name_matches:
+                resolved.append(persona_id)
+                break
+    return resolved
+
+
+def _split_paused_mentions(
+    persona_ids: list[str], personas: dict[str, Persona]
+) -> tuple[list[str], list[str]]:
+    """Split a resolved mention list into (active, skipped-because-paused).
+
+    Spec §2.1's explicit resolution: a paused persona in the mention list
+    is skipped, not a reason to reject the whole send -- `@all` in a
+    10-persona group where 3 happen to be paused should still reach the
+    other 7. Order is preserved within each list.
+    """
+    active: list[str] = []
+    skipped: list[str] = []
+    for persona_id in persona_ids:
+        persona = personas.get(persona_id)
+        if persona is not None and persona.status == "paused":
+            skipped.append(persona_id)
+        else:
+            active.append(persona_id)
+    return active, skipped
+
+
 def _reject_if_persona_paused(persona_id: str) -> None:
     """Gate against starting a turn for a paused persona — see
     `tapestry_mentions_concurrency_status_spec.md` §4/§5 decision 2:
@@ -1047,7 +1152,9 @@ async def _broadcast_new_messages(app: FastAPI, conversation_id: str) -> None:
         )
 
 
-def _record_running_activity(app: FastAPI, conversation_id: str, chunk: dict) -> None:
+def _record_running_activity(
+    app: FastAPI, conversation_id: str, chunk: dict, graph_thread_id: str | None = None
+) -> None:
     """Best-effort, in-memory-only tracking of in-flight tool calls, fed by
     `graph/build.py`'s `execute_node` `streaming.emit("tool/status", ...)`
     calls (`{"type": "tool/status", "payload": {"tool_name": ..., "status":
@@ -1056,10 +1163,22 @@ def _record_running_activity(app: FastAPI, conversation_id: str, chunk: dict) ->
     durable event log: `tool/result` only ever records a call's FINAL
     result, never "still running".
 
+    Keyed by `graph_thread_id` (defaulting to `conversation_id`, today's
+    only case), NOT always `conversation_id` — caught in review: with tag-
+    all's concurrent fan-out, several legs of one conversation can have a
+    tool running at once. Keying by `conversation_id` alone means the
+    second leg's "running" write clobbers the first's (last-writer-wins on
+    one shared key), and whichever leg finishes first pops the row out
+    from under every leg still running. Each dict value still carries its
+    own `conversation_id` so `GET /api/activity` (which is conversation-
+    scoped in its output shape) can still resolve a real conversation
+    label from a key that's a fan-out thread id, not a conversation id.
+
     Never raises — this must not crash `_drive_turn`'s custom-frame
     handling over a chunk shape this function didn't anticipate; it's
     best-effort live state, not a durable guarantee.
     """
+    thread_id = graph_thread_id or conversation_id
     try:
         if not isinstance(chunk, dict) or chunk.get("type") != "tool/status":
             return
@@ -1069,17 +1188,23 @@ def _record_running_activity(app: FastAPI, conversation_id: str, chunk: dict) ->
             # No persona id travels with this frame (see streaming.emit's
             # payload above) -- fall back to the conversation's lead
             # persona, an acceptable simplification per the task brief.
+            # (Still a simplification for a fan-out leg specifically: the
+            # ACTUAL persona running the tool may not be persona_ids[0] --
+            # the thread_id key at least stops legs from corrupting each
+            # other's rows, which is the bug this fixes; attributing the
+            # exact running persona per leg is a smaller, separate gap.)
             persona_ids, _, _ = _conversation_meta(conversation_id)
             actor = persona_ids[0] if persona_ids else "system"
             tool_name = payload.get("tool_name", "")
-            app.state.running_activity[conversation_id] = {
+            app.state.running_activity[thread_id] = {
+                "conversation_id": conversation_id,
                 "actor": actor,
                 "label": f"running {tool_name}".strip(),
                 "timestamp": _now_iso(),
                 "task_id": None,
             }
         elif status == "done":
-            app.state.running_activity.pop(conversation_id, None)
+            app.state.running_activity.pop(thread_id, None)
     except Exception:
         pass
 
@@ -1121,7 +1246,7 @@ async def _drive_turn(
         async for mode, chunk in graph.astream(graph_input, config, stream_mode=["custom", "values"]):
             if mode == "custom":
                 await _broadcast(app, conversation_id, chunk)
-                _record_running_activity(app, conversation_id, chunk)
+                _record_running_activity(app, conversation_id, chunk, thread_id)
             elif mode == "values" and isinstance(chunk, dict) and "__interrupt__" in chunk:
                 interrupts = chunk["__interrupt__"]
                 if interrupts:
@@ -1135,11 +1260,15 @@ async def _drive_turn(
         # failure on the conversation's own WS stream rather than letting
         # it vanish into asyncio's default "exception was never retrieved"
         # log line with no link back to which conversation broke.
-        # Also clear any "running" row this turn left behind -- a tool_fn
-        # that raises inside execute_node never reaches its own "done"
-        # streaming.emit, and this is the only other place that turn's
-        # failure is guaranteed to pass through.
-        app.state.running_activity.pop(conversation_id, None)
+        # Also clear any "running" row THIS THREAD left behind (not just
+        # `conversation_id` -- see `_record_running_activity`'s own
+        # docstring: a fan-out leg's row is keyed by its own thread_id, and
+        # popping by conversation_id alone would clear nothing for it,
+        # leaving a stale "running" row behind) -- a tool_fn that raises
+        # inside execute_node never reaches its own "done" streaming.emit,
+        # and this is the only other place that turn's failure is
+        # guaranteed to pass through.
+        app.state.running_activity.pop(thread_id, None)
         await _broadcast(
             app, conversation_id, {"type": "turn/error", "payload": {"error": str(exc)}}
         )
@@ -1162,7 +1291,11 @@ _RESUME_POLL_TIMEOUT_SECONDS = 5.0
 
 
 def _spawn_turn(
-    app: FastAPI, conversation_id: str, graph_input: Any, graph_thread_id: str | None = None
+    app: FastAPI,
+    conversation_id: str,
+    graph_input: Any,
+    graph_thread_id: str | None = None,
+    concurrency_gate: asyncio.Semaphore | None = None,
 ) -> None:
     """Fire-and-forget `_drive_turn`, tracked in `app.state.background_tasks`
     so `create_app`'s lifespan shutdown can cancel and await it instead of
@@ -1187,12 +1320,45 @@ def _spawn_turn(
     look busy too. `_drive_turn` clears its own thread's entry in a
     `finally` on every exit path (natural end, paused at an interrupt, or
     a raised exception).
+
+    `concurrency_gate`, when given (the fan-out spawner's own bounded
+    semaphore — spec §2.5), is acquired around the actual `_drive_turn`
+    call, not before marking `turns_in_flight` — a leg queued behind the
+    concurrency cap still shows as busy immediately, which is accurate
+    (it HAS been asked, and IS working through the queue), not idle.
     """
     thread_id = graph_thread_id or conversation_id
     app.state.turns_in_flight.add(thread_id)
-    task = asyncio.create_task(_drive_turn(app, conversation_id, graph_input, thread_id))
+
+    async def _run() -> None:
+        if concurrency_gate is None:
+            await _drive_turn(app, conversation_id, graph_input, thread_id)
+        else:
+            async with concurrency_gate:
+                await _drive_turn(app, conversation_id, graph_input, thread_id)
+
+    task = asyncio.create_task(_run())
     app.state.background_tasks.add(task)
     task.add_done_callback(app.state.background_tasks.discard)
+
+
+def _spawn_fanout_turns(
+    app: FastAPI, conversation_id: str, persona_ids: list[str], trigger_message_id: str
+) -> None:
+    """Spawn one independent tag-all fan-out leg per persona in
+    `persona_ids`, concurrently — spec §2.2. Each gets its own fresh,
+    single-use LangGraph thread
+    (`f"{conversation_id}::mention::{persona_id}::{trigger_message_id}"`),
+    so a rare approval pause on one leg never blocks any other, and never
+    touches the conversation's own main thread at all. Bounded by
+    `FANOUT_CONCURRENCY_LIMIT` (spec §2.5) so a large `@all` completes in
+    waves rather than firing every completion at once.
+    """
+    semaphore = asyncio.Semaphore(FANOUT_CONCURRENCY_LIMIT)
+    for persona_id in persona_ids:
+        graph_thread_id = f"{conversation_id}::mention::{persona_id}::{trigger_message_id}"
+        state = graph_build.new_state(conversation_id, persona_id)
+        _spawn_turn(app, conversation_id, state, graph_thread_id, semaphore)
 
 
 def _graph_thread_id_for_question(conversation_id: str, question_id: str) -> str:
@@ -1425,10 +1591,12 @@ async def create_app() -> FastAPI:
 
     @app.post(
         "/api/conversations/{conversation_id}/messages",
-        response_model=MessageOut,
+        response_model=MessageOut | FanOutConfirmationOut,
         status_code=201,
     )
-    async def send_message(conversation_id: str, body: SendMessageIn) -> MessageOut:
+    async def send_message(
+        conversation_id: str, body: SendMessageIn, response: Response
+    ) -> MessageOut | FanOutConfirmationOut:
         _ensure_conversation(conversation_id, app)
         persona_ids, _, _ = _conversation_meta(conversation_id)
         if not persona_ids:
@@ -1436,13 +1604,60 @@ async def create_app() -> FastAPI:
                 status_code=422,
                 detail=f"conversation {conversation_id!r} has no personas to respond",
             )
-        _reject_if_persona_paused(persona_ids[0])
-        _reject_if_turn_in_progress(app, conversation_id)
-        message = _append_user_message(conversation_id, body.text)
 
-        # Judgment call 3: the lead/entry persona for this turn.
-        state = graph_build.new_state(conversation_id, persona_ids[0])
-        _spawn_turn(app, conversation_id, state)
+        personas = _load_personas()
+        mentioned = _resolve_mentions(body.text, persona_ids, personas)
+
+        if not mentioned:
+            # Judgment call 3, unchanged: the lead/entry persona for this
+            # turn, on the conversation's own main thread -- see spec §2.1,
+            # "no mention at all -> today's behavior, unchanged."
+            _reject_if_persona_paused(persona_ids[0])
+            _reject_if_turn_in_progress(app, conversation_id)
+            message = _append_user_message(conversation_id, body.text)
+            state = graph_build.new_state(conversation_id, persona_ids[0])
+            _spawn_turn(app, conversation_id, state)
+            return message
+
+        # Tag-all fan-out path (spec §2). No `_reject_if_turn_in_progress`
+        # check here -- every mentioned persona runs on its own fresh
+        # fan-out thread (spec §2.2), never the main thread, so whatever
+        # is or isn't happening on the main thread has no bearing on
+        # whether this send can proceed.
+        if len(mentioned) > FANOUT_HARD_CAP:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{len(mentioned)} personas tagged, over the {FANOUT_HARD_CAP} limit "
+                    "-- tag a smaller group, or raise FANOUT_HARD_CAP for this deployment"
+                ),
+            )
+        if len(mentioned) > FANOUT_CONFIRM_THRESHOLD and not body.confirm_fan_out:
+            response.status_code = 202
+            return FanOutConfirmationOut(persona_ids=mentioned, count=len(mentioned))
+
+        active, skipped = _split_paused_mentions(mentioned, personas)
+        if not active:
+            # Caught in review: skip-and-report (spec §2.1) is right when
+            # SOME mentioned personas are active -- @all in a 10-persona
+            # group with 3 paused should still reach the other 7. It's
+            # wrong here: every mentioned persona is paused, so silently
+            # returning 201 with an empty active list records a message
+            # NOBODY will ever answer, with the only signal buried in a
+            # response field no client reads yet -- worse than the DM
+            # path's loud 409 for the exact same underlying intent
+            # ("message this paused persona"). Reject instead, same as
+            # the DM path, rather than accepting a message that goes
+            # nowhere.
+            names = ", ".join(repr(p) for p in skipped)
+            raise HTTPException(
+                status_code=409,
+                detail=f"every tagged persona is paused ({names}) -- resume at least one first",
+            )
+        message = _append_user_message(conversation_id, body.text)
+        message.mentioned_persona_ids = active
+        message.skipped_persona_ids = skipped
+        _spawn_fanout_turns(app, conversation_id, active, message.id)
         return message
 
     @app.get(
@@ -1644,7 +1859,13 @@ async def create_app() -> FastAPI:
             )
 
         running: list[ActivityItemOut] = []
-        for conversation_id, info in app.state.running_activity.items():
+        for thread_id, info in app.state.running_activity.items():
+            # The dict key is a thread id (== conversation_id for an
+            # ordinary turn, a fan-out leg's own thread otherwise) -- the
+            # real conversation_id to resolve a label from is stored in
+            # the value itself (see _record_running_activity), never
+            # assumed to equal the key.
+            conversation_id = info.get("conversation_id", thread_id)
             row = _get_conversation_row(conversation_id)
             label = _conversation_label(row) if row is not None else conversation_id
             running.append(

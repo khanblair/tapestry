@@ -268,6 +268,56 @@ def test_list_open_turns_not_fooled_by_a_stale_quiet_conversation():
     assert open_turns.get("nova") == open_start
 
 
+def test_list_open_turns_excludes_a_turn_older_than_the_default_age_bound(db_connection):
+    """Caught in review: close_orphaned_turns deliberately never auto-closes
+    a fan-out leg's own open turn/start (see that function's docstring) --
+    left completely unbounded, a crashed leg would show its persona as
+    "busy" forever, with no way to clear it. list_open_turns bounds by age
+    instead, specifically for that gap.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    open_start = append_event("conv-1", "turn/start", "nova", {})
+    ancient = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="microseconds")
+    db_connection.execute(
+        "UPDATE events SET timestamp = ? WHERE id = ?", (ancient, open_start.id)
+    )
+    db_connection.commit()
+
+    assert "nova" not in list_open_turns()
+
+
+def test_list_open_turns_keeps_a_turn_within_the_default_age_bound(db_connection):
+    from datetime import datetime, timedelta, timezone
+
+    open_start = append_event("conv-1", "turn/start", "nova", {})
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="microseconds")
+    db_connection.execute(
+        "UPDATE events SET timestamp = ? WHERE id = ?", (recent, open_start.id)
+    )
+    db_connection.commit()
+
+    assert list_open_turns().get("nova") == open_start.model_copy(update={"timestamp": recent})
+
+
+def test_list_open_turns_respects_a_custom_max_age_seconds(db_connection):
+    from datetime import datetime, timedelta, timezone
+
+    open_start = append_event("conv-1", "turn/start", "nova", {})
+    thirty_minutes_old = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(
+        timespec="microseconds"
+    )
+    db_connection.execute(
+        "UPDATE events SET timestamp = ? WHERE id = ?", (thirty_minutes_old, open_start.id)
+    )
+    db_connection.commit()
+
+    # Within the 3600s (1 hour) default...
+    assert "nova" in list_open_turns()
+    # ...but excluded by a deliberately tighter 600s (10 minute) bound.
+    assert "nova" not in list_open_turns(max_age_seconds=600)
+
+
 def test_read_recent_events_spans_every_conversation():
     append_event("conv-1", "task/started", "ada", {"n": 1})
     append_event("conv-2", "task/started", "rex", {"n": 2})

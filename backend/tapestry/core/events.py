@@ -238,20 +238,46 @@ def find_open_turns(events: list[TapestryEvent]) -> dict[str, TapestryEvent]:
     return open_starts
 
 
-def list_open_turns() -> dict[str, TapestryEvent]:
+# How long an open `turn/start` is still trusted for live "busy" status
+# before being treated as stale (see `list_open_turns` below) — caught in
+# review: `close_orphaned_turns` deliberately never auto-closes a fan-out
+# leg's own open turn/start (a blind log scan can't tell a leg still
+# genuinely paused at a live approval apart from one truly abandoned by a
+# crash — see that function's own docstring). Left completely unbounded,
+# a crashed fan-out leg would show that persona as "busy" in every roster
+# render, forever, with no in-app way to clear it -- turning the exact
+# dynamic-status placeholder this was built to fix right back into one.
+# One hour is generous enough that a real, live human-approval wait is
+# never mistaken for stale, while still bounding how long a genuine crash
+# can wedge a persona's displayed status.
+STALE_OPEN_TURN_AGE_SECONDS = 3600
+
+
+def list_open_turns(max_age_seconds: float = STALE_OPEN_TURN_AGE_SECONDS) -> dict[str, TapestryEvent]:
     """Return the currently open `turn/start` event for every persona that
     has one, across ALL conversations, keyed by persona id (a `turn/start`
     event's own `actor` — see `graph/build.py`'s `persona_node`, which sets
     `actor=persona.id`).
 
-    A real, unbounded scan of every `turn/start`/`turn/end` row —
-    deliberately NOT `read_recent_events(limit=...)`, which is
+    A real, unbounded (by event count) scan of every `turn/start`/`turn/end`
+    row — deliberately NOT `read_recent_events(limit=...)`, which is
     cross-conversation but window-bounded and could miss, or misreport, an
     old crashed turn sitting in a quiet conversation depending on how much
     activity happened elsewhere in the meantime. This is the read side of
     deriving a persona's live status (see `web_adapter/api.py`'s
     `_persona_to_out`) rather than writing one to the persona's YAML —
     that module has its own reasoning for why status must be a projection.
+
+    Bounded by AGE, though (`max_age_seconds`): an open `turn/start` older
+    than this is excluded from the result, even though it's still
+    genuinely "open" in the log. This is specifically for the fan-out-leg
+    orphans `close_orphaned_turns` deliberately leaves open (see that
+    function's own docstring) — without an age bound, a crashed fan-out
+    leg would show its persona as permanently "busy," in every
+    conversation, with no way to clear it. A real, live approval wait is
+    expected to resolve in well under an hour; something still open past
+    that is far more likely a stale crash artifact than a human who
+    hasn't gotten to it yet.
 
     With concurrent tag-all fan-out (see
     `tapestry_mentions_concurrency_status_spec.md` §2), several different
@@ -280,7 +306,13 @@ def list_open_turns() -> dict[str, TapestryEvent]:
         for row in rows
     ]
     open_starts = find_open_turns(all_events)
-    return {event.actor: event for event in open_starts.values()}
+    now = datetime.now(timezone.utc)
+    fresh: dict[str, TapestryEvent] = {}
+    for event in open_starts.values():
+        age_seconds = (now - datetime.fromisoformat(event.timestamp)).total_seconds()
+        if age_seconds <= max_age_seconds:
+            fresh[event.actor] = event
+    return fresh
 
 
 def is_main_thread_turn(event: TapestryEvent, conversation_id: str) -> bool:
