@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import type { Conversation, Message, Persona } from "@/lib/api";
+import type { Conversation, Message, Mode, Persona } from "@/lib/api";
 import { subscribeToConversation } from "@/lib/api";
 import { PersonaAvatar, GroupAvatar } from "@/components/persona/PersonaAvatar";
 import { StatusPill } from "@/components/persona/StatusDot";
@@ -10,6 +10,8 @@ import { BackIcon, DotsIcon, FolderIcon } from "@/components/ui/icons";
 import { MessageBubble } from "./MessageBubble";
 import { Composer } from "./Composer";
 import { ApprovalCard } from "@/components/approvals/ApprovalCard";
+import { ModeSwitcher } from "./ModeSwitcher";
+import { ModelSwitcher } from "./ModelSwitcher";
 
 export interface ConversationViewProps {
   conversation: Conversation;
@@ -27,9 +29,23 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
   const [messages, setMessages] = useState<Message[]>(initialMessages);
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // The lead persona's effective mode/model, held locally so the switcher
+  // controls below can update immediately on a successful backend call
+  // without a full page refetch — mirrors how `messages` above is updated
+  // optimistically off WebSocket events rather than re-fetched. Reset
+  // whenever the conversation itself changes (navigating to a different
+  // conversation), same as `messages`.
+  const [mode, setMode] = useState<Mode>(conversation.mode);
+  const [model, setModel] = useState<string>(conversation.model);
+
   useEffect(() => {
     setMessages(initialMessages);
   }, [conversation.id, initialMessages]);
+
+  useEffect(() => {
+    setMode(conversation.mode);
+    setModel(conversation.model);
+  }, [conversation.id, conversation.mode, conversation.model]);
 
   useEffect(() => {
     const unsubscribe = subscribeToConversation(conversation.id, (event) => {
@@ -57,6 +73,10 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
     : [];
   const primaryPersona = !isGroup ? personaById.get(conversation.personaIds[0]) : undefined;
   const headerName = isGroup ? conversation.name ?? "Group" : primaryPersona?.name ?? "Unknown persona";
+  // The lead persona (personaIds[0]) is authoritative for conversation-level
+  // mode/model state for both a DM and a group — same convention the rest
+  // of this app already uses (tapestry_modes_models_personas_spec.md §1.6).
+  const leadPersonaId = conversation.personaIds[0];
 
   // The group header's "open diff" shortcut points at the most recent
   // message that actually carries a diff, since Conversation has no
@@ -90,6 +110,8 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
               <div className="sub">{groupPersonas.map((p) => p.name).join(", ")}</div>
             </div>
             <span className="spacer" />
+            <ModeSwitcher conversationId={conversation.id} personaId={leadPersonaId} mode={mode} onModeChanged={setMode} />
+            <ModelSwitcher conversationId={conversation.id} personaId={leadPersonaId} model={model} onModelChanged={setModel} />
             {latestDiff && (
               <Link href={`/conversation/${conversation.id}/diff/${latestDiff.taskId}`} className="icon-btn" aria-label="View diff">
                 <FolderIcon size={18} />
@@ -103,9 +125,19 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
               <Link href={`/profile/${primaryPersona.id}`}>
                 <h2 style={{ cursor: "pointer" }}>{primaryPersona.name}</h2>
               </Link>
-              <StatusPill status={primaryPersona.status} label={`${statusLabel(primaryPersona.status)} · ${primaryPersona.model}`} />
+              {/* `model` (local state, seeded from conversation.model) — not
+                  primaryPersona.model — since Conversation.model is the
+                  documented effective model (lib/api.ts), which can diverge
+                  from the persona's own configured model after a session-
+                  scoped switch via ModelSwitcher below. Using the persona's
+                  static field here would show a second, stale answer to
+                  "what model is this conversation running?" right next to
+                  the switcher that just changed it. */}
+              <StatusPill status={primaryPersona.status} label={`${statusLabel(primaryPersona.status)} · ${model}`} />
             </div>
             <span className="spacer" />
+            <ModeSwitcher conversationId={conversation.id} personaId={leadPersonaId} mode={mode} onModeChanged={setMode} />
+            <ModelSwitcher conversationId={conversation.id} personaId={leadPersonaId} model={model} onModelChanged={setModel} />
             <Link href={`/profile/${primaryPersona.id}`} className="icon-btn" aria-label="Persona details">
               <DotsIcon size={18} />
             </Link>

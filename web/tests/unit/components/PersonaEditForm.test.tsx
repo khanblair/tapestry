@@ -37,8 +37,10 @@ vi.mock("next/navigation", () => ({
 }));
 
 const getPersonaById = vi.fn();
+const safeGetStatus = vi.fn();
 vi.mock("@/lib/safeApi", () => ({
   getPersonaById: (...args: unknown[]) => getPersonaById(...args),
+  safeGetStatus: (...args: unknown[]) => safeGetStatus(...args),
 }));
 
 const createPersona = vi.fn();
@@ -67,25 +69,29 @@ async function rerenderEdit(rerender: (ui: ReactElement) => void, personaId: str
   rerender(element);
 }
 
+// Real TOOL_REGISTRY/MODEL values, matching what the backend actually
+// stores (personas/*.yaml) -- NOT display labels. See personaDetails.ts's
+// TOOL_OPTIONS/MODEL_OPTIONS docstrings for the bug this distinction fixes.
 const ADA: Persona = {
   id: "ada",
   name: "Ada",
   role: "Architect",
-  model: "Claude Opus 4.8",
+  model: "claude-opus-4-6",
   status: "online",
   color: "#3B82F6",
   systemPrompt: "Plans system design.",
-  tools: ["File read"],
+  tools: ["file_editor_read"],
 };
 const REX: Persona = {
   id: "rex",
   name: "Rex",
   role: "Developer",
-  model: "DeepSeek V3.2",
+  model: "deepseek/deepseek-chat",
   status: "busy",
   color: "#8B5CF6",
   systemPrompt: "Implements features.",
-  tools: ["File edit", "Shell exec"],
+  tools: ["file_editor", "terminal"],
+  mcp: ["filesystem", "terminal"],
 };
 const ROSTER = [ADA, REX];
 
@@ -97,6 +103,18 @@ beforeEach(() => {
   getPersonaById.mockImplementation((id: string) =>
     Promise.resolve(ROSTER.find((p) => p.id === id) ?? null)
   );
+  safeGetStatus.mockReset();
+  safeGetStatus.mockResolvedValue({
+    platforms: [],
+    providers: [],
+    metamcp: { running: true, serverCount: 4 },
+    mcpServers: [
+      { name: "filesystem", connected: true },
+      { name: "git", connected: true },
+      { name: "terminal", connected: true },
+      { name: "browser", connected: true },
+    ],
+  });
 });
 
 describe("persona edit form state clearing", () => {
@@ -215,5 +233,131 @@ describe("persona edit form state clearing", () => {
     await rerenderEdit(rerender, "rex");
     await screen.findByDisplayValue("Rex");
     expect(screen.queryByText(/couldn.t save/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("persona edit form -- tapestry_modes_models_personas_spec.md §3 fields", () => {
+  it("does not silently drop the mcp field -- pre-checks the persona's real mcp servers and includes them, unmodified, in the update payload", async () => {
+    // Direct regression test for the exact gap the spec called out: `mcp`
+    // was already a real Persona/PersonaDraft field (lib/api.ts) with no
+    // form control for it at all, so an update payload built from the old
+    // DraftState always sent nothing for it -- silently discarding whatever
+    // MCP servers a persona had, even server-side, the moment someone saved
+    // an unrelated edit through this form. REX's fixture above sets
+    // `mcp: ["filesystem", "terminal"]`.
+    updatePersona.mockResolvedValue({ ...REX });
+    await renderEdit("rex");
+    await screen.findByDisplayValue("Rex");
+
+    expect(await screen.findByRole("checkbox", { name: "filesystem" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "terminal" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "git" })).not.toBeChecked();
+
+    fireEvent.click(screen.getByRole("button", { name: /save persona/i }));
+
+    await waitFor(() =>
+      expect(updatePersona).toHaveBeenCalledWith(
+        "rex",
+        expect.objectContaining({ mcp: expect.arrayContaining(["filesystem", "terminal"]) })
+      )
+    );
+    const payload = updatePersona.mock.calls[0][1] as { mcp: string[] };
+    expect(payload.mcp).toHaveLength(2);
+  });
+
+  it("pre-checks an existing persona's real tools and preserves them on save (real TOOL_REGISTRY ids, not display labels)", async () => {
+    // Regression test for a real, severe bug: TOOL_OPTIONS used to be a
+    // flat string[] of display labels ("File edit", "Shell exec", ...)
+    // used directly as both the checkbox value AND the `tools` payload --
+    // since REX's REAL tools are `["file_editor", "terminal"]` (real
+    // TOOL_REGISTRY keys, per backend/tapestry/graph/build.py), every
+    // checkbox rendered UNCHECKED regardless of the persona's actual
+    // permissions, and saving without manually re-checking everything
+    // would have silently stripped them -- a persona created through this
+    // form at all could never successfully use any tool, since none of
+    // the sent strings matched a real registry key.
+    updatePersona.mockResolvedValue({ ...REX });
+    await renderEdit("rex");
+    await screen.findByDisplayValue("Rex");
+
+    expect(screen.getByRole("checkbox", { name: "File edit" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Shell exec" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "File read" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Git" })).not.toBeChecked();
+
+    fireEvent.click(screen.getByRole("button", { name: /save persona/i }));
+
+    await waitFor(() => expect(updatePersona).toHaveBeenCalled());
+    const payload = updatePersona.mock.calls[0][1] as { tools: string[] };
+    expect(payload.tools.sort()).toEqual(["file_editor", "terminal"]);
+  });
+
+  it("round-trips all six new fields (mcp, fallbackModels, guardianModel, reasoningEffort, defaultMode, maxTurns, maxDelegationDepth) through create", async () => {
+    createPersona.mockResolvedValue({ ...ADA, id: "new-id" });
+    await renderEdit("new");
+    await screen.findByRole("heading", { name: /new persona/i });
+
+    fireEvent.change(screen.getByLabelText(/^name$/i), { target: { value: "Zed" } });
+    fireEvent.change(screen.getByLabelText(/^role$/i), { target: { value: "Tester" } });
+
+    // mcp -- real server names come from safeGetStatus() (mocked in
+    // beforeEach above), same source ToolsAndMcpPanel uses.
+    fireEvent.click(await screen.findByRole("checkbox", { name: "filesystem" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "git" }));
+
+    // fallbackModels -- excludes the current primary model, which for a
+    // fresh EMPTY_DRAFT is MODEL_OPTIONS[0] ("Claude Opus 4.6"), so neither
+    // of these two checkboxes collide with it. Checkbox accessible names
+    // are the display LABEL; the value sent to the backend is the real
+    // model id (see the payload assertion below).
+    fireEvent.click(screen.getByRole("checkbox", { name: "Claude Sonnet 5" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "DeepSeek Chat" }));
+
+    fireEvent.change(screen.getByLabelText(/guardian model/i), { target: { value: "gemini/gemini-3-pro" } });
+    fireEvent.change(screen.getByLabelText(/reasoning effort/i), { target: { value: "high" } });
+    fireEvent.change(screen.getByLabelText(/default mode/i), { target: { value: "auto" } });
+    fireEvent.change(screen.getByLabelText(/max turns/i), { target: { value: "7" } });
+    fireEvent.change(screen.getByLabelText(/max delegation depth/i), { target: { value: "2" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /save persona/i }));
+
+    await waitFor(() => expect(createPersona).toHaveBeenCalled());
+    expect(createPersona).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "Zed",
+        role: "Tester",
+        guardianModel: "gemini/gemini-3-pro",
+        reasoningEffort: "high",
+        defaultMode: "auto",
+        maxTurns: 7,
+        maxDelegationDepth: 2,
+      })
+    );
+    const payload = createPersona.mock.calls[0][0] as {
+      mcp: string[];
+      fallbackModels: string[];
+    };
+    expect(payload.mcp.sort()).toEqual(["filesystem", "git"]);
+    expect(payload.fallbackModels.sort()).toEqual(["claude-sonnet-5", "deepseek/deepseek-chat"]);
+    expect(push).toHaveBeenCalledWith("/personas");
+  });
+
+  it("omits guardianModel/reasoningEffort/maxTurns/maxDelegationDepth when left unset, rather than sending empty strings or zeros", async () => {
+    createPersona.mockResolvedValue({ ...ADA, id: "new-id" });
+    await renderEdit("new");
+    await screen.findByRole("heading", { name: /new persona/i });
+
+    fireEvent.change(screen.getByLabelText(/^name$/i), { target: { value: "Zed" } });
+    fireEvent.click(screen.getByRole("button", { name: /save persona/i }));
+
+    await waitFor(() => expect(createPersona).toHaveBeenCalled());
+    const payload = createPersona.mock.calls[0][0] as Record<string, unknown>;
+    expect(payload.guardianModel).toBeUndefined();
+    expect(payload.reasoningEffort).toBeUndefined();
+    expect(payload.maxTurns).toBeUndefined();
+    expect(payload.maxDelegationDepth).toBeUndefined();
+    // defaultMode always has a concrete value ("manual" default), unlike
+    // the other four -- it's not nullable on Persona.
+    expect(payload.defaultMode).toBe("manual");
   });
 });

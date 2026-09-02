@@ -69,11 +69,18 @@ export const MOCK_PERSONAS: Persona[] = [
   },
 ];
 
+// mode/model: the lead persona's (personaIds[0]) current effective mode and
+// model, mirroring what a real GET /api/conversations would resolve per
+// tapestry_modes_models_personas_spec.md §1.6/§2.2. Every fixture here
+// starts at "manual" (today's exact baseline behavior, unchanged by
+// default) with the model matching that persona's MOCK_PERSONAS entry
+// above, since no `mode/changed` or `persona/model_switched` event exists
+// for any of these conversations yet.
 export const MOCK_CONVERSATIONS: Conversation[] = [
-  { id: "dm-ada", kind: "dm", personaIds: ["ada"], lastPreview: "Sent the auth architecture proposal", updatedAt: minutesAgo(2) },
-  { id: "dm-rex", kind: "dm", personaIds: ["rex"], lastPreview: "Fixed — re-running tests now", updatedAt: minutesAgo(4) },
-  { id: "dm-vex", kind: "dm", personaIds: ["vex"], lastPreview: "Token scoping looks right now", updatedAt: minutesAgo(6) },
-  { id: "dm-nova", kind: "dm", personaIds: ["nova"], lastPreview: "Standing by for the deploy", updatedAt: minutesAgo(60) },
+  { id: "dm-ada", kind: "dm", personaIds: ["ada"], lastPreview: "Sent the auth architecture proposal", updatedAt: minutesAgo(2), mode: "manual", model: "Claude Opus 4.8" },
+  { id: "dm-rex", kind: "dm", personaIds: ["rex"], lastPreview: "Fixed — re-running tests now", updatedAt: minutesAgo(4), mode: "manual", model: "DeepSeek V3.2" },
+  { id: "dm-vex", kind: "dm", personaIds: ["vex"], lastPreview: "Token scoping looks right now", updatedAt: minutesAgo(6), mode: "manual", model: "Claude Sonnet 5" },
+  { id: "dm-nova", kind: "dm", personaIds: ["nova"], lastPreview: "Standing by for the deploy", updatedAt: minutesAgo(60), mode: "manual", model: "Gemini 3 Pro" },
   {
     id: "grp-auth",
     kind: "group",
@@ -81,6 +88,8 @@ export const MOCK_CONVERSATIONS: Conversation[] = [
     personaIds: ["ada", "rex", "vex"],
     lastPreview: "Rex: opened diff — 3 files changed",
     updatedAt: minutesAgo(4),
+    mode: "manual",
+    model: "Claude Opus 4.8",
   },
 ];
 

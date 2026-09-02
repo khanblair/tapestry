@@ -284,6 +284,49 @@ button {
 .spacer {
   flex: 1 1 auto;
 }
+
+/* ---------- conversation header mode/model switchers ---------- */
+.mode-switcher,
+.model-switcher {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+.topbar-select {
+  width: auto;
+  max-width: 150px;
+  padding: 5px 8px;
+  font-size: 12px;
+  border-radius: 7px;
+}
+.switcher-error {
+  font-size: 11px;
+  color: var(--danger);
+  margin-left: 6px;
+  white-space: nowrap;
+}
+.scope-picker {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
+  z-index: 20;
+  min-width: 170px;
+}
+.scope-picker .scope-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: 600;
+  padding: 0 2px 2px;
+}
 .scroll {
   overflow-y: auto;
   flex: 1 1 auto;

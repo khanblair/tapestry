@@ -2,9 +2,9 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { createPersona, updatePersona, type Persona } from "@/lib/api";
-import { getPersonaById } from "@/lib/safeApi";
-import { MODEL_OPTIONS, TOOL_OPTIONS, NEW_PERSONA_COLOR } from "@/lib/personaDetails";
+import { createPersona, updatePersona, type Mode, type Persona } from "@/lib/api";
+import { getPersonaById, safeGetStatus } from "@/lib/safeApi";
+import { MODE_OPTIONS, MODEL_OPTIONS, TOOL_OPTIONS, NEW_PERSONA_COLOR } from "@/lib/personaDetails";
 import { CheckIcon } from "@/components/ui/icons";
 import { Modal } from "@/components/ui/Modal";
 
@@ -13,20 +13,46 @@ export interface PersonaEditFormProps {
   personaId: string;
 }
 
+// "None" sentinel for the optional `guardianModel` <select> — Persona's
+// real field is `string | undefined`, but a controlled <select> needs a
+// string value for every option, including the unset one.
+const GUARDIAN_MODEL_NONE = "";
+
 interface DraftState {
   name: string;
   role: string;
   model: string;
   systemPrompt: string;
   tools: string[];
+  // --- tapestry_modes_models_personas_spec.md §3 / §3.2 — mirrors the six
+  // new Persona/PersonaDraft fields one-for-one. `mcp` was already a real
+  // field on Persona/PersonaDraft (lib/api.ts) but had no form field here at
+  // all -- the exact gap PersonaEditForm.test.tsx's "does not silently drop
+  // mcp" regression test below covers directly.
+  mcp: string[];
+  fallbackModels: string[];
+  /** GUARDIAN_MODEL_NONE ("") means unset -- see that const's comment. */
+  guardianModel: string;
+  reasoningEffort: string;
+  defaultMode: Mode;
+  /** Kept as text so the field can be empty (unset -- use the global default) rather than coerced to 0. Parsed to a number (or omitted) in handleSave. */
+  maxTurns: string;
+  maxDelegationDepth: string;
 }
 
 const EMPTY_DRAFT: DraftState = {
   name: "",
   role: "",
-  model: MODEL_OPTIONS[0],
+  model: MODEL_OPTIONS[0].value,
   systemPrompt: "",
   tools: [],
+  mcp: [],
+  fallbackModels: [],
+  guardianModel: GUARDIAN_MODEL_NONE,
+  reasoningEffort: "",
+  defaultMode: "manual",
+  maxTurns: "",
+  maxDelegationDepth: "",
 };
 
 function draftFromPersona(p: Persona): DraftState {
@@ -36,6 +62,13 @@ function draftFromPersona(p: Persona): DraftState {
     model: p.model,
     systemPrompt: p.systemPrompt ?? "",
     tools: p.tools ?? [],
+    mcp: p.mcp ?? [],
+    fallbackModels: p.fallbackModels ?? [],
+    guardianModel: p.guardianModel ?? GUARDIAN_MODEL_NONE,
+    reasoningEffort: p.reasoningEffort ?? "",
+    defaultMode: p.defaultMode ?? "manual",
+    maxTurns: p.maxTurns != null ? String(p.maxTurns) : "",
+    maxDelegationDepth: p.maxDelegationDepth != null ? String(p.maxDelegationDepth) : "",
   };
 }
 
@@ -82,6 +115,29 @@ export function PersonaEditForm({ personaId }: PersonaEditFormProps) {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [draft, setDraft] = useState<DraftState>(EMPTY_DRAFT);
   const [existing, setExisting] = useState<Persona | null>(null);
+  // The real, live metamcp server names -- same source ToolsAndMcpPanel.tsx
+  // uses (GET /api/status via safeGetStatus(), falling back to
+  // lib/mockData.ts's MOCK_STATUS when the backend isn't reachable), so the
+  // `mcp` multi-select below offers exactly the servers that actually exist
+  // rather than a second, hardcoded list that could drift from the real one.
+  const [mcpOptions, setMcpOptions] = useState<string[]>([]);
+  // Tracked separately from `mcpOptions.length === 0` -- an empty real
+  // server list (metamcp down, nothing registered) is a legitimate loaded
+  // state, not "still loading". Same shape as ToolsAndMcpPanel's own
+  // `status === null` check.
+  const [mcpLoaded, setMcpLoaded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    safeGetStatus().then((status) => {
+      if (cancelled) return;
+      setMcpOptions(status.mcpServers.map((s) => s.name));
+      setMcpLoaded(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (isNew) {
@@ -117,28 +173,62 @@ export function PersonaEditForm({ personaId }: PersonaEditFormProps) {
     }));
   }
 
+  // Same toggle pattern as toggleTool above, reused for `mcp` (the field
+  // that used to be silently dropped) rather than a differently-shaped
+  // multi-select control.
+  function toggleMcp(server: string) {
+    setDraft((d) => ({
+      ...d,
+      mcp: d.mcp.includes(server) ? d.mcp.filter((s) => s !== server) : [...d.mcp, server],
+    }));
+  }
+
+  // A model can't meaningfully be its own fallback, so picking it as the
+  // primary model drops it from `fallbackModels` too (see the `model`
+  // <select>'s onChange below) -- toggling here only ever adds/removes a
+  // model that isn't the current primary.
+  function toggleFallbackModel(model: string) {
+    setDraft((d) => ({
+      ...d,
+      fallbackModels: d.fallbackModels.includes(model)
+        ? d.fallbackModels.filter((m) => m !== model)
+        : [...d.fallbackModels, model],
+    }));
+  }
+
   async function handleSave() {
     setSaving(true);
     setSaveError(null);
     try {
+      // Shared by both createPersona and updatePersona below -- every field
+      // in tapestry_modes_models_personas_spec.md §3 gets wired through
+      // exactly the way the pre-existing four fields already were.
+      // Empty-string/empty-list values are normalized to `undefined` for the
+      // truly optional, nullable fields (guardianModel, reasoningEffort,
+      // maxTurns, maxDelegationDepth) so an unset field round-trips as unset
+      // rather than as an empty string or 0.
+      const shared = {
+        name: draft.name,
+        role: draft.role,
+        model: draft.model,
+        systemPrompt: draft.systemPrompt,
+        tools: draft.tools,
+        mcp: draft.mcp,
+        fallbackModels: draft.fallbackModels,
+        guardianModel: draft.guardianModel === GUARDIAN_MODEL_NONE ? undefined : draft.guardianModel,
+        reasoningEffort: draft.reasoningEffort.trim() === "" ? undefined : draft.reasoningEffort.trim(),
+        defaultMode: draft.defaultMode,
+        maxTurns: draft.maxTurns.trim() === "" ? undefined : Number(draft.maxTurns),
+        maxDelegationDepth: draft.maxDelegationDepth.trim() === "" ? undefined : Number(draft.maxDelegationDepth),
+      };
       if (isNew) {
         await createPersona({
-          name: draft.name,
-          role: draft.role,
-          model: draft.model,
+          ...shared,
           status: "offline",
           color: NEW_PERSONA_COLOR,
-          systemPrompt: draft.systemPrompt,
-          tools: draft.tools,
         });
       } else if (existing) {
-        await updatePersona(existing.id, {
-          name: draft.name,
-          role: draft.role,
-          model: draft.model,
-          systemPrompt: draft.systemPrompt,
-          tools: draft.tools,
-        });
+        await updatePersona(existing.id, shared);
       }
       // Only navigate away on success -- closeToList() used to live in a
       // `finally` block, which also ran on a rejected save. That silently
@@ -199,11 +289,20 @@ export function PersonaEditForm({ personaId }: PersonaEditFormProps) {
               id="persona-model"
               className="input"
               value={draft.model}
-              onChange={(e) => setDraft((d) => ({ ...d, model: e.target.value }))}
+              onChange={(e) => {
+                const nextModel = e.target.value;
+                // A model can't meaningfully be its own fallback -- drop it
+                // from fallbackModels if it's picked as the new primary.
+                setDraft((d) => ({
+                  ...d,
+                  model: nextModel,
+                  fallbackModels: d.fallbackModels.filter((m) => m !== nextModel),
+                }));
+              }}
             >
-              {MODEL_OPTIONS.map((m) => (
-                <option key={m} value={m}>
-                  {m}
+              {MODEL_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
                 </option>
               ))}
             </select>
@@ -222,18 +321,18 @@ export function PersonaEditForm({ personaId }: PersonaEditFormProps) {
           </div>
 
           <div className="form-row">
-            <label className="field-label">Tools &amp; MCP servers</label>
+            <label className="field-label">Tools</label>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-              {TOOL_OPTIONS.map((tool) => (
+              {TOOL_OPTIONS.map((opt) => (
                 <label
-                  key={tool}
-                  className={`chip ${draft.tools.includes(tool) ? "on" : ""}`}
+                  key={opt.value}
+                  className={`chip ${draft.tools.includes(opt.value) ? "on" : ""}`}
                   style={{ position: "relative", cursor: "pointer" }}
                 >
                   <input
                     type="checkbox"
-                    checked={draft.tools.includes(tool)}
-                    onChange={() => toggleTool(tool)}
+                    checked={draft.tools.includes(opt.value)}
+                    onChange={() => toggleTool(opt.value)}
                     style={{
                       position: "absolute",
                       width: 1,
@@ -246,10 +345,160 @@ export function PersonaEditForm({ personaId }: PersonaEditFormProps) {
                       border: 0,
                     }}
                   />
-                  {tool}
+                  {opt.label}
                 </label>
               ))}
             </div>
+          </div>
+
+          <div className="form-row">
+            <label className="field-label">MCP servers</label>
+            {!mcpLoaded ? (
+              <div className="empty-hint">Loading…</div>
+            ) : mcpOptions.length === 0 ? (
+              <div className="empty-hint">No MCP servers available.</div>
+            ) : (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {mcpOptions.map((server) => (
+                  <label
+                    key={server}
+                    className={`chip ${draft.mcp.includes(server) ? "on" : ""}`}
+                    style={{ position: "relative", cursor: "pointer" }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={draft.mcp.includes(server)}
+                      onChange={() => toggleMcp(server)}
+                      style={{
+                        position: "absolute",
+                        width: 1,
+                        height: 1,
+                        padding: 0,
+                        margin: -1,
+                        overflow: "hidden",
+                        clip: "rect(0,0,0,0)",
+                        whiteSpace: "nowrap",
+                        border: 0,
+                      }}
+                    />
+                    {server}
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="form-row">
+            <label className="field-label">Fallback models</label>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {/* A model can't meaningfully be its own fallback -- excludes
+                  whichever model is currently selected as primary. */}
+              {MODEL_OPTIONS.filter((opt) => opt.value !== draft.model).map((opt) => (
+                <label
+                  key={opt.value}
+                  className={`chip ${draft.fallbackModels.includes(opt.value) ? "on" : ""}`}
+                  style={{ position: "relative", cursor: "pointer" }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={draft.fallbackModels.includes(opt.value)}
+                    onChange={() => toggleFallbackModel(opt.value)}
+                    style={{
+                      position: "absolute",
+                      width: 1,
+                      height: 1,
+                      padding: 0,
+                      margin: -1,
+                      overflow: "hidden",
+                      clip: "rect(0,0,0,0)",
+                      whiteSpace: "nowrap",
+                      border: 0,
+                    }}
+                  />
+                  {opt.label}
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <div className="form-row">
+            <label className="field-label" htmlFor="persona-guardian-model">
+              Guardian model
+            </label>
+            <select
+              id="persona-guardian-model"
+              className="input"
+              value={draft.guardianModel}
+              onChange={(e) => setDraft((d) => ({ ...d, guardianModel: e.target.value }))}
+            >
+              <option value={GUARDIAN_MODEL_NONE}>None</option>
+              {MODEL_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="form-row">
+            <label className="field-label" htmlFor="persona-reasoning-effort">
+              Reasoning effort
+            </label>
+            <input
+              id="persona-reasoning-effort"
+              className="input"
+              placeholder="e.g. low, medium, high"
+              value={draft.reasoningEffort}
+              onChange={(e) => setDraft((d) => ({ ...d, reasoningEffort: e.target.value }))}
+            />
+          </div>
+
+          <div className="form-row">
+            <label className="field-label" htmlFor="persona-default-mode">
+              Default mode
+            </label>
+            <select
+              id="persona-default-mode"
+              className="input"
+              value={draft.defaultMode}
+              onChange={(e) => setDraft((d) => ({ ...d, defaultMode: e.target.value as Mode }))}
+            >
+              {MODE_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value} title={opt.description}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="form-row">
+            <label className="field-label" htmlFor="persona-max-turns">
+              Max turns
+            </label>
+            <input
+              id="persona-max-turns"
+              className="input"
+              type="number"
+              min={1}
+              placeholder="Default (10)"
+              value={draft.maxTurns}
+              onChange={(e) => setDraft((d) => ({ ...d, maxTurns: e.target.value }))}
+            />
+          </div>
+
+          <div className="form-row">
+            <label className="field-label" htmlFor="persona-max-delegation-depth">
+              Max delegation depth
+            </label>
+            <input
+              id="persona-max-delegation-depth"
+              className="input"
+              type="number"
+              min={1}
+              placeholder="Default (3)"
+              value={draft.maxDelegationDepth}
+              onChange={(e) => setDraft((d) => ({ ...d, maxDelegationDepth: e.target.value }))}
+            />
           </div>
 
           {saveError && (
