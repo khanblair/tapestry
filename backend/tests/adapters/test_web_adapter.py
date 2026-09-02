@@ -614,6 +614,36 @@ def test_answer_ask_batch_endpoint_resumes_too(client, monkeypatch):
     assert call_count["terminal"] == 1
 
 
+def test_graph_thread_id_for_question_finds_the_recording_asks_own_thread(client):
+    # `client` fixture used only for its DB isolation (TAPESTRY_DB_PATH),
+    # not for any HTTP call -- append_event needs the isolated connection.
+    events_module.append_event(
+        "conv-1",
+        "ask/requested",
+        actor="system",
+        payload={
+            "questions": [{"id": "q1", "question": "approve?"}],
+            "graph_thread_id": "conv-1::mention::rex::m1",
+        },
+    )
+    assert api._graph_thread_id_for_question("conv-1", "q1") == "conv-1::mention::rex::m1"
+
+
+def test_graph_thread_id_for_question_defaults_to_conversation_id_when_absent(client):
+    # Predates graph_thread_id existing on this payload.
+    events_module.append_event(
+        "conv-1",
+        "ask/requested",
+        actor="system",
+        payload={"questions": [{"id": "q1", "question": "approve?"}]},
+    )
+    assert api._graph_thread_id_for_question("conv-1", "q1") == "conv-1"
+
+
+def test_graph_thread_id_for_question_defaults_to_conversation_id_when_unknown(client):
+    assert api._graph_thread_id_for_question("conv-1", "does-not-exist") == "conv-1"
+
+
 def test_answer_ask_with_no_pending_approval_returns_409(client, monkeypatch):
     # api._resume_with_answer polls briefly before giving up (a real
     # client can race the approval WS notification against the

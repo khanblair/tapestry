@@ -1077,7 +1077,19 @@ async def persona_node(state: TapestryGraphState, config: RunnableConfig) -> dic
                 conversation_id,
                 "ask/requested",
                 actor="system",
-                payload=_with_thread(state, {"questions": [question.model_dump()]}),
+                payload=_with_thread(
+                    state,
+                    {
+                        "questions": [question.model_dump()],
+                        # So a resume can find the right LangGraph thread for
+                        # THIS ask -- required once concurrent tag-all
+                        # fan-out legs can each have their own pending
+                        # approval at once (spec §2.4). See persona_node's
+                        # own docstring for where graph_thread_id comes
+                        # from.
+                        "graph_thread_id": graph_thread_id,
+                    },
+                ),
             )
             pending_tool_call["ask_request_id"] = ask_request_id
             next_node = "approval"

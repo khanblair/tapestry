@@ -1084,12 +1084,21 @@ def _record_running_activity(app: FastAPI, conversation_id: str, chunk: dict) ->
         pass
 
 
-async def _drive_turn(app: FastAPI, conversation_id: str, graph_input: Any) -> None:
+async def _drive_turn(
+    app: FastAPI, conversation_id: str, graph_input: Any, graph_thread_id: str | None = None
+) -> None:
     """Run one graph turn (or resume one) to completion or until it pauses
     at an approval interrupt, forwarding events out over this
     conversation's WS subscribers as they happen. Always launched as a
     fire-and-forget `asyncio.create_task` — never awaited by the HTTP
     handler that starts it.
+
+    `graph_thread_id` — the LangGraph checkpoint thread to actually run
+    on. Defaults to `conversation_id` (today's only behavior, and still
+    true for every ordinary, non-fan-out turn); a tag-all fan-out leg
+    (spec §2.2) passes its own thread id instead, so its turn runs
+    independently of the conversation's main thread and of every other
+    concurrently-running leg.
 
     `stream_mode=["custom", "values"]` — verified against the installed
     `langgraph` package's own `pregel/main.py` (`astream`'s docstring:
@@ -1105,8 +1114,9 @@ async def _drive_turn(app: FastAPI, conversation_id: str, graph_input: Any) -> N
     backend itself now keys off of (`GET /api/activity`'s "running" list) —
     no longer just proven-but-unused plumbing for a future frontend.
     """
+    thread_id = graph_thread_id or conversation_id
     graph = app.state.graph
-    config = {"configurable": {"thread_id": conversation_id}}
+    config = {"configurable": {"thread_id": thread_id}}
     try:
         async for mode, chunk in graph.astream(graph_input, config, stream_mode=["custom", "values"]):
             if mode == "custom":
@@ -1136,21 +1146,24 @@ async def _drive_turn(app: FastAPI, conversation_id: str, graph_input: Any) -> N
         raise
     finally:
         # See `_spawn_turn`'s docstring / `_reject_if_turn_in_progress`:
-        # this conversation is no longer "actively executing in this
-        # process" the moment this function returns, whether that's a
-        # natural end, a pause at an approval interrupt, or a raised
-        # exception -- all three are legitimate reasons a NEW message
-        # should be allowed to try again (the interrupt case still gets
-        # caught by `find_open_turns`' durable log check, which this
-        # in-memory set was never meant to replace).
-        app.state.turns_in_flight.discard(conversation_id)
+        # this THREAD (not necessarily the whole conversation -- a fan-out
+        # leg's own thread_id, distinct from conversation_id) is no longer
+        # "actively executing in this process" the moment this function
+        # returns, whether that's a natural end, a pause at an approval
+        # interrupt, or a raised exception -- all three are legitimate
+        # reasons a NEW message/leg should be allowed to try again (the
+        # interrupt case still gets caught by `find_open_turns`' durable
+        # log check, which this in-memory set was never meant to replace).
+        app.state.turns_in_flight.discard(thread_id)
 
 
 _RESUME_POLL_INTERVAL_SECONDS = 0.1
 _RESUME_POLL_TIMEOUT_SECONDS = 5.0
 
 
-def _spawn_turn(app: FastAPI, conversation_id: str, graph_input: Any) -> None:
+def _spawn_turn(
+    app: FastAPI, conversation_id: str, graph_input: Any, graph_thread_id: str | None = None
+) -> None:
     """Fire-and-forget `_drive_turn`, tracked in `app.state.background_tasks`
     so `create_app`'s lifespan shutdown can cancel and await it instead of
     abandoning it mid-flight. Not just tidiness: an untracked task left
@@ -1162,17 +1175,46 @@ def _spawn_turn(app: FastAPI, conversation_id: str, graph_input: Any) -> None:
     is correct resource hygiene on its own terms, independent of whether
     any specific downstream test is sensitive to it.
 
-    Also where `conversation_id` is marked in `app.state.turns_in_flight`
+    Also where the target thread is marked in `app.state.turns_in_flight`
     (see `_reject_if_turn_in_progress`) — every path that starts or resumes
-    a turn (`send_message`, `_resume_with_answer`) goes through here, so
-    marking it once in this shared spot covers both rather than repeating
-    it at each caller. `_drive_turn` clears it in a `finally` on every exit
-    path (natural end, paused at an interrupt, or a raised exception).
+    a turn (`send_message`, `_resume_with_answer`, the fan-out spawner)
+    goes through here, so marking it once in this shared spot covers all
+    of them rather than repeating it at each caller. Marked by
+    `graph_thread_id` (defaulting to `conversation_id`, exactly today's
+    only case), NOT always `conversation_id` — critical for fan-out: each
+    leg has its own distinct thread id, so marking one leg in-flight must
+    never make a DIFFERENT concurrently-spawned leg (or the main thread)
+    look busy too. `_drive_turn` clears its own thread's entry in a
+    `finally` on every exit path (natural end, paused at an interrupt, or
+    a raised exception).
     """
-    app.state.turns_in_flight.add(conversation_id)
-    task = asyncio.create_task(_drive_turn(app, conversation_id, graph_input))
+    thread_id = graph_thread_id or conversation_id
+    app.state.turns_in_flight.add(thread_id)
+    task = asyncio.create_task(_drive_turn(app, conversation_id, graph_input, thread_id))
     app.state.background_tasks.add(task)
     task.add_done_callback(app.state.background_tasks.discard)
+
+
+def _graph_thread_id_for_question(conversation_id: str, question_id: str) -> str:
+    """Which LangGraph thread `question_id`'s `ask/requested` was raised
+    on — `conversation_id` itself for an ordinary approval, or a tag-all
+    fan-out leg's own thread (see spec §2.4). Looked up from the event log
+    rather than required as a new client-facing field, so answering a
+    question works exactly the same from the frontend's perspective
+    whether it came from the main thread or a fan-out leg.
+
+    Falls back to `conversation_id` when no matching `ask/requested` is
+    found (unknown `question_id` — `_resume_with_answer`'s own poll loop
+    is what actually reports that as a 409) or when one is found but
+    predates `graph_thread_id` existing on this payload.
+    """
+    for event in events.read_events(conversation_id):
+        if event.type != "ask/requested":
+            continue
+        questions = event.payload.get("questions") or []
+        if any(q.get("id") == question_id for q in questions):
+            return event.payload.get("graph_thread_id", conversation_id)
+    return conversation_id
 
 
 async def _resume_with_answer(app: FastAPI, conversation_id: str, answer: AskAnswer) -> None:
@@ -1190,7 +1232,8 @@ async def _resume_with_answer(app: FastAPI, conversation_id: str, answer: AskAns
     a much shorter budget since this is milliseconds of in-process graph
     scheduling, not a human's response time.
     """
-    config = {"configurable": {"thread_id": conversation_id}}
+    graph_thread_id = _graph_thread_id_for_question(conversation_id, answer.id)
+    config = {"configurable": {"thread_id": graph_thread_id}}
     deadline = asyncio.get_running_loop().time() + _RESUME_POLL_TIMEOUT_SECONDS
     snapshot = await app.state.graph.aget_state(config)
     while not snapshot.interrupts:
@@ -1202,7 +1245,7 @@ async def _resume_with_answer(app: FastAPI, conversation_id: str, answer: AskAns
         await asyncio.sleep(_RESUME_POLL_INTERVAL_SECONDS)
         snapshot = await app.state.graph.aget_state(config)
     decision = {"selected": answer.selected, "custom": answer.custom}
-    _spawn_turn(app, conversation_id, Command(resume=decision))
+    _spawn_turn(app, conversation_id, Command(resume=decision), graph_thread_id)
 
 
 # ---------------------------------------------------------------------------
