@@ -217,7 +217,22 @@ export async function getStatus(): Promise<SystemStatus> {
   return request<SystemStatus>("/api/status");
 }
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
+// Server-rendered pages (app/**/page.tsx Server Components) run this
+// module inside the Node process — under Docker that's a SEPARATE
+// container from the browser, so "localhost" means something different in
+// each: to the browser it's the host machine (where the backend's port is
+// published), to the server-side Node process it's that container's own
+// loopback, which the backend container is not on. INTERNAL_API_URL (not
+// NEXT_PUBLIC_-prefixed, so Next.js never inlines it into the client
+// bundle) lets Docker Compose point server-side fetches at the backend
+// service's Compose-internal DNS name, while the browser keeps using
+// NEXT_PUBLIC_API_URL. Outside Docker (native dev, or any single-host
+// setup) the two are simply the same value, so this falls back to
+// NEXT_PUBLIC_API_URL when INTERNAL_API_URL isn't set.
+const API_URL =
+  typeof window === "undefined"
+    ? (process.env.INTERNAL_API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "")
+    : (process.env.NEXT_PUBLIC_API_URL ?? "");
 
 class ApiError extends Error {
   status: number;

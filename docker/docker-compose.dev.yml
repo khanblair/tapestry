@@ -60,7 +60,15 @@ services:
       - /app/node_modules # anonymous volume: same trick, for pnpm's install
       - /app/.next # anonymous volume: Next's own build cache, not host-shared
     environment:
+      # NEXT_PUBLIC_API_URL is what the BROWSER uses (published port on the
+      # host). INTERNAL_API_URL is what server-rendered pages use instead,
+      # read from inside this container -- "localhost" there is this
+      # container's own loopback, not the backend container. Without this,
+      # every server-rendered page (the roster sidebar, the conversation
+      # view) silently fell back to lib/mockData.ts's fixtures, since their
+      # fetch to the backend simply failed. See web/lib/api.ts's comment.
       NEXT_PUBLIC_API_URL: http://localhost:8000
+      INTERNAL_API_URL: http://backend:8000
     depends_on:
       - backend
 

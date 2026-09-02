@@ -39,7 +39,15 @@ services:
     ports:
       - "3000:3000"
     environment:
-      NEXT_PUBLIC_API_URL: http://backend:8000
+      # NEXT_PUBLIC_API_URL is what the BROWSER uses (published port on the
+      # host) -- the Docker-internal "backend" hostname doesn't resolve
+      # from outside the Compose network. INTERNAL_API_URL is what
+      # server-rendered pages use instead, from inside this container --
+      # see web/lib/api.ts's own comment for the full explanation. Setting
+      # NEXT_PUBLIC_API_URL to the internal hostname (as this file
+      # previously did) broke every browser-side fetch.
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      INTERNAL_API_URL: http://backend:8000
     depends_on:
       - backend
 
