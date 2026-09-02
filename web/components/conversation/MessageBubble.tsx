@@ -5,8 +5,8 @@ import remarkGfm from "remark-gfm";
 import type { AskQuestion, Message, Persona } from "@/lib/api";
 import { PersonaAvatar, YouAvatar } from "@/components/persona/PersonaAvatar";
 import { ActivityBlock } from "./ActivityBlock";
+import { ClockTime } from "./ClockTime";
 import { DiffChip } from "./DiffChip";
-import { formatClockTime } from "@/lib/time";
 import { remarkMentions } from "@/lib/remarkMentions";
 
 export interface MessageBubbleProps {
@@ -62,7 +62,9 @@ export function MessageBubble({ message, actorPersona, renderApproval }: Message
             </Link>
           )}
           {!isYou && <span className="msg-role">&middot; {actorPersona.role}</span>}
-          <span className="msg-time">{formatClockTime(message.timestamp)}</span>
+          <span className="msg-time">
+            <ClockTime iso={message.timestamp} />
+          </span>
         </div>
         <div className="msg-text">{renderMessageText(message.text)}</div>
         {message.activity && (

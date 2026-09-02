@@ -782,9 +782,14 @@ def _build_system_prompt(persona: Persona, catalog: list[SkillSummary]) -> str:
     if catalog:
         lines.append(
             f"Available skills (call the {SKILL_LOADER_TOOL_NAME!r} tool with "
-            '{"name": "<skill-name>"} to read the full procedure):'
+            '{"name": "<skill-name>"} to read the full procedure). Do not load a '
+            "skill for a greeting, acknowledgement, or small talk — only when the "
+            "task at hand actually matches its When to use:"
         )
-        lines.extend(f"- {summary.name}: {summary.description}" for summary in catalog)
+        for summary in catalog:
+            lines.append(f"- {summary.name}: {summary.description}")
+            if summary.when_to_use:
+                lines.append(f"  When to use: {summary.when_to_use}")
     else:
         lines.append("No skills are currently available.")
     return "\n".join(lines)

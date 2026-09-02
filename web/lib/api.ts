@@ -396,6 +396,17 @@ export async function setConversationModel(
   });
 }
 
+// Cancels every turn (the main thread, and every tag-all fan-out leg)
+// currently running for this conversation. The backend's own
+// _drive_turn appends the matching turn/end and broadcasts a
+// "turn/stopped" WS frame -- callers don't need to do anything with
+// this call's own (empty) response beyond letting it resolve.
+export async function stopConversation(conversationId: string): Promise<void> {
+  await request<void>(`/api/conversations/${encodeURIComponent(conversationId)}/stop`, {
+    method: "POST",
+  });
+}
+
 /**
  * Opens a WebSocket to the given conversation's live event stream and
  * calls `onEvent` for every frame received (parsed as

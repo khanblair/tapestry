@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
-import type { Conversation, Persona } from "@/lib/api";
+import type { Conversation, ConversationEvent, Persona } from "@/lib/api";
 
 // Integration coverage for the one piece of derivation logic
 // ConversationView itself owns (leadPersonaId = conversation.personaIds[0])
@@ -21,10 +21,13 @@ vi.mock("next/link", () => ({
   ),
 }));
 
-const subscribeToConversation = vi.fn(() => () => {});
+const subscribeToConversation = vi.fn(
+  (_conversationId: string, _onEvent: (event: ConversationEvent) => void) => () => {}
+);
 const setConversationMode = vi.fn();
 const setConversationModel = vi.fn();
 const sendMessage = vi.fn();
+const stopConversation = vi.fn();
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
@@ -34,6 +37,7 @@ vi.mock("@/lib/api", async () => {
     setConversationMode: (...args: unknown[]) => setConversationMode(...args),
     setConversationModel: (...args: unknown[]) => setConversationModel(...args),
     sendMessage: (...args: unknown[]) => sendMessage(...args),
+    stopConversation: (...args: unknown[]) => stopConversation(...args),
   };
 });
 
@@ -121,5 +125,123 @@ describe("ConversationView mode/model switcher wiring", () => {
 
     expect(screen.getByText(/Working · Claude Opus 4\.8/)).toBeInTheDocument();
     expect(screen.queryByText(/Working · DeepSeek V3\.2/)).not.toBeInTheDocument();
+  });
+});
+
+describe("ConversationView typing indicator", () => {
+  it("shows a typing indicator for a persona/typing frame and hides it once done", async () => {
+    let onEvent: (event: ConversationEvent) => void = () => {};
+    subscribeToConversation.mockImplementation((_id, cb) => {
+      onEvent = cb;
+      return () => {};
+    });
+
+    const conversation: Conversation = {
+      id: "dm-rex",
+      kind: "dm",
+      personaIds: ["rex"],
+      updatedAt: new Date().toISOString(),
+      mode: "manual",
+      model: "DeepSeek V3.2",
+    };
+    render(<ConversationView conversation={conversation} personas={[REX]} initialMessages={[]} />);
+
+    expect(screen.queryByText(/is typing/)).not.toBeInTheDocument();
+
+    onEvent({ type: "persona/typing", payload: { persona_id: "rex" } });
+    await waitFor(() => expect(screen.getByText("Rex is typing")).toBeInTheDocument());
+
+    onEvent({ type: "persona/typing", payload: { persona_id: "rex", done: true } });
+    await waitFor(() => expect(screen.queryByText(/is typing/)).not.toBeInTheDocument());
+  });
+
+  it("clears a stale typing indicator when navigating to a different conversation", async () => {
+    let onEvent: (event: ConversationEvent) => void = () => {};
+    subscribeToConversation.mockImplementation((_id, cb) => {
+      onEvent = cb;
+      return () => {};
+    });
+
+    const conversationA: Conversation = {
+      id: "dm-rex",
+      kind: "dm",
+      personaIds: ["rex"],
+      updatedAt: new Date().toISOString(),
+      mode: "manual",
+      model: "DeepSeek V3.2",
+    };
+    const { rerender } = render(
+      <ConversationView conversation={conversationA} personas={[REX]} initialMessages={[]} />
+    );
+    onEvent({ type: "persona/typing", payload: { persona_id: "rex" } });
+    await waitFor(() => expect(screen.getByText("Rex is typing")).toBeInTheDocument());
+
+    const conversationB: Conversation = {
+      id: "dm-ada",
+      kind: "dm",
+      personaIds: ["ada"],
+      updatedAt: new Date().toISOString(),
+      mode: "manual",
+      model: "Claude Opus 4.8",
+    };
+    rerender(<ConversationView conversation={conversationB} personas={[ADA]} initialMessages={[]} />);
+
+    await waitFor(() => expect(screen.queryByText(/is typing/)).not.toBeInTheDocument());
+  });
+});
+
+describe("ConversationView stop button", () => {
+  it("shows a Stop button only while a persona is typing, and calls stopConversation when clicked", async () => {
+    stopConversation.mockResolvedValue(undefined);
+    let onEvent: (event: ConversationEvent) => void = () => {};
+    subscribeToConversation.mockImplementation((_id, cb) => {
+      onEvent = cb;
+      return () => {};
+    });
+
+    const conversation: Conversation = {
+      id: "dm-rex",
+      kind: "dm",
+      personaIds: ["rex"],
+      updatedAt: new Date().toISOString(),
+      mode: "manual",
+      model: "DeepSeek V3.2",
+    };
+    render(<ConversationView conversation={conversation} personas={[REX]} initialMessages={[]} />);
+
+    expect(screen.queryByLabelText("Stop generating")).not.toBeInTheDocument();
+
+    onEvent({ type: "persona/typing", payload: { persona_id: "rex" } });
+    await waitFor(() => expect(screen.getByLabelText("Stop generating")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText("Stop generating"));
+    await waitFor(() => expect(stopConversation).toHaveBeenCalledWith("dm-rex"));
+  });
+
+  it("hides the Stop button again once the backend confirms every persona stopped typing", async () => {
+    let onEvent: (event: ConversationEvent) => void = () => {};
+    subscribeToConversation.mockImplementation((_id, cb) => {
+      onEvent = cb;
+      return () => {};
+    });
+
+    const conversation: Conversation = {
+      id: "dm-rex",
+      kind: "dm",
+      personaIds: ["rex"],
+      updatedAt: new Date().toISOString(),
+      mode: "manual",
+      model: "DeepSeek V3.2",
+    };
+    render(<ConversationView conversation={conversation} personas={[REX]} initialMessages={[]} />);
+
+    onEvent({ type: "persona/typing", payload: { persona_id: "rex" } });
+    await waitFor(() => expect(screen.getByLabelText("Stop generating")).toBeInTheDocument());
+
+    // _drive_turn's finally block broadcasts persona/typing done=true on
+    // every exit path, including a stop-triggered cancellation -- so the
+    // button disappearing here is what actually confirms the stop landed.
+    onEvent({ type: "persona/typing", payload: { persona_id: "rex", done: true } });
+    await waitFor(() => expect(screen.queryByLabelText("Stop generating")).not.toBeInTheDocument());
   });
 });

@@ -333,30 +333,37 @@ def is_main_thread_turn(event: TapestryEvent, conversation_id: str) -> bool:
 
 
 TURN_ERROR_REASON = "turn_error"
+# A human explicitly stopped generation (web_adapter/api.py's POST
+# .../stop) -- distinct from TURN_ERROR_REASON so a reader of the log can
+# tell "this turn was cut short by a person" apart from "this turn died on
+# its own" without guessing from context.
+STOPPED_BY_HUMAN_REASON = "stopped_by_human"
 
 
-def close_turn_on_thread(conversation_id: str, graph_thread_id: str) -> TapestryEvent | None:
+def close_turn_on_thread(
+    conversation_id: str, graph_thread_id: str, reason: str = TURN_ERROR_REASON
+) -> TapestryEvent | None:
     """Close the one open `turn/start` running on `graph_thread_id`, right
-    after catching a live exception from that same turn (see
-    `web_adapter/api.py`'s `_drive_turn`) — as opposed to
+    after catching a live exception from (or a human stopping) that same
+    turn (see `web_adapter/api.py`'s `_drive_turn`) — as opposed to
     `close_orphaned_turns`, which repairs a turn abandoned by a *previous*
     process, discovered later from a cold log scan.
 
-    Appends `turn/end` with `payload["reason"] == TURN_ERROR_REASON` — a
-    distinct string from `ORPHAN_REPAIR_REASON`, since that one is reserved
-    exclusively for `close_orphaned_turns`'s own synthetic repair path (see
-    this module's docstring). Without this, a turn that dies mid-flight
-    (a bad API key, a provider outage, an unhandled tool error) leaves its
-    `turn/start` open with no repair until some later process restart or
-    `close_orphaned_turns` sweep finds it — during that whole window the
-    conversation is durably wedged: the actor shows "busy" forever and
-    `_reject_if_turn_in_progress` 409s every new message to it.
+    Appends `turn/end` with `payload["reason"] == reason` — always one of
+    `TURN_ERROR_REASON`/`STOPPED_BY_HUMAN_REASON` here, both distinct from
+    `ORPHAN_REPAIR_REASON`, which is reserved exclusively for
+    `close_orphaned_turns`'s own synthetic repair path (see this module's
+    docstring). Without this, a turn that dies or is stopped mid-flight
+    leaves its `turn/start` open with no repair until some later process
+    restart or `close_orphaned_turns` sweep finds it — during that whole
+    window the conversation is durably wedged: the actor shows "busy"
+    forever and `_reject_if_turn_in_progress` 409s every new message to it.
 
     Safe to call for a fan-out leg's own thread too, unlike
     `close_orphaned_turns` (which deliberately skips those) — this only
-    ever closes the exact thread that just raised in THIS process, so
-    there's no risk of mistaking a live, still-paused sibling leg for one
-    to close.
+    ever closes the exact thread that just raised/was stopped in THIS
+    process, so there's no risk of mistaking a live, still-paused sibling
+    leg for one to close.
 
     No-op (returns `None`) if there's no open turn on that thread — the
     exception could originate before any `turn/start` was even appended.
@@ -368,7 +375,7 @@ def close_turn_on_thread(conversation_id: str, graph_thread_id: str) -> Tapestry
                 conversation_id=conversation_id,
                 type="turn/end",
                 actor="system",
-                payload={"turn_id": turn_id, "reason": TURN_ERROR_REASON},
+                payload={"turn_id": turn_id, "reason": reason},
             )
     return None
 

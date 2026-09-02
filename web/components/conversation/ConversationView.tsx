@@ -3,15 +3,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import type { Conversation, Message, Mode, Persona } from "@/lib/api";
-import { subscribeToConversation } from "@/lib/api";
+import { subscribeToConversation, stopConversation } from "@/lib/api";
 import { PersonaAvatar, GroupAvatar } from "@/components/persona/PersonaAvatar";
 import { StatusPill } from "@/components/persona/StatusDot";
-import { BackIcon, DotsIcon, FolderIcon } from "@/components/ui/icons";
+import { BackIcon, DotsIcon, FolderIcon, StopIcon } from "@/components/ui/icons";
 import { MessageBubble } from "./MessageBubble";
 import { Composer } from "./Composer";
 import { ApprovalCard } from "@/components/approvals/ApprovalCard";
 import { ModeSwitcher } from "./ModeSwitcher";
 import { ModelSwitcher } from "./ModelSwitcher";
+import { TypingIndicator } from "./TypingIndicator";
 
 export interface ConversationViewProps {
   conversation: Conversation;
@@ -27,6 +28,11 @@ export interface ConversationViewProps {
  */
 export function ConversationView({ conversation, personas, initialMessages }: ConversationViewProps) {
   const [messages, setMessages] = useState<Message[]>(initialMessages);
+  // Persona ids currently mid-turn, per the persona/typing WS frame
+  // (api.py's _drive_turn) -- a Set so a tag-all fan-out with several
+  // personas typing at once tracks each independently, and adding/
+  // removing the same id twice is a no-op rather than a bug.
+  const [typingPersonaIds, setTypingPersonaIds] = useState<Set<string>>(new Set());
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // The lead persona's effective mode/model, held locally so the switcher
@@ -48,11 +54,12 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
   }, [conversation.id, conversation.mode, conversation.model]);
 
   useEffect(() => {
+    // A stale indicator from the previous conversation must not survive
+    // navigating to a new one -- there's no "typing" WS frame telling us
+    // to clear it on unmount, since the old socket is simply closed.
+    setTypingPersonaIds(new Set());
+
     const unsubscribe = subscribeToConversation(conversation.id, (event) => {
-      // The backend's event shape beyond {type, payload} isn't finalized
-      // yet — "message" is the one event type we know we need to handle
-      // (a new Message arriving live). Anything else is ignored rather
-      // than guessed at.
       if (event.type === "message" && event.payload) {
         const incoming = event.payload as Message;
         // The backend broadcasts every message it appends over this
@@ -62,6 +69,14 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
         // feedback, so without this id check it renders twice once the
         // WS frame for it arrives.
         setMessages((prev) => (prev.some((m) => m.id === incoming.id) ? prev : [...prev, incoming]));
+      } else if (event.type === "persona/typing" && event.payload) {
+        const { persona_id: personaId, done } = event.payload as { persona_id: string; done?: boolean };
+        setTypingPersonaIds((prev) => {
+          const next = new Set(prev);
+          if (done) next.delete(personaId);
+          else next.add(personaId);
+          return next;
+        });
       }
     });
     return unsubscribe;
@@ -70,9 +85,28 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages]);
+  }, [messages, typingPersonaIds]);
+
+  const [stopping, setStopping] = useState(false);
+  async function handleStop() {
+    setStopping(true);
+    try {
+      await stopConversation(conversation.id);
+    } catch (error) {
+      console.error("Failed to stop generation", error);
+    } finally {
+      setStopping(false);
+    }
+  }
 
   const personaById = useMemo(() => new Map(personas.map((p) => [p.id, p])), [personas]);
+  const typingPersonas = useMemo(
+    () =>
+      Array.from(typingPersonaIds)
+        .map((id) => personaById.get(id))
+        .filter((p): p is Persona => Boolean(p)),
+    [typingPersonaIds, personaById],
+  );
 
   const isGroup = conversation.kind === "group";
   const groupPersonas = isGroup
@@ -169,6 +203,20 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
               renderApproval={(approval) => <ApprovalCard conversationId={conversation.id} question={approval} />}
             />
           ))}
+          {typingPersonas.length > 0 && (
+            <div className="typing-row">
+              <TypingIndicator personas={typingPersonas} />
+              <button
+                type="button"
+                className="btn btn-sm btn-danger"
+                onClick={handleStop}
+                disabled={stopping}
+                aria-label="Stop generating"
+              >
+                <StopIcon size={13} /> Stop
+              </button>
+            </div>
+          )}
         </div>
       </div>
 

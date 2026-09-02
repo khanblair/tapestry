@@ -145,6 +145,7 @@ Endpoint list
     GET    /api/conversations/{conversation_id}/diff/{task_id}
     POST   /api/conversations/{conversation_id}/mode
     POST   /api/conversations/{conversation_id}/model
+    POST   /api/conversations/{conversation_id}/stop
     POST   /api/conversations/{conversation_id}/ask/answers            (real, batch)
     POST   /api/conversations/{conversation_id}/ask/{question_id}/answer  (alias)
     GET    /api/search?q=...
@@ -1231,7 +1232,11 @@ def _record_running_activity(
 
 
 async def _drive_turn(
-    app: FastAPI, conversation_id: str, graph_input: Any, graph_thread_id: str | None = None
+    app: FastAPI,
+    conversation_id: str,
+    graph_input: Any,
+    graph_thread_id: str | None = None,
+    persona_id: str | None = None,
 ) -> None:
     """Run one graph turn (or resume one) to completion or until it pauses
     at an approval interrupt, forwarding events out over this
@@ -1263,6 +1268,17 @@ async def _drive_turn(
     thread_id = graph_thread_id or conversation_id
     graph = app.state.graph
     config = {"configurable": {"thread_id": thread_id}}
+    if persona_id is not None:
+        # Typing indicator (UX ask, not in the original scope doc): a
+        # human sees the composer freeze while a persona is still working
+        # -- best-effort, in-memory-only, mirroring `_record_running_activity`'s
+        # own "this can't come from the durable log" reasoning. Never
+        # persisted: a page reload/reconnect simply shows nothing typing,
+        # which is correct (nothing was mid-response at that instant from
+        # the new connection's point of view).
+        await _broadcast(
+            app, conversation_id, {"type": "persona/typing", "payload": {"persona_id": persona_id}}
+        )
     try:
         async for mode, chunk in graph.astream(graph_input, config, stream_mode=["custom", "values"]):
             if mode == "custom":
@@ -1277,6 +1293,22 @@ async def _drive_turn(
                         {"type": "ask/requested", "payload": interrupts[0].value},
                     )
             await _broadcast_new_messages(app, conversation_id)
+    except asyncio.CancelledError:
+        # A human stopped generation (POST .../stop cancels this exact
+        # task via app.state.turn_tasks) -- NOT a crash, so this gets its
+        # own reason string and its own WS frame type, both distinct from
+        # the except Exception branch below. Still needs the same
+        # self-healing close_turn_on_thread call: LangGraph's own
+        # checkpointer may not have had a chance to durably persist
+        # anything for this step, so without this the turn/start this
+        # cancelled task itself appended would otherwise be left open
+        # exactly like an unhandled crash would leave it.
+        app.state.running_activity.pop(thread_id, None)
+        events.close_turn_on_thread(
+            conversation_id, thread_id, reason=events.STOPPED_BY_HUMAN_REASON
+        )
+        await _broadcast(app, conversation_id, {"type": "turn/stopped", "payload": {}})
+        raise
     except Exception as exc:  # pragma: no cover - defensive: surface the
         # failure on the conversation's own WS stream rather than letting
         # it vanish into asyncio's default "exception was never retrieved"
@@ -1298,9 +1330,7 @@ async def _drive_turn(
         # process restart. `close_turn_on_thread` appends the missing
         # `turn/end` right here, on the one thread that actually just
         # failed, so the conversation self-heals immediately instead of
-        # staying durably wedged. Also `except Exception`, not `raise`'s
-        # `BaseException` -- a `CancelledError` (cooperative shutdown) is
-        # never mistaken for a real crash here.
+        # staying durably wedged.
         events.close_turn_on_thread(conversation_id, thread_id)
         await _broadcast(
             app, conversation_id, {"type": "turn/error", "payload": {"error": str(exc)}}
@@ -1317,6 +1347,15 @@ async def _drive_turn(
         # interrupt case still gets caught by `find_open_turns`' durable
         # log check, which this in-memory set was never meant to replace).
         app.state.turns_in_flight.discard(thread_id)
+        if persona_id is not None:
+            # Always clear the typing indicator on every exit path,
+            # including a pause at an approval interrupt -- a persona
+            # waiting on a human is not "typing".
+            await _broadcast(
+                app,
+                conversation_id,
+                {"type": "persona/typing", "payload": {"persona_id": persona_id, "done": True}},
+            )
 
 
 _RESUME_POLL_INTERVAL_SECONDS = 0.1
@@ -1329,6 +1368,7 @@ def _spawn_turn(
     graph_input: Any,
     graph_thread_id: str | None = None,
     concurrency_gate: asyncio.Semaphore | None = None,
+    persona_id: str | None = None,
 ) -> None:
     """Fire-and-forget `_drive_turn`, tracked in `app.state.background_tasks`
     so `create_app`'s lifespan shutdown can cancel and await it instead of
@@ -1365,14 +1405,20 @@ def _spawn_turn(
 
     async def _run() -> None:
         if concurrency_gate is None:
-            await _drive_turn(app, conversation_id, graph_input, thread_id)
+            await _drive_turn(app, conversation_id, graph_input, thread_id, persona_id)
         else:
             async with concurrency_gate:
-                await _drive_turn(app, conversation_id, graph_input, thread_id)
+                await _drive_turn(app, conversation_id, graph_input, thread_id, persona_id)
 
     task = asyncio.create_task(_run())
     app.state.background_tasks.add(task)
     task.add_done_callback(app.state.background_tasks.discard)
+    # Only registered if this thread doesn't already have one -- a fan-out
+    # leg's thread_id is always fresh/single-use per call, but registering
+    # unconditionally is still correct defense: whichever task is current
+    # for this thread_id is the one a stop request should target.
+    app.state.turn_tasks[thread_id] = task
+    task.add_done_callback(lambda t: app.state.turn_tasks.pop(thread_id, None) if app.state.turn_tasks.get(thread_id) is t else None)
 
 
 def _spawn_fanout_turns(
@@ -1391,7 +1437,7 @@ def _spawn_fanout_turns(
     for persona_id in persona_ids:
         graph_thread_id = f"{conversation_id}::mention::{persona_id}::{trigger_message_id}"
         state = graph_build.new_state(conversation_id, persona_id)
-        _spawn_turn(app, conversation_id, state, graph_thread_id, semaphore)
+        _spawn_turn(app, conversation_id, state, graph_thread_id, semaphore, persona_id)
 
 
 def _graph_thread_id_for_question(conversation_id: str, question_id: str) -> str:
@@ -1444,7 +1490,12 @@ async def _resume_with_answer(app: FastAPI, conversation_id: str, answer: AskAns
         await asyncio.sleep(_RESUME_POLL_INTERVAL_SECONDS)
         snapshot = await app.state.graph.aget_state(config)
     decision = {"selected": answer.selected, "custom": answer.custom}
-    _spawn_turn(app, conversation_id, Command(resume=decision), graph_thread_id)
+    # snapshot.values is the checkpointed TapestryGraphState -- persona_id
+    # was set on it back when this turn's own new_state() first ran, and
+    # a resume never changes who the turn belongs to, so it's still the
+    # right persona to show as "typing" again.
+    persona_id = snapshot.values.get("persona_id")
+    _spawn_turn(app, conversation_id, Command(resume=decision), graph_thread_id, persona_id=persona_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1494,6 +1545,12 @@ async def create_app() -> FastAPI:
         # alongside it is what still catches a turn left open by a
         # *previous* process (this set is empty again after any restart).
         app.state.turns_in_flight = set()
+        # UX ask, not in the original scope doc: lets POST .../stop find
+        # and cancel the exact asyncio task running a given thread's turn.
+        # Keyed by thread_id, same as turns_in_flight/running_activity --
+        # a tag-all fan-out leg has its own entry, so stopping one leg
+        # never touches a sibling leg's still-running task.
+        app.state.turn_tasks = {}
         try:
             yield
         finally:
@@ -1649,7 +1706,7 @@ async def create_app() -> FastAPI:
             _reject_if_turn_in_progress(app, conversation_id)
             message = _append_user_message(conversation_id, body.text)
             state = graph_build.new_state(conversation_id, persona_ids[0])
-            _spawn_turn(app, conversation_id, state)
+            _spawn_turn(app, conversation_id, state, persona_id=persona_ids[0])
             return message
 
         # Tag-all fan-out path (spec §2). No `_reject_if_turn_in_progress`
@@ -1796,6 +1853,36 @@ async def create_app() -> FastAPI:
             # file.
             config = {"configurable": {"thread_id": conversation_id}}
             await app.state.graph.aupdate_state(config, {"model_override_once": body.model})
+        return Response(status_code=204)
+
+    @app.post("/api/conversations/{conversation_id}/stop", status_code=204)
+    async def stop_conversation(conversation_id: str) -> Response:
+        """UX ask, not in the original scope doc: cancel every turn (the
+        main thread, and every tag-all fan-out leg) currently running for
+        this conversation, right now, rather than waiting for a natural
+        stopping point.
+
+        Finds each open `turn/start`'s `graph_thread_id` from the durable
+        log, looks up that thread's live asyncio task in
+        `app.state.turn_tasks` (registered by `_spawn_turn`), and calls
+        `task.cancel()` on it directly -- `_drive_turn`'s own `except
+        asyncio.CancelledError` branch is what actually appends the
+        matching `turn/end` (`reason=STOPPED_BY_HUMAN_REASON`) and
+        broadcasts `turn/stopped`, so this handler itself does no event-log
+        writing; it only triggers cancellation and waits for that to land.
+
+        A thread with no live task (already finished, or paused at an
+        approval interrupt with nothing actively running) is silently
+        skipped -- "stop the thing that's currently working" has nothing
+        to do to it, and that's not an error.
+        """
+        _ensure_conversation(conversation_id, app)
+        open_starts = events.find_open_turns(events.read_events(conversation_id))
+        for start_event in open_starts.values():
+            thread_id = start_event.payload.get("graph_thread_id", conversation_id)
+            task = app.state.turn_tasks.get(thread_id)
+            if task is not None and not task.done():
+                task.cancel()
         return Response(status_code=204)
 
     # -- Ask / approvals ---------------------------------------------------

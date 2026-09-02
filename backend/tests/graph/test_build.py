@@ -28,6 +28,7 @@ from tapestry.graph.budgets import DelegationDepthExceeded, TurnBudgetExceeded
 from tapestry.graph.checkpointer import get_checkpointer
 from tapestry.graph.verify import VerificationResult
 from tapestry.models.litellm_client import ModelResponse
+from tapestry.skills.registry import SkillSummary
 from tapestry.tools.file_editor import ToolResult
 
 
@@ -146,6 +147,50 @@ def test_build_tool_schemas_always_includes_core_capabilities():
     assert "terminal_read_only" in names
     # But NOT tools she isn't permitted (file_editor is Rex's, not hers).
     assert "file_editor" not in names
+
+
+# ---------------------------------------------------------------------------
+# System prompt / skill-catalog rendering
+#
+# Root cause of the "Ada loads three skills to answer 'hi'" UX bug: the
+# catalog SkillSummary.when_to_use field was parsed from frontmatter and
+# fully populated, but _build_system_prompt only ever rendered
+# `name: description`, so the model never saw the guidance that would tell
+# it a skill doesn't apply to small talk. It had to guess from the
+# description alone, and guessed wrong -- expensively.
+# ---------------------------------------------------------------------------
+
+
+def _skill_summary(name: str, description: str, when_to_use: str | None) -> SkillSummary:
+    return SkillSummary(
+        name=name,
+        description=description,
+        when_to_use=when_to_use,
+        user_invocable=False,
+        rank=0,
+        source="test",
+    )
+
+
+def test_system_prompt_surfaces_when_to_use_so_the_model_can_skip_irrelevant_skills():
+    ada = build.PERSONAS["ada"]
+    catalog = [
+        _skill_summary(
+            "systematic-debugging",
+            "A rigorous process for isolating and fixing bugs.",
+            "Use when investigating a reported bug or unexpected behavior, not for small talk.",
+        )
+    ]
+    prompt = build._build_system_prompt(ada, catalog)
+    assert "systematic-debugging: A rigorous process" in prompt
+    assert "When to use: Use when investigating a reported bug" in prompt
+
+
+def test_system_prompt_tells_the_model_not_to_load_skills_for_small_talk():
+    ada = build.PERSONAS["ada"]
+    catalog = [_skill_summary("test-driven-development", "Write a failing test first.", "Use before implementing.")]
+    prompt = build._build_system_prompt(ada, catalog)
+    assert "small talk" in prompt.lower()
 
 
 def test_new_state_fills_documented_defaults():

@@ -43,6 +43,7 @@ export const SunIcon = makeIcon('<circle cx="12" cy="12" r="4.2"/><line x1="12" 
 export const MoonIcon = makeIcon('<path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5Z"/>');
 export const CheckIcon = makeIcon('<polyline points="4 12.5 9.5 18 20 6"/>');
 export const SendIcon = makeIcon('<line x1="21" y1="3" x2="10" y2="14"/><polygon points="21 3 14.5 21 10 14 3 9.5 21 3"/>');
+export const StopIcon = makeIcon('<circle cx="12" cy="12" r="9"/><rect x="9" y="9" width="6" height="6" fill="currentColor" stroke="none"/>');
 export const UsersIcon = makeIcon('<circle cx="8.5" cy="8" r="3.2"/><path d="M2.5 20c0-3.6 2.7-6 6-6s6 2.4 6 6"/><circle cx="17" cy="9" r="2.6"/><path d="M15.2 14.2c2.6.3 4.3 2.5 4.3 5.8"/>');
 export const UserIcon = makeIcon('<circle cx="12" cy="8" r="3.6"/><path d="M4.5 20c0-4.2 3.3-6.8 7.5-6.8s7.5 2.6 7.5 6.8"/>');
 export const MonitorIcon = makeIcon('<rect x="3" y="4.5" width="18" height="12" rx="1.6"/><line x1="8" y1="20" x2="16" y2="20"/><line x1="12" y1="16.5" x2="12" y2="20"/>');

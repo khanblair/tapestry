@@ -519,6 +519,36 @@ def test_full_turn_over_websocket_with_approval_interrupt_and_resume(client, mon
     assert sum(1 for e in logged if e.type == "tool/result") == 1
 
 
+def test_persona_typing_frame_broadcasts_start_and_stop(client, monkeypatch):
+    """UX ask (not in the original scope doc): the human should see a
+    typing indicator while a persona's turn is in flight, keyed to the
+    real persona id, so a paused-at-approval turn correctly stops
+    "typing" instead of leaving a stale indicator on screen.
+    """
+    monkeypatch.setattr(graph_build, "call_model", AsyncMock(return_value=_plain_response("hi")))
+
+    conversation_id = "dm-rex"
+    with client.websocket_connect(f"/ws/conversations/{conversation_id}") as ws:
+        send_res = client.post(
+            f"/api/conversations/{conversation_id}/messages", json={"text": "hello"}
+        )
+        assert send_res.status_code == 201
+
+        started = None
+        stopped = None
+        for _ in range(200):
+            frame = ws.receive_json()
+            if frame["type"] != "persona/typing":
+                continue
+            if not frame["payload"].get("done"):
+                started = frame["payload"]
+            else:
+                stopped = frame["payload"]
+                break
+        assert started == {"persona_id": "rex"}
+        assert stopped == {"persona_id": "rex", "done": True}
+
+
 def test_second_message_rejected_while_first_turn_still_running(client, monkeypatch):
     """`tapestry_mentions_concurrency_status_spec.md` §1's concurrency bug,
     the "actively running" half: proven (before the fix) to silently
@@ -601,6 +631,62 @@ def test_a_crashed_turn_self_heals_instead_of_wedging_the_conversation(client, m
         f"/api/conversations/{conversation_id}/messages", json={"text": "second"}
     )
     assert second.status_code == 201
+
+
+def test_stop_cancels_a_running_turn_and_the_conversation_self_heals(client, monkeypatch):
+    """UX ask, not in the original scope doc: a human should be able to
+    stop generation mid-turn rather than wait for it to finish. `call_model`
+    hangs on `hang.wait()` so the turn is genuinely still executing when
+    POST .../stop cancels its task -- that cancellation propagates as
+    `asyncio.CancelledError` out of `hang.wait()`, which `_drive_turn`'s
+    own `except asyncio.CancelledError` branch must catch and turn into a
+    real `turn/end` (not leave the conversation wedged, same failure mode
+    as the crash-recovery test above but via a different trigger).
+    """
+    hang = asyncio.Event()
+
+    async def never_returns(*args, **kwargs):
+        await hang.wait()
+        raise AssertionError("should have been cancelled before this point")
+
+    monkeypatch.setattr(graph_build, "call_model", never_returns)
+
+    conversation_id = "dm-rex"
+    send_res = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "please help"}
+    )
+    assert send_res.status_code == 201
+
+    import time
+
+    for _ in range(50):
+        if any(e.type == "turn/start" for e in events_module.read_events(conversation_id)):
+            break
+        time.sleep(0.05)
+
+    stop_res = client.post(f"/api/conversations/{conversation_id}/stop")
+    assert stop_res.status_code == 204
+
+    logged = []
+    for _ in range(50):
+        logged = events_module.read_events(conversation_id)
+        if any(e.type == "turn/end" for e in logged):
+            break
+        time.sleep(0.05)
+
+    turn_ends = [e for e in logged if e.type == "turn/end"]
+    assert len(turn_ends) == 1
+    assert turn_ends[0].payload["reason"] == events_module.STOPPED_BY_HUMAN_REASON
+
+    # Without the fix, the cancelled task's own turn/start is never
+    # matched, so a new message still 409s exactly like the crash case.
+    monkeypatch.setattr(graph_build, "call_model", AsyncMock(return_value=_plain_response("back")))
+    second = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "second"}
+    )
+    assert second.status_code == 201
+
+    hang.set()  # let the (already-cancelled) task's await finish unwinding
 
 
 def test_second_message_rejected_while_first_turn_paused_at_approval_and_original_still_resumable(

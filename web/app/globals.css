@@ -490,6 +490,60 @@ button {
   display: flex;
   gap: 10px;
 }
+.typing-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.typing-avatars {
+  display: inline-flex;
+}
+.typing-avatars > *:not(:first-child) {
+  margin-left: -8px;
+}
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 7px 10px;
+  background: var(--surface-2);
+  border-radius: 12px;
+}
+.typing-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  animation: typing-bounce 1.2s infinite ease-in-out;
+}
+.typing-dots span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.typing-dots span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+@keyframes typing-bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.5;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+.typing-label {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.typing-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
 .msg .body {
   flex: 1 1 auto;
   min-width: 0;
