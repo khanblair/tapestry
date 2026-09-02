@@ -1,9 +1,15 @@
 FROM node:22-slim AS base
 WORKDIR /app
 RUN corepack enable
+# pnpm's dependency-status check tries to interactively confirm before
+# touching node_modules, which has no TTY to prompt in a Docker build
+# (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY) -- CI=true is pnpm's own
+# documented fix for exactly this, surfaced directly in its own error
+# message. Verified by actually building this image, not assumed.
+ENV CI=true
 
 FROM base AS deps
-COPY package.json pnpm-lock.yaml* ./
+COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml* ./
 RUN pnpm install --frozen-lockfile || pnpm install
 
 FROM base AS build
