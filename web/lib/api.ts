@@ -11,6 +11,12 @@
  * originally specified shape.
  */
 
+// The five modes a persona can run under — tapestry_modes_models_personas_spec.md
+// §1. Manual is today's original (and still default) behavior: every
+// mutating tool call asks first. See that spec for the full per-mode
+// breakdown (Accept edits/Auto/Plan/Bypass).
+export type Mode = "manual" | "accept_edits" | "auto" | "plan" | "bypass";
+
 export interface Persona {
   id: string;
   name: string;
@@ -28,6 +34,16 @@ export interface Persona {
   systemPrompt?: string;
   tools?: string[];
   mcp?: string[];
+  // --- additive (optional), tapestry_modes_models_personas_spec.md §3 —
+  // every field here mirrors backend/tapestry/core/personas.py's Persona
+  // one-for-one, camelCased. All optional: a persona with none of these
+  // set behaves exactly as it always has.
+  fallbackModels?: string[];
+  guardianModel?: string;
+  reasoningEffort?: string;
+  defaultMode?: Mode;
+  maxTurns?: number;
+  maxDelegationDepth?: number;
 }
 
 export interface Conversation {
@@ -37,6 +53,13 @@ export interface Conversation {
   personaIds: string[];
   lastPreview?: string;
   updatedAt: string;
+  // The lead persona's (personaIds[0]) current effective mode/model —
+  // session/global scope only, per spec §1.6/§2.2 (a "once" override is
+  // deliberately not reflected here: it's a one-shot value for the very
+  // next turn, not standing conversation state worth surfacing as "the"
+  // current mode/model).
+  mode: Mode;
+  model: string;
 }
 
 export interface Message {
@@ -282,6 +305,12 @@ export interface PersonaDraft {
   systemPrompt?: string;
   tools?: string[];
   mcp?: string[];
+  fallbackModels?: string[];
+  guardianModel?: string;
+  reasoningEffort?: string;
+  defaultMode?: Mode;
+  maxTurns?: number;
+  maxDelegationDepth?: number;
 }
 
 export async function createPersona(draft: PersonaDraft): Promise<Persona> {
@@ -317,6 +346,36 @@ export async function answerAsk(conversationId: string, answers: AskAnswer[]): P
   await request<void>(`/api/conversations/${encodeURIComponent(conversationId)}/ask/answers`, {
     method: "POST",
     body: JSON.stringify({ answers }),
+  });
+}
+
+// --- Modes and model switching (tapestry_modes_models_personas_spec.md
+// §1.6/§2.2) — both post an event the backend appends to the conversation's
+// log (mode/changed, persona/model_switched), read back via Conversation.mode
+// / .model above.
+
+export async function setConversationMode(
+  conversationId: string,
+  personaId: string,
+  mode: Mode,
+): Promise<void> {
+  await request<void>(`/api/conversations/${encodeURIComponent(conversationId)}/mode`, {
+    method: "POST",
+    body: JSON.stringify({ mode, personaId }),
+  });
+}
+
+export type ModelSwitchScope = "once" | "session";
+
+export async function setConversationModel(
+  conversationId: string,
+  personaId: string,
+  model: string,
+  scope: ModelSwitchScope,
+): Promise<void> {
+  await request<void>(`/api/conversations/${encodeURIComponent(conversationId)}/model`, {
+    method: "POST",
+    body: JSON.stringify({ model, personaId, scope }),
   });
 }
 
