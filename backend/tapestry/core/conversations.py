@@ -1,9 +1,19 @@
 """Conversation history, projected FROM the event log — never stored twice.
 
-`derive_messages` is the ONLY way conversation history is ever assembled.
-Nothing in this codebase should keep a separate "messages" table or list —
-every message a human or persona ever sees is recomputed from
-`events.read_events` on demand.
+`derive_messages` is the ONLY way conversation history is ever assembled
+**as input to a model** (`graph/build.py`'s `persona_node` reads it to
+rebuild message-list context for a turn). Nothing in this codebase should
+keep a separate "messages" table or list — every message a human or
+persona ever sees is recomputed from `events.read_events` on demand.
+
+`derive_timeline`, below, is a *deliberately separate* wider projection for
+the UI, not a replacement for `derive_messages`. The event log carries far
+more than chat turns — tool results, diffs, task lifecycle, delegation —
+and a human watching a conversation benefits from seeing all of it, but a
+model rebuilding its own context should not: widening `derive_messages`
+itself would silently leak tool-result/task-lifecycle noise into every
+persona's own message history. Two readers, two projections, one source of
+truth underneath.
 """
 
 from __future__ import annotations
@@ -60,3 +70,60 @@ def derive_messages(conversation_id: str) -> list[Message]:
             )
         )
     return messages
+
+
+# Pure internal bookkeeping, excluded from the timeline: `model/response`
+# (cost/token accounting, not display content — an explicit user decision,
+# not a default), `turn/start`/`turn/end` (graph-loop bracketing, no
+# human-facing content of their own), `conversation/created` (conversation
+# metadata already reflected in the `Conversation` object itself, not an
+# event that happened *during* the conversation).
+_TIMELINE_EXCLUDED_TYPES = frozenset(
+    {"model/response", "turn/start", "turn/end", "conversation/created"}
+)
+
+
+class TimelineItem(BaseModel):
+    id: str
+    conversation_id: str
+    actor: str
+    timestamp: str
+    type: str
+    payload: dict
+    thread_id: str | None = None
+
+
+def derive_timeline(conversation_id: str) -> list[TimelineItem]:
+    """Project every human-displayable event into a `TimelineItem`, in log
+    order — the deliberately WIDE sibling to `derive_messages` (see module
+    docstring for why these are two separate projections rather than one
+    widened function).
+
+    Unlike `derive_messages`, nothing is dropped here except the handful of
+    event types in `_TIMELINE_EXCLUDED_TYPES` — a `tool/result`,
+    `task/diff_ready`, `task/started`, `task/completed`,
+    `task/verification_failed`, `delegation/sent`, `ask/requested`, or
+    `ask/answered` event all project through, alongside `user/message` and
+    `assistant/message`. `payload` is passed through unflattened: a caller
+    needing type-specific fields (`task/diff_ready`'s
+    `files`/`additions`/`deletions`, `tool/result`'s
+    `tool_name`/`arguments`/`is_error`, ...) reads them directly rather
+    than this module guessing which subset any given caller wants.
+    """
+    all_events = events.read_events(conversation_id)
+    items: list[TimelineItem] = []
+    for event in all_events:
+        if event.type in _TIMELINE_EXCLUDED_TYPES:
+            continue
+        items.append(
+            TimelineItem(
+                id=event.id,
+                conversation_id=event.conversation_id,
+                actor=event.actor,
+                timestamp=event.timestamp,
+                type=event.type,
+                payload=event.payload,
+                thread_id=event.payload.get("thread_id"),
+            )
+        )
+    return items

@@ -168,6 +168,49 @@ def read_events(conversation_id: str, since: str | None = None) -> list[Tapestry
     ]
 
 
+def read_recent_events(types: set[str] | None = None, limit: int = 50) -> list[TapestryEvent]:
+    """Read the most recent events **across every conversation**, newest first.
+
+    The one exception to "the event log is always read scoped to one
+    conversation" (see `schema.sql`'s own comment on why that's the only
+    index that matters) — a cross-conversation activity feed (Activity
+    screen's "Running now" / "Recent") genuinely needs this, and
+    `read_events(conversation_id)` structurally cannot answer it. `types`,
+    when given, restricts to those event types via a `WHERE type IN (...)`
+    clause evaluated by SQLite before `LIMIT` is applied, so `limit` means
+    "the N most recent matching events," not "the N most recent events,
+    then filter" (which could return fewer than `limit` even when more
+    matches exist further back).
+    """
+    conn = get_connection()
+    _ensure_schema(conn)
+    if types:
+        placeholders = ",".join("?" for _ in types)
+        cursor = conn.execute(
+            "SELECT id, conversation_id, type, timestamp, actor, payload_json "
+            f"FROM events WHERE type IN ({placeholders}) ORDER BY rowid DESC LIMIT ?",
+            (*types, limit),
+        )
+    else:
+        cursor = conn.execute(
+            "SELECT id, conversation_id, type, timestamp, actor, payload_json "
+            "FROM events ORDER BY rowid DESC LIMIT ?",
+            (limit,),
+        )
+    rows = cursor.fetchall()
+    return [
+        TapestryEvent(
+            id=row[0],
+            conversation_id=row[1],
+            type=row[2],
+            timestamp=row[3],
+            actor=row[4],
+            payload=json.loads(row[5]),
+        )
+        for row in rows
+    ]
+
+
 def close_orphaned_turns(conversation_id: str) -> list[TapestryEvent]:
     """Close any `turn/start` in this conversation with no matching `turn/end`.
 

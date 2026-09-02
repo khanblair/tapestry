@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from tapestry.core.conversations import Message, derive_messages
+from tapestry.core.conversations import Message, TimelineItem, derive_messages, derive_timeline
 from tapestry.core.events import append_event
 
 
@@ -70,3 +70,63 @@ def test_derive_messages_defaults_missing_text_to_empty_string():
 
 def test_derive_messages_on_empty_conversation_returns_empty_list():
     assert derive_messages("does-not-exist") == []
+
+
+def test_derive_timeline_projects_message_and_non_message_events():
+    append_event("conv-1", "user/message", "human", {"text": "fix the auth bug"})
+    append_event(
+        "conv-1",
+        "tool/result",
+        "ada",
+        {"task_id": "t1", "tool_name": "file_editor", "text": "wrote 3 lines", "is_error": False},
+    )
+    append_event(
+        "conv-1",
+        "task/diff_ready",
+        "ada",
+        {"task_id": "t1", "files": [{"name": "auth.py"}], "additions": 3, "deletions": 1},
+    )
+
+    timeline = derive_timeline("conv-1")
+
+    assert [item.type for item in timeline] == ["user/message", "tool/result", "task/diff_ready"]
+    assert all(isinstance(item, TimelineItem) for item in timeline)
+    assert timeline[1].payload["tool_name"] == "file_editor"
+    assert timeline[2].payload["additions"] == 3
+
+
+def test_derive_timeline_excludes_pure_bookkeeping_events():
+    append_event("conv-1", "user/message", "human", {"text": "hi"})
+    append_event("conv-1", "turn/start", "human", {})
+    append_event("conv-1", "model/response", "ada", {"cost": 0.01})
+    append_event("conv-1", "turn/end", "ada", {"turn_id": "x", "reason": "done"})
+    append_event("conv-1", "conversation/created", "system", {"kind": "dm"})
+
+    timeline = derive_timeline("conv-1")
+
+    assert len(timeline) == 1
+    assert timeline[0].type == "user/message"
+
+
+def test_derive_timeline_preserves_event_log_order():
+    append_event("conv-1", "user/message", "human", {"text": "first"})
+    append_event("conv-1", "task/started", "ada", {"task_id": "t1"})
+    append_event("conv-1", "task/completed", "ada", {"task_id": "t1"})
+
+    timeline = derive_timeline("conv-1")
+
+    assert [item.type for item in timeline] == ["user/message", "task/started", "task/completed"]
+
+
+def test_derive_timeline_is_scoped_to_conversation():
+    append_event("conv-1", "task/started", "ada", {"task_id": "t1"})
+    append_event("conv-2", "task/started", "rex", {"task_id": "t2"})
+
+    timeline = derive_timeline("conv-1")
+
+    assert len(timeline) == 1
+    assert timeline[0].payload["task_id"] == "t1"
+
+
+def test_derive_timeline_on_empty_conversation_returns_empty_list():
+    assert derive_timeline("does-not-exist") == []

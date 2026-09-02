@@ -140,6 +140,7 @@ from tapestry.core.conversations import derive_messages
 from tapestry.core.delegation import DelegationRoundLimitExceeded, delegate
 from tapestry.core.personas import Persona, load_personas
 from tapestry.graph import budgets, streaming, verify
+from tapestry.graph.diff_capture import capture_workspace_diff
 from tapestry.graph.budgets import DelegationDepthExceeded
 from tapestry.graph.checkpointer import get_checkpointer
 from tapestry.models.litellm_client import call_model
@@ -1038,18 +1039,40 @@ async def execute_node(state: TapestryGraphState) -> dict:
     )
 
     if tool_name in DIFF_PRODUCING_TOOLS and not result.is_error:
+        # Real, structured diff data via `git diff` — see
+        # graph/diff_capture.py's module docstring for why this is scoped
+        # to the whole workspace rather than reconstructed from `arguments`.
+        # `None` (not a git repo, `git` missing, nothing uncommitted) falls
+        # back to the old best-effort shape rather than emitting a
+        # `task/diff_ready` with an empty files list — a tool call that
+        # DID produce output should still leave the frontend something to
+        # show, even in an environment where real diff capture can't run.
+        workspace_diff = await capture_workspace_diff(_workspace_root())
+        if workspace_diff is not None:
+            diff_payload = {
+                "task_id": task_id,
+                "files_changed": [f.name for f in workspace_diff.files],
+                "diff_summary": result.text[:2000],
+                "additions": workspace_diff.additions,
+                "deletions": workspace_diff.deletions,
+                "truncated": workspace_diff.truncated,
+                "files": [f.model_dump(by_alias=False) for f in workspace_diff.files],
+            }
+        else:
+            diff_payload = {
+                "task_id": task_id,
+                "files_changed": [arguments["path"]] if "path" in arguments else [],
+                "diff_summary": result.text[:2000],
+                "additions": None,
+                "deletions": None,
+                "truncated": False,
+                "files": [],
+            }
         events.append_event(
             conversation_id,
             "task/diff_ready",
             actor=persona.id,
-            payload=_with_thread(
-                state,
-                {
-                    "task_id": task_id,
-                    "files_changed": [arguments["path"]] if "path" in arguments else [],
-                    "diff_summary": result.text[:2000],
-                },
-            ),
+            payload=_with_thread(state, diff_payload),
         )
 
     messages = list(state.get("messages", []))

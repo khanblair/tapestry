@@ -6,6 +6,7 @@ from tapestry.core.events import (
     append_event,
     close_orphaned_turns,
     read_events,
+    read_recent_events,
 )
 
 
@@ -107,6 +108,53 @@ def test_close_orphaned_turns_only_closes_the_orphan_among_several():
 
     assert len(closed) == 1
     assert closed[0].payload["turn_id"] == open_start.id
+
+
+def test_read_recent_events_spans_every_conversation():
+    append_event("conv-1", "task/started", "ada", {"n": 1})
+    append_event("conv-2", "task/started", "rex", {"n": 2})
+
+    recent = read_recent_events()
+
+    assert {e.payload["n"] for e in recent} == {1, 2}
+
+
+def test_read_recent_events_orders_newest_first():
+    append_event("conv-1", "task/started", "ada", {"n": 1})
+    append_event("conv-1", "task/started", "ada", {"n": 2})
+    append_event("conv-1", "task/started", "ada", {"n": 3})
+
+    recent = read_recent_events()
+
+    assert [e.payload["n"] for e in recent] == [3, 2, 1]
+
+
+def test_read_recent_events_respects_limit():
+    for n in range(5):
+        append_event("conv-1", "task/started", "ada", {"n": n})
+
+    recent = read_recent_events(limit=2)
+
+    assert [e.payload["n"] for e in recent] == [4, 3]
+
+
+def test_read_recent_events_filters_by_type_before_limiting():
+    append_event("conv-1", "task/started", "ada", {"n": 1})
+    append_event("conv-1", "turn/start", "ada", {"n": 2})
+    append_event("conv-1", "task/started", "ada", {"n": 3})
+    append_event("conv-1", "turn/start", "ada", {"n": 4})
+    append_event("conv-1", "task/started", "ada", {"n": 5})
+
+    recent = read_recent_events(types={"task/started"}, limit=2)
+
+    # the two most recent task/started events, ignoring the turn/start
+    # events interleaved between them -- not "the 2 most recent events,
+    # then filter" (which would return only n=5, since n=4 is a turn/start).
+    assert [e.payload["n"] for e in recent] == [5, 3]
+
+
+def test_read_recent_events_on_empty_log_returns_empty_list():
+    assert read_recent_events() == []
 
 
 def test_close_orphaned_turns_is_scoped_to_its_conversation():

@@ -210,6 +210,14 @@ async def test_approval_interrupt_resume_tool_runs_exactly_once(tmp_path):
             assert sum(1 for e in events_after_resume if e.type == "tool/result") == 1
             assert sum(1 for e in events_after_resume if e.type == "task/diff_ready") == 1
 
+            diff_ready = next(e for e in events_after_resume if e.type == "task/diff_ready")
+            # tmp_path isn't a git repo, so capture_workspace_diff() falls
+            # back to the best-effort shape -- but the new keys must still
+            # be present (as None/empty, not missing) so a wire model
+            # expecting them never has to special-case a KeyError.
+            for key in ("additions", "deletions", "truncated", "files"):
+                assert key in diff_ready.payload
+
             ask_answered = next(e for e in events_after_resume if e.type == "ask/answered")
             assert ask_answered.payload["answers"][0]["selected"] == ["approve"]
     finally:

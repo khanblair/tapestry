@@ -75,6 +75,12 @@ export interface AskQuestion {
   options?: string[];
   multiSelect?: boolean;
   intent?: string;
+  // --- additive: links an approval-intent question back to the task it
+  // gates (backend's core/ask.py AskQuestion.related_task_id, present in
+  // the model since the graph/build.py pass but never exposed on the wire
+  // until now). Lets getApprovalForDiff below find "the approval question
+  // for this diff" directly instead of a same-conversation heuristic scan.
+  relatedTaskId?: string;
 }
 
 export interface AskAnswer {
@@ -86,6 +92,129 @@ export interface AskAnswer {
 export interface ConversationEvent {
   type: string;
   payload: unknown;
+}
+
+// --- Diff detail (full per-line content for the diff screen) ---
+//
+// Message.diff (above) is a SUMMARY only (file count + total add/del) —
+// enough for DiffChip's inline chip, not enough for DiffViewer's file
+// tabs + line-numbered content. This is the real, separate shape for
+// that: one file's real `git diff` hunks, parsed server-side by
+// backend/tapestry/graph/diff_capture.py, not reconstructed here.
+
+export interface DiffLine {
+  type: "add" | "del" | "ctx";
+  lineNumber: number;
+  content: string;
+}
+
+export interface DiffFile {
+  name: string;
+  lines: DiffLine[];
+}
+
+export interface DiffDetail {
+  taskId: string;
+  title: string;
+  fileCount: number;
+  additions: number;
+  deletions: number;
+  files: DiffFile[];
+}
+
+export async function getDiffDetail(
+  conversationId: string,
+  taskId: string,
+): Promise<DiffDetail | null> {
+  try {
+    return await request<DiffDetail>(
+      `/api/conversations/${encodeURIComponent(conversationId)}/diff/${encodeURIComponent(taskId)}`,
+    );
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+// --- Pending approvals inbox (Activity screen's "Needs your input") ---
+//
+// Wraps the backend's already-existing GET /api/asks/pending — real since
+// the web adapter's first pass, just never called from the frontend
+// (components/settings/../app/activity/page.tsx did its own N+1
+// conversation scan via lib/safeApi.ts instead).
+
+export interface PendingApproval {
+  conversationId: string;
+  conversationLabel: string;
+  question: AskQuestion;
+}
+
+export async function getPendingApprovals(): Promise<PendingApproval[]> {
+  return request<PendingApproval[]>("/api/asks/pending");
+}
+
+// --- Cross-conversation activity feed (Activity screen's "Running now" /
+// "Recent") ---
+//
+// No per-conversation endpoint can answer this — it's the one screen that
+// genuinely needs a cross-conversation view of the event log. "running"
+// reflects live in-flight tool calls (ephemeral, in-memory on the
+// backend — the event log itself only ever records a tool call's FINAL
+// result, never "still going"); "recent" reflects real persisted
+// task/delegation history.
+
+export interface ActivityItem {
+  conversationId: string;
+  conversationLabel: string;
+  actor: string;
+  label: string;
+  timestamp: string;
+  taskId?: string;
+}
+
+export interface ActivityFeed {
+  running: ActivityItem[];
+  recent: ActivityItem[];
+}
+
+export async function getActivity(): Promise<ActivityFeed> {
+  return request<ActivityFeed>("/api/activity");
+}
+
+// --- System status (Settings screen's Platforms / Model Providers /
+// Tools & MCP panels) ---
+//
+// All three panels were hardcoded arrays with no backend call at all
+// before this. One endpoint covers all three: which chat surfaces have a
+// bot token configured, which LiteLLM providers have an API key
+// configured, and metamcp's real live tool/server list.
+
+export interface PlatformStatus {
+  name: string;
+  detail: string;
+  connected: boolean;
+  alwaysOn: boolean;
+}
+
+export interface ProviderStatus {
+  name: string;
+  connected: boolean;
+}
+
+export interface McpServerStatus {
+  name: string;
+  connected: boolean;
+}
+
+export interface SystemStatus {
+  platforms: PlatformStatus[];
+  providers: ProviderStatus[];
+  metamcp: { running: boolean; serverCount: number };
+  mcpServers: McpServerStatus[];
+}
+
+export async function getStatus(): Promise<SystemStatus> {
+  return request<SystemStatus>("/api/status");
 }
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
