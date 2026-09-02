@@ -128,7 +128,7 @@ import json
 import os
 import uuid
 from pathlib import Path
-from typing import Awaitable, Callable, TypedDict
+from typing import Awaitable, Callable, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -222,6 +222,14 @@ class TapestryGraphState(TypedDict, total=False):
     turn_id: str | None  # the open turn/start event id this state belongs to
     approved: bool | None  # last approval decision, consumed by execute_node
     next_node: str  # routing signal computed by whichever node just ran
+    # tapestry_modes_models_personas_spec.md §2.2: a "once" scope model
+    # override, applying to exactly the next persona_node pass. Not event-
+    # logged (unlike session/global scope) -- genuinely ephemeral, cleared
+    # by persona_node itself immediately after use. Set externally via
+    # `graph.aupdate_state(config, {"model_override_once": model})`, the
+    # same mechanism session/global scope don't need since those live in
+    # the event log instead.
+    model_override_once: str | None
 
 
 def new_state(
@@ -248,6 +256,7 @@ def new_state(
         turn_id=None,
         approved=None,
         next_node="persona",
+        model_override_once=None,
     )
 
 
@@ -304,6 +313,161 @@ TOOLS_REQUIRING_APPROVAL: frozenset[str] = frozenset(
 # Tools whose successful result should also produce a task/diff_ready event
 # (files actually changed, so a frontend diff screen has something to show).
 DIFF_PRODUCING_TOOLS: frozenset[str] = frozenset({"file_editor", "git"})
+
+# ---------------------------------------------------------------------------
+# Modes — tapestry_modes_models_personas_spec.md §1. `TOOLS_REQUIRING_APPROVAL`
+# above remains the OUTER gate (a tool not in that set never goes through
+# approval_node, in ANY mode) — this tier map only distinguishes *within*
+# that set, since a flat set can express Manual/Bypass but not "Accept
+# edits" (gate everything except file edits) or Auto's tiered handling.
+# ---------------------------------------------------------------------------
+
+ToolRiskTier = Literal["safe", "edit", "mutate", "deploy"]
+
+TOOL_RISK_TIER: dict[str, ToolRiskTier] = {
+    "file_editor_read": "safe",
+    "terminal_read_only": "safe",
+    "test_runner": "safe",
+    "skill_loader": "safe",
+    "file_editor": "edit",
+    "terminal": "mutate",
+    "git": "mutate",
+    "deploy_pipeline": "deploy",
+}
+
+# The tools Plan mode intersects a persona's own `tools:` list down to —
+# everything else in TOOL_RISK_TIER ("edit"/"mutate"/"deploy") becomes
+# unreachable for that turn, regardless of what the persona's YAML
+# otherwise permits. See spec §1.4: this is deliberately an intersection,
+# not a replacement, so a persona with an already-narrower toolset (Ada)
+# keeps its own stronger, mode-independent guarantee.
+_PLAN_MODE_TOOLS: frozenset[str] = frozenset(
+    name for name, tier in TOOL_RISK_TIER.items() if tier == "safe"
+)
+
+VALID_MODES: frozenset[str] = frozenset({"manual", "accept_edits", "auto", "plan", "bypass"})
+
+_GUARDIAN_MODEL_ENV_VAR = "TAPESTRY_GUARDIAN_MODEL"
+
+
+def _effective_tools(persona_tools: list[str], mode: str) -> list[str]:
+    """The tool names actually offered to the model this turn — `persona.
+    tools` itself in every mode except Plan, which intersects it with the
+    read-only ("safe" tier) set. `skill_loader`/`delegate`/`task_complete`
+    are unaffected either way: `_build_tool_schemas` appends those
+    unconditionally, they are orchestration primitives, not
+    edit/mutate/deploy-tier tools Plan mode has any reason to block.
+    """
+    if mode == "plan":
+        return [name for name in persona_tools if name in _PLAN_MODE_TOOLS]
+    return persona_tools
+
+
+def _resolve_mode(conversation_id: str, persona: Persona) -> str:
+    """The active mode for `persona` in `conversation_id`: the most recent
+    `mode/changed` event scoped to this persona, falling back to `persona.
+    default_mode` when none exists yet. Per spec §1.6, mode is neither
+    purely static (baked into the persona) nor a purely global session
+    toggle — a per-conversation override, scoped per-persona so a group
+    conversation's personas can each be in a different mode.
+    """
+    for event in reversed(events.read_events(conversation_id)):
+        if event.type == "mode/changed" and event.payload.get("persona_id") == persona.id:
+            mode = event.payload.get("mode")
+            if mode in VALID_MODES:
+                return mode
+    return persona.default_mode
+
+
+def _resolve_model(
+    state: TapestryGraphState, conversation_id: str, persona: Persona
+) -> tuple[str, bool]:
+    """The effective model for this call: `state["model_override_once"]`
+    (once-scope, checked first and highest priority) > the most recent
+    `persona/model_switched` event scoped to this persona (session-scope)
+    > `persona.model` (global). Returns `(model, consumed_once)` —
+    `consumed_once` tells the caller to clear `model_override_once` from
+    state after this call, since a once-scope override applies to exactly
+    one `persona_node` pass, not durable history (spec §2.2).
+    """
+    once_override = state.get("model_override_once")
+    if once_override:
+        return once_override, True
+    for event in reversed(events.read_events(conversation_id)):
+        if event.type == "persona/model_switched" and event.payload.get("persona_id") == persona.id:
+            model = event.payload.get("model")
+            if model:
+                return model, False
+    return persona.model, False
+
+
+async def _guardian_review(persona: Persona, tool_name: str, arguments: dict) -> str:
+    """Auto mode's guardian check (spec §1.5) for an "edit"/"mutate"-tier
+    tool proposal — a second, cheap model call that reviews one proposed
+    tool call and returns `"approve"` or `"escalate"`. Deliberately never
+    reached for "deploy"-tier tools (see `_mode_requires_approval`) or in
+    any mode other than Auto.
+
+    Fails closed on every error path — no configured guardian model, the
+    model call itself raising, an unparseable response — all resolve to
+    `"escalate"`, never a silent auto-approve. A misconfigured or failing
+    guardian must never be MORE permissive than asking a human.
+    """
+    guardian_model = persona.guardian_model or os.environ.get(_GUARDIAN_MODEL_ENV_VAR)
+    if not guardian_model:
+        return "escalate"
+
+    prompt = (
+        "You are a safety reviewer screening ONE proposed tool call before it "
+        "runs without further human review. Judge only whether this specific "
+        "call is safe and reasonable to run unattended.\n\n"
+        f"Tool: {tool_name}\n"
+        f"Arguments: {json.dumps(arguments, sort_keys=True)}\n\n"
+        "Respond with exactly one word: APPROVE if this is safe to run "
+        "unattended, or ESCALATE if a human should review it first. When in "
+        "doubt, ESCALATE."
+    )
+    try:
+        response = await call_model(
+            model=guardian_model, messages=[{"role": "user", "content": prompt}], tools=None
+        )
+    except Exception:
+        return "escalate"
+
+    decision = response.text.strip().upper()
+    return "approve" if decision.startswith("APPROVE") else "escalate"
+
+
+async def _mode_requires_approval(
+    mode: str, tier: ToolRiskTier, persona: Persona, tool_name: str, arguments: dict
+) -> bool:
+    """Whether a proposed `tool_name` (already known to be in
+    `TOOLS_REQUIRING_APPROVAL`, i.e. tier is "edit"/"mutate"/"deploy") must
+    still go through `approval_node`'s `interrupt()`, under `mode`. Table
+    is spec §1.4's, implemented exactly:
+
+        Manual        -> always True
+        Bypass        -> always False
+        Accept edits  -> False for "edit", True otherwise
+        Auto          -> True for "deploy" (never guardian-eligible,
+                          matching Nova's own "most gated persona" design
+                          intent); guardian-screened otherwise
+        Plan          -> True (defensive fallback only — Plan's toolset
+                          intersection already prevents this tier from
+                          ever being proposed in the first place)
+    """
+    if mode == "bypass":
+        return False
+    if mode == "manual":
+        return True
+    if mode == "accept_edits":
+        return tier != "edit"
+    if mode == "auto":
+        if tier == "deploy":
+            return True
+        decision = await _guardian_review(persona, tool_name, arguments)
+        return decision != "approve"
+    return True
 
 # Interim permission-wrapping guard, NOT a sandbox — the real sandbox
 # boundary is the Phase 4 Docker tool-runner (see project_structure.md).
@@ -612,8 +776,8 @@ def _build_system_prompt(persona: Persona, catalog: list[SkillSummary]) -> str:
     return "\n".join(lines)
 
 
-def _build_tool_schemas(persona: Persona) -> list[dict]:
-    schemas = [TOOL_SCHEMAS[name] for name in persona.tools if name in TOOL_SCHEMAS]
+def _build_tool_schemas(tool_names: list[str]) -> list[dict]:
+    schemas = [TOOL_SCHEMAS[name] for name in tool_names if name in TOOL_SCHEMAS]
     # Core orchestration capabilities every persona has, regardless of its
     # own permissioned `tools:` list.
     schemas.append(TOOL_SCHEMAS[SKILL_LOADER_TOOL_NAME])
@@ -655,12 +819,29 @@ async def persona_node(state: TapestryGraphState) -> dict:
     conversation_id = state["conversation_id"]
     turn_count = state.get("turn_count", 0)
 
-    # Turn cap FIRST, before any other work -- per the task brief's own
-    # placement instruction ("turn cap in the persona node before
-    # proceeding").
-    budgets.check_turn_budget(turn_count)
-
+    # persona lookup moved ahead of the turn-cap check (previously first)
+    # specifically so persona.max_turns can override the global default —
+    # _get_persona is a pure in-memory dict lookup, no side effects, so
+    # reordering it earlier changes nothing about when anything actually
+    # happens.
     persona = _get_persona(state["persona_id"])
+
+    # Turn cap FIRST among anything with a side effect, before any other
+    # work -- per the task brief's own placement instruction ("turn cap in
+    # the persona node before proceeding").
+    budgets.check_turn_budget(turn_count, max_turns=persona.max_turns or budgets.DEFAULT_MAX_TURNS)
+
+    mode = _resolve_mode(conversation_id, persona)
+    effective_model, consumed_once = _resolve_model(state, conversation_id, persona)
+
+    # Every return path below must clear a consumed once-scope override
+    # (spec §2.2: it applies to exactly this one persona_node pass, never
+    # persisted history) — one choke point rather than repeating the same
+    # conditional key at every return statement.
+    def _finish(result: dict) -> dict:
+        if consumed_once:
+            return {**result, "model_override_once": None}
+        return result
 
     turn_id = state.get("turn_id")
     if turn_id is None:
@@ -676,16 +857,37 @@ async def persona_node(state: TapestryGraphState) -> dict:
     catalog = _SKILL_REGISTRY.discover()
 
     system_prompt = _build_system_prompt(persona, catalog)
-    tool_schemas = _build_tool_schemas(persona)
+    effective_tools = _effective_tools(persona.tools, mode)
+    tool_schemas = _build_tool_schemas(effective_tools)
     messages = [{"role": "system", "content": system_prompt}] + list(state.get("messages", []))
 
     streaming.emit(
         "persona/thinking", {"persona_id": persona.id, "conversation_id": conversation_id}
     )
-    response = await call_model(model=persona.model, messages=messages, tools=tool_schemas)
+    response = await call_model(
+        model=effective_model,
+        messages=messages,
+        tools=tool_schemas,
+        fallback_models=persona.fallback_models,
+    )
     streaming.emit(
         "persona/responded", {"persona_id": persona.id, "conversation_id": conversation_id}
     )
+
+    if response.model_used != effective_model:
+        # A fallback candidate answered instead of the requested model —
+        # see litellm_client.call_model's docstring for exactly when this
+        # happens. Logged so a human reviewing the conversation can see it,
+        # not just infer it from which model's name shows up in `raw`.
+        events.append_event(
+            conversation_id,
+            "model/fallback",
+            actor=persona.id,
+            payload=_with_thread(
+                state,
+                {"from_model": effective_model, "to_model": response.model_used, "reason": "primary_exhausted"},
+            ),
+        )
 
     # Cost/token measurement source of truth (budgets.measure_conversation_cost
     # sums these back up later) — appended right where the model call
@@ -723,7 +925,7 @@ async def persona_node(state: TapestryGraphState) -> dict:
             payload={"turn_id": turn_id, "reason": "assistant_reply"},
         )
         new_messages = messages[1:] + [{"role": "assistant", "content": response.text}]
-        return {"messages": new_messages, "turn_id": turn_id, "next_node": "end"}
+        return _finish({"messages": new_messages, "turn_id": turn_id, "next_node": "end"})
 
     function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
     tool_name = function.get("name", "")
@@ -733,25 +935,29 @@ async def persona_node(state: TapestryGraphState) -> dict:
     ]
 
     if tool_name == DELEGATE_TOOL_NAME:
-        return await _handle_delegate(state, persona, turn_id, arguments, new_messages)
+        return _finish(await _handle_delegate(state, persona, turn_id, arguments, new_messages))
 
     if tool_name == TASK_COMPLETE_TOOL_NAME:
-        return await _handle_task_complete(state, persona, turn_id, arguments, new_messages)
+        return _finish(
+            await _handle_task_complete(state, persona, turn_id, arguments, new_messages)
+        )
 
     if tool_name not in TOOL_REGISTRY or (
-        tool_name != SKILL_LOADER_TOOL_NAME and tool_name not in persona.tools
+        tool_name != SKILL_LOADER_TOOL_NAME and tool_name not in effective_tools
     ):
         feedback = {
             "role": "tool",
             "tool_call_id": tool_call.get("id", ""),
             "content": f"Tool {tool_name!r} is not permitted for persona {persona.id!r}.",
         }
-        return {
-            "messages": new_messages + [feedback],
-            "turn_id": turn_id,
-            "turn_count": turn_count + 1,
-            "next_node": "persona",
-        }
+        return _finish(
+            {
+                "messages": new_messages + [feedback],
+                "turn_id": turn_id,
+                "turn_count": turn_count + 1,
+                "next_node": "persona",
+            }
+        )
 
     task_id = state.get("task_id")
     if task_id is None:
@@ -770,36 +976,54 @@ async def persona_node(state: TapestryGraphState) -> dict:
     }
 
     if tool_name in TOOLS_REQUIRING_APPROVAL:
-        ask_request_id = uuid.uuid4().hex
-        question = AskQuestion(
-            id=ask_request_id,
-            question=f"Approve {persona.name} running {tool_name!r}?",
-            detail=json.dumps(arguments, sort_keys=True),
-            options=["approve", "reject"],
-            intent="approval",
-            related_task_id=task_id,
-        )
-        # Written here, exactly once — persona_node never re-executes due
-        # to approval_node's interrupt(), unlike anything inside
-        # approval_node itself. See module docstring.
-        events.append_event(
-            conversation_id,
-            "ask/requested",
-            actor="system",
-            payload=_with_thread(state, {"questions": [question.model_dump()]}),
-        )
-        pending_tool_call["ask_request_id"] = ask_request_id
-        next_node = "approval"
+        tier = TOOL_RISK_TIER.get(tool_name, "mutate")
+        needs_approval = await _mode_requires_approval(mode, tier, persona, tool_name, arguments)
+        if needs_approval:
+            ask_request_id = uuid.uuid4().hex
+            question = AskQuestion(
+                id=ask_request_id,
+                question=f"Approve {persona.name} running {tool_name!r}?",
+                detail=json.dumps(arguments, sort_keys=True),
+                options=["approve", "reject"],
+                intent="approval",
+                related_task_id=task_id,
+            )
+            # Written here, exactly once — persona_node never re-executes due
+            # to approval_node's interrupt(), unlike anything inside
+            # approval_node itself. See module docstring.
+            events.append_event(
+                conversation_id,
+                "ask/requested",
+                actor="system",
+                payload=_with_thread(state, {"questions": [question.model_dump()]}),
+            )
+            pending_tool_call["ask_request_id"] = ask_request_id
+            next_node = "approval"
+        else:
+            # Mode bypassed a would-otherwise-be-gated tool call. Logged
+            # (never silent) so the activity feed / conversation view can
+            # show WHY a human was never asked — see spec §4.
+            events.append_event(
+                conversation_id,
+                "mode/auto_approved",
+                actor=persona.id,
+                payload=_with_thread(
+                    state, {"tool_name": tool_name, "mode": mode, "task_id": task_id}
+                ),
+            )
+            next_node = "execute"
     else:
         next_node = "execute"
 
-    return {
-        "messages": new_messages,
-        "pending_tool_call": pending_tool_call,
-        "task_id": task_id,
-        "turn_id": turn_id,
-        "next_node": next_node,
-    }
+    return _finish(
+        {
+            "messages": new_messages,
+            "pending_tool_call": pending_tool_call,
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "next_node": next_node,
+        }
+    )
 
 
 async def _handle_delegate(
@@ -833,7 +1057,10 @@ async def _handle_delegate(
         # (separate) round cap that core.delegation.delegate() itself
         # enforces, so a depth violation is reported as exactly that and
         # never masked by a round-limit error instead.
-        budgets.check_delegation_depth(delegation_depth)
+        budgets.check_delegation_depth(
+            delegation_depth,
+            max_depth=persona.max_delegation_depth or budgets.DEFAULT_MAX_DELEGATION_DEPTH,
+        )
         await delegate(conversation_id, from_persona=persona.id, to_persona=to_persona, text=text)
     except (DelegationDepthExceeded, DelegationRoundLimitExceeded) as exc:
         # A hard cap is a real stopping decision, not a crash to hide —

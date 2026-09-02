@@ -42,7 +42,7 @@ def _json_response(**fields) -> ModelResponse:
         "notes": "looks good",
     }
     payload.update(fields)
-    return ModelResponse(text=json.dumps(payload), tool_calls=None)
+    return ModelResponse(text=json.dumps(payload), tool_calls=None, model_used="test-model")
 
 
 class TestPassingVerification:
@@ -114,7 +114,7 @@ class TestFailsClosed:
     """The gate must never default to passed=True on a malformed response."""
 
     async def test_unparseable_text_fails_closed(self):
-        bad_response = ModelResponse(text="Sure, looks good to me!", tool_calls=None)
+        bad_response = ModelResponse(text="Sure, looks good to me!", tool_calls=None, model_used="test-model")
         with patch("tapestry.graph.verify.call_model", new=AsyncMock(return_value=bad_response)):
             result = await verify_before_completion("conv-1", "fix the bug", _PERSONA)
 
@@ -123,7 +123,7 @@ class TestFailsClosed:
 
     async def test_json_missing_passed_key_fails_closed(self):
         payload = {"restated_ask": "fix it", "notes": "did something"}
-        response = ModelResponse(text=json.dumps(payload), tool_calls=None)
+        response = ModelResponse(text=json.dumps(payload), tool_calls=None, model_used="test-model")
         with patch("tapestry.graph.verify.call_model", new=AsyncMock(return_value=response)):
             result = await verify_before_completion("conv-1", "fix the bug", _PERSONA)
 
@@ -131,7 +131,7 @@ class TestFailsClosed:
 
     async def test_passed_as_non_bool_fails_closed(self):
         payload = {"passed": "yes", "notes": "trust me"}
-        response = ModelResponse(text=json.dumps(payload), tool_calls=None)
+        response = ModelResponse(text=json.dumps(payload), tool_calls=None, model_used="test-model")
         with patch("tapestry.graph.verify.call_model", new=AsyncMock(return_value=response)):
             result = await verify_before_completion("conv-1", "fix the bug", _PERSONA)
 
@@ -144,6 +144,7 @@ class TestFailsClosed:
         response = ModelResponse(
             text=f"Here is my verification:\n{json.dumps(payload)}\nHope that helps!",
             tool_calls=None,
+            model_used="test-model",
         )
         with patch("tapestry.graph.verify.call_model", new=AsyncMock(return_value=response)):
             result = await verify_before_completion("conv-1", "fix the bug", _PERSONA)

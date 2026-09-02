@@ -27,6 +27,12 @@ class ModelResponse(BaseModel):
     input_tokens: int | None = None
     output_tokens: int | None = None
     raw: dict | None = None
+    # Which model actually produced this response -- equal to the `model`
+    # `call_model` was originally called with UNLESS a `fallback_models`
+    # entry ended up answering instead. Always set explicitly by
+    # `call_model`, never left to infer a default; see that function's
+    # docstring for the full fallback contract.
+    model_used: str
 
 
 class StreamChunk(BaseModel):
@@ -100,39 +106,26 @@ class TapestryContextWindowExceeded(Exception):
     """
 
 
-async def call_model(
+async def _call_one_model(
     model: str,
     messages: list[dict],
-    tools: list[dict] | None = None,
-    max_retries: int = 2,
+    tools: list[dict] | None,
+    max_retries: int,
 ) -> ModelResponse:
-    """Call `model` via `litellm.acompletion` and return a normalized
-    `ModelResponse`.
-
-    `max_retries` counts retries *after* the first attempt -- so
-    `max_retries=2` (the default) means up to 3 total calls to LiteLLM
-    before `EmptyResponseError` is raised. This only governs the
-    empty-completion retry policy below; it is not passed through to
-    LiteLLM's own `num_retries` (that governs retrying actual provider
-    exceptions -- rate limits, timeouts -- which is a separate, unspecified
-    concern this function deliberately leaves alone).
+    """The original single-model `call_model` body, unchanged in behavior --
+    `call_model` below wraps this in a fallback-chain loop. Split out so
+    that loop can retry a WHOLE `max_retries+1`-attempt cycle against the
+    next candidate model, rather than the empty-completion retry counter
+    and the fallback-candidate counter being conflated into one.
     """
     last_error: EmptyResponseError | None = None
 
     for attempt in range(max_retries + 1):
-        try:
-            response = await litellm.acompletion(
-                model=model,
-                messages=messages,
-                tools=tools,
-            )
-        except litellm.ContextWindowExceededError as exc:
-            # Policy 2 (ANALYSIS-litellm.md sections 1 and 3): reclassify LiteLLM's own
-            # normalized exception into Tapestry's canonical one. Not
-            # retried -- a context-window overflow won't resolve itself on
-            # a bare retry, it's the caller's job to react (e.g. compact
-            # history) and call again.
-            raise TapestryContextWindowExceeded(str(exc)) from exc
+        response = await litellm.acompletion(
+            model=model,
+            messages=messages,
+            tools=tools,
+        )
 
         message = response.choices[0].message
         text = message.content or ""
@@ -175,9 +168,70 @@ async def call_model(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             raw=response.model_dump(),
+            model_used=model,
         )
 
     assert last_error is not None  # loop always sets it before falling through
+    raise last_error
+
+
+async def call_model(
+    model: str,
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    max_retries: int = 2,
+    fallback_models: list[str] = (),
+) -> ModelResponse:
+    """Call `model` via `litellm.acompletion` and return a normalized
+    `ModelResponse`.
+
+    `max_retries` counts retries *after* the first attempt -- so
+    `max_retries=2` (the default) means up to 3 total calls to LiteLLM
+    before that model is considered exhausted. This only governs the
+    empty-completion retry policy; it is not passed through to LiteLLM's
+    own `num_retries` (that governs retrying actual provider exceptions --
+    rate limits, timeouts -- which used to be a separate, unspecified
+    concern this function left alone; see the fallback-chain note below for
+    why that's no longer quite true).
+
+    `fallback_models`, when given, is walked in order after `model` itself
+    is exhausted -- "exhausted" meaning either every attempt against it
+    returned an empty completion (`EmptyResponseError`), or a single
+    attempt raised any provider/transport exception OTHER than
+    `litellm.ContextWindowExceededError`. That one exception never
+    triggers a fallback and is never retried, regardless of position in the
+    candidate list, exactly as when `fallback_models` is empty: reclassified
+    immediately into `TapestryContextWindowExceeded` (per ANALYSIS-litellm.md
+    sections 1 and 3) and raised, because a context overflow won't resolve
+    itself by calling a *different* model with the exact same oversized
+    message history -- it's the caller's job to react (e.g. compact
+    history) and call again, not this function's job to paper over.
+
+    With `fallback_models=()` (the default), this reproduces the exact
+    previous behavior: a non-context-window exception from `litellm.
+    acompletion` propagates immediately and unchanged (there is nowhere to
+    "fall back" to), and empty-completion exhaustion still raises
+    `EmptyResponseError`.
+
+    The returned `ModelResponse.model_used` names whichever model actually
+    produced the response, so a caller can tell a fallback happened without
+    re-deriving anything (`response.model_used != model`).
+    """
+    candidates = [model, *fallback_models]
+    last_error: Exception | None = None
+
+    for candidate_model in candidates:
+        try:
+            return await _call_one_model(candidate_model, messages, tools, max_retries)
+        except litellm.ContextWindowExceededError as exc:
+            # Policy 2: never falls back, regardless of which candidate hit
+            # it -- see docstring.
+            raise TapestryContextWindowExceeded(str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - deliberately broad, see docstring
+            last_error = exc
+            continue
+
+    assert last_error is not None  # candidates is never empty (model is always in it)
     raise last_error
 
 

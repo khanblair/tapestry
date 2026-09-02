@@ -15,14 +15,31 @@ import yaml
 from pydantic import BaseModel
 
 
+Mode = Literal["manual", "accept_edits", "auto", "plan", "bypass"]
+
+
 class Persona(BaseModel):
     id: str
     name: str
     role: str
     model: str
+    # Per tapestry_modes_models_personas_spec.md §2.3/§2.4/§3 -- every field
+    # below is optional with a default that reproduces exactly what an
+    # existing personas/*.yaml (with none of these keys present) already
+    # does today.
+    fallback_models: list[str] = []
+    guardian_model: str | None = None
+    # Passed through to LiteLLM as-is when set; provider support varies, so
+    # deliberately not validated against a fixed enum here.
+    reasoning_effort: str | None = None
     system_prompt: str
     tools: list[str]
     mcp_servers: list[str]
+    default_mode: Mode = "manual"
+    # Overrides graph.budgets.DEFAULT_MAX_TURNS / DEFAULT_MAX_DELEGATION_DEPTH
+    # for this persona when set; None means "use the global default."
+    max_turns: int | None = None
+    max_delegation_depth: int | None = None
     status: Literal["online", "busy", "paused", "offline"]
     color: str
 

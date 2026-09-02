@@ -155,6 +155,142 @@ class TestEmptyResponsePolicy:
         assert mock_acompletion.await_count == 1
 
 
+class TestFallbackChain:
+    async def test_no_fallback_models_reproduces_previous_behavior_on_real_exception(self):
+        import litellm
+
+        mock_acompletion = AsyncMock(
+            side_effect=litellm.RateLimitError(
+                message="rate limited", model="claude-sonnet-4-5-20250929", llm_provider="anthropic"
+            )
+        )
+
+        with patch("litellm.acompletion", new=mock_acompletion):
+            with pytest.raises(litellm.RateLimitError):
+                await call_model(
+                    model="claude-sonnet-4-5-20250929",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+
+        assert mock_acompletion.await_count == 1
+
+    async def test_falls_back_to_next_model_on_provider_exception(self):
+        import litellm
+
+        good_response = _make_response(content="from fallback", prompt_tokens=1, completion_tokens=1)
+        mock_acompletion = AsyncMock(
+            side_effect=[
+                litellm.RateLimitError(
+                    message="rate limited", model="primary-model", llm_provider="anthropic"
+                ),
+                good_response,
+            ]
+        )
+
+        with patch("litellm.acompletion", new=mock_acompletion):
+            result = await call_model(
+                model="primary-model",
+                messages=[{"role": "user", "content": "hi"}],
+                fallback_models=["fallback-model"],
+            )
+
+        assert result.text == "from fallback"
+        assert result.model_used == "fallback-model"
+        assert mock_acompletion.await_count == 2
+        # The fallback call must actually target the fallback model.
+        assert mock_acompletion.await_args_list[1].kwargs["model"] == "fallback-model"
+
+    async def test_falls_back_after_empty_completion_exhausts_primary(self):
+        empty_response = _make_response(content="", tool_calls=None)
+        good_response = _make_response(content="from fallback", prompt_tokens=1, completion_tokens=1)
+        mock_acompletion = AsyncMock(side_effect=[empty_response, good_response])
+
+        with patch("litellm.acompletion", new=mock_acompletion):
+            result = await call_model(
+                model="primary-model",
+                messages=[{"role": "user", "content": "hi"}],
+                max_retries=0,
+                fallback_models=["fallback-model"],
+            )
+
+        assert result.text == "from fallback"
+        assert result.model_used == "fallback-model"
+        assert mock_acompletion.await_count == 2
+
+    async def test_walks_multiple_fallbacks_in_order(self):
+        import litellm
+
+        error = litellm.RateLimitError(message="rate limited", model="x", llm_provider="anthropic")
+        good_response = _make_response(content="third time's the charm")
+        mock_acompletion = AsyncMock(side_effect=[error, error, good_response])
+
+        with patch("litellm.acompletion", new=mock_acompletion):
+            result = await call_model(
+                model="primary",
+                messages=[{"role": "user", "content": "hi"}],
+                max_retries=0,
+                fallback_models=["second", "third"],
+            )
+
+        assert result.model_used == "third"
+        assert [c.kwargs["model"] for c in mock_acompletion.await_args_list] == [
+            "primary",
+            "second",
+            "third",
+        ]
+
+    async def test_raises_last_error_when_every_candidate_is_exhausted(self):
+        import litellm
+
+        error = litellm.RateLimitError(message="rate limited", model="x", llm_provider="anthropic")
+        mock_acompletion = AsyncMock(side_effect=[error, error])
+
+        with patch("litellm.acompletion", new=mock_acompletion):
+            with pytest.raises(litellm.RateLimitError):
+                await call_model(
+                    model="primary",
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_retries=0,
+                    fallback_models=["second"],
+                )
+
+        assert mock_acompletion.await_count == 2
+
+    async def test_context_window_exceeded_never_falls_back(self):
+        import litellm
+
+        provider_error = litellm.ContextWindowExceededError(
+            message="context window exceeded",
+            model="primary",
+            llm_provider="anthropic",
+        )
+        mock_acompletion = AsyncMock(side_effect=provider_error)
+
+        with patch("litellm.acompletion", new=mock_acompletion):
+            with pytest.raises(TapestryContextWindowExceeded):
+                await call_model(
+                    model="primary",
+                    messages=[{"role": "user", "content": "hi"}],
+                    fallback_models=["second"],
+                )
+
+        # Never tried the fallback model.
+        assert mock_acompletion.await_count == 1
+
+    async def test_successful_primary_call_reports_itself_as_model_used(self):
+        good_response = _make_response(content="ok")
+        mock_acompletion = AsyncMock(return_value=good_response)
+
+        with patch("litellm.acompletion", new=mock_acompletion):
+            result = await call_model(
+                model="primary",
+                messages=[{"role": "user", "content": "hi"}],
+                fallback_models=["second"],
+            )
+
+        assert result.model_used == "primary"
+
+
 class TestContextWindowExceededPolicy:
     async def test_reraised_as_tapestry_exception(self):
         import litellm

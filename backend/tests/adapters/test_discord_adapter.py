@@ -757,13 +757,15 @@ def _tool_call(name: str, arguments: dict, call_id: str = "call_1") -> dict:
 def _plain_model_response(text: str):
     from tapestry.models.litellm_client import ModelResponse
 
-    return ModelResponse(text=text, tool_calls=None)
+    return ModelResponse(text=text, tool_calls=None, model_used="test-model")
 
 
 def _tool_call_model_response(text: str, name: str, arguments: dict, call_id: str = "call_1"):
     from tapestry.models.litellm_client import ModelResponse
 
-    return ModelResponse(text=text, tool_calls=[_tool_call(name, arguments, call_id)])
+    return ModelResponse(
+        text=text, tool_calls=[_tool_call(name, arguments, call_id)], model_used="test-model"
+    )
 
 
 class TestDriveGraphAgainstARealGraph:

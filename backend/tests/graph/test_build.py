@@ -40,11 +40,13 @@ def _tool_call(name: str, arguments: dict, call_id: str = "call_1") -> dict:
 
 
 def _plain_response(text: str) -> ModelResponse:
-    return ModelResponse(text=text, tool_calls=None)
+    return ModelResponse(text=text, tool_calls=None, model_used="test-model")
 
 
 def _tool_call_response(text: str, name: str, arguments: dict, call_id: str = "call_1") -> ModelResponse:
-    return ModelResponse(text=text, tool_calls=[_tool_call(name, arguments, call_id)])
+    return ModelResponse(
+        text=text, tool_calls=[_tool_call(name, arguments, call_id)], model_used="test-model"
+    )
 
 
 async def _run_graph(tmp_path, conversation_id: str):
@@ -99,7 +101,7 @@ def test_approval_and_diff_producing_tools_are_real_registry_keys():
 
 def test_build_tool_schemas_always_includes_core_capabilities():
     ada = build.PERSONAS["ada"]
-    schemas = build._build_tool_schemas(ada)
+    schemas = build._build_tool_schemas(ada.tools)
     names = {s["function"]["name"] for s in schemas}
     assert build.SKILL_LOADER_TOOL_NAME in names
     assert build.DELEGATE_TOOL_NAME in names
