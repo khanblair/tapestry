@@ -27,16 +27,18 @@ export function DiffScreenView({ conversationId, taskId }: DiffScreenViewProps) 
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([getDiffDetail(taskId), getApprovalForDiff(taskId)]).then(([foundDiff, foundApproval]) => {
-      if (!cancelled) {
-        setDiff(foundDiff);
-        setApproval(foundApproval);
-      }
-    });
+    Promise.all([getDiffDetail(conversationId, taskId), getApprovalForDiff(conversationId, taskId)]).then(
+      ([foundDiff, foundApproval]) => {
+        if (!cancelled) {
+          setDiff(foundDiff);
+          setApproval(foundApproval);
+        }
+      },
+    );
     return () => {
       cancelled = true;
     };
-  }, [taskId]);
+  }, [conversationId, taskId]);
 
   return (
     <Modal title={diff?.title ?? "Diff"} onClose={() => router.push(`/conversation/${conversationId}`)} wide>

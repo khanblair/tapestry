@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { safeGetPersonas } from "@/lib/safeApi";
+import { safeGetPersonas, safeGetStatus } from "@/lib/safeApi";
+import type { SystemStatus } from "@/lib/api";
 import { Button } from "@/components/ui/Button";
 import { UsersIcon, ChevronRightIcon } from "@/components/ui/icons";
 import { PlatformsPanel } from "./PlatformsPanel";
@@ -28,6 +29,10 @@ type SettingsTabId = (typeof TABS)[number]["id"];
 export function SettingsTabs() {
   const [activeTab, setActiveTab] = useState<SettingsTabId>("platforms");
   const [personaCount, setPersonaCount] = useState<number | null>(null);
+  // Fetched once here (rather than once per panel) so switching tabs back
+  // and forth doesn't re-fetch every time a conditionally-rendered panel
+  // remounts -- all three status panels below just read a slice of this.
+  const [status, setStatus] = useState<SystemStatus | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -36,6 +41,9 @@ export function SettingsTabs() {
     // dev/demo environments -- see lib/safeApi.ts.
     safeGetPersonas().then((personas) => {
       if (!cancelled) setPersonaCount(personas.length);
+    });
+    safeGetStatus().then((found) => {
+      if (!cancelled) setStatus(found);
     });
     return () => {
       cancelled = true;
@@ -70,9 +78,9 @@ export function SettingsTabs() {
         ))}
       </div>
 
-      {activeTab === "platforms" && <PlatformsPanel />}
-      {activeTab === "models" && <ModelProvidersPanel />}
-      {activeTab === "tools" && <ToolsAndMcpPanel />}
+      {activeTab === "platforms" && <PlatformsPanel status={status} />}
+      {activeTab === "models" && <ModelProvidersPanel status={status} />}
+      {activeTab === "tools" && <ToolsAndMcpPanel status={status} />}
       {activeTab === "appearance" && <AppearancePanel />}
     </div>
   );

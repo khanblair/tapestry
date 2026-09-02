@@ -14,7 +14,13 @@
 // fallbacks (and this file) should go away in favor of always hitting the
 // real endpoints.
 
-import type { Conversation, Message, Persona } from "./api";
+import type {
+  ActivityFeed,
+  Conversation,
+  Message,
+  Persona,
+  SystemStatus,
+} from "./api";
 
 export const MOCK_PERSONAS: Persona[] = [
   {
@@ -143,6 +149,7 @@ export const MOCK_MESSAGES: Record<string, Message[]> = {
         question: "Merge feat/oauth-google → main",
         detail: "Rex wants to merge 3 changed files into main. Tests pass, Vex has reviewed.",
         intent: "approval",
+        relatedTaskId: "oauth-google",
       },
     },
   ],
@@ -164,25 +171,15 @@ export const MOCK_THREAD_MESSAGES: Record<string, Message[]> = {
   ],
 };
 
-export interface DiffLine {
-  type: "add" | "del" | "ctx";
-  lineNumber: string | number;
-  content: string;
-}
-
-export interface DiffFile {
-  name: string;
-  lines: DiffLine[];
-}
-
-export interface DiffDetail {
-  taskId: string;
-  title: string;
-  fileCount: number;
-  additions: number;
-  deletions: number;
-  files: DiffFile[];
-}
+// Re-exported (not redeclared) from lib/api.ts — that's the real,
+// authoritative shape now that GET /api/conversations/{id}/diff/{taskId} is
+// a real endpoint. A separate, looser local type here (lineNumber used to be
+// `string | number`) would let the mock fixture widen the real contract;
+// `export type { ... } from` keeps every existing import of these three
+// names (this file, safeApi.ts, DiffScreenView.tsx, DiffViewer.tsx,
+// DiffViewer.test.tsx) working unchanged.
+export type { DiffLine, DiffFile, DiffDetail } from "./api";
+import type { DiffDetail } from "./api";
 
 export const MOCK_DIFFS: Record<string, DiffDetail> = {
   "oauth-google": {
@@ -224,4 +221,60 @@ export const MOCK_DIFFS: Record<string, DiffDetail> = {
       },
     ],
   },
+};
+
+// Fallback for lib/safeApi.ts's safeGetActivity() when GET /api/activity
+// isn't reachable — same "Running now" / "Recent" copy the Activity screen
+// used to render as static JSX before that endpoint existed.
+export const MOCK_ACTIVITY: ActivityFeed = {
+  running: [
+    {
+      conversationId: "grp-auth",
+      conversationLabel: "#auth-rework",
+      actor: "Rex",
+      label: "running pytest tests/auth/",
+      timestamp: minutesAgo(0),
+    },
+  ],
+  recent: [
+    {
+      conversationId: "grp-auth",
+      conversationLabel: "#auth-rework",
+      actor: "Ada",
+      label: "proposed OAuth architecture",
+      timestamp: minutesAgo(30),
+    },
+    {
+      conversationId: "grp-auth",
+      conversationLabel: "#auth-rework",
+      actor: "Vex",
+      label: "flagged token scope issue",
+      timestamp: minutesAgo(8),
+    },
+  ],
+};
+
+// Fallback for lib/safeApi.ts's safeGetStatus() when GET /api/status isn't
+// reachable — the same rows the three Settings panels used to hardcode
+// directly before that endpoint existed.
+export const MOCK_STATUS: SystemStatus = {
+  platforms: [
+    { name: "Discord", detail: "Connected as @tapestry-bot", connected: true, alwaysOn: false },
+    { name: "Telegram", detail: "Not connected", connected: false, alwaysOn: false },
+    { name: "Web", detail: "Always on", connected: true, alwaysOn: true },
+  ],
+  providers: [
+    { name: "Anthropic", connected: true },
+    { name: "DeepSeek", connected: true },
+    { name: "Gemini", connected: true },
+    { name: "Qwen", connected: false },
+    { name: "OpenRouter", connected: true },
+  ],
+  metamcp: { running: true, serverCount: 4 },
+  mcpServers: [
+    { name: "filesystem", connected: true },
+    { name: "git", connected: true },
+    { name: "terminal", connected: true },
+    { name: "browser", connected: true },
+  ],
 };

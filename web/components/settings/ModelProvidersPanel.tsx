@@ -1,24 +1,28 @@
-/**
- * Ported verbatim from `settingsScreen()`'s `models` tab body in the
- * prototype: Anthropic/DeepSeek/Gemini/OpenRouter connected, Qwen not
- * connected, plus the LiteLLM routing hint.
- */
-const PROVIDERS = [
-  { name: "Anthropic", status: "Connected" },
-  { name: "DeepSeek", status: "Connected" },
-  { name: "Gemini", status: "Connected" },
-  { name: "Qwen", status: "Not connected" },
-  { name: "OpenRouter", status: "Connected" },
-] as const;
+import type { SystemStatus } from "@/lib/api";
 
-export function ModelProvidersPanel() {
+export interface ModelProvidersPanelProps {
+  /** `null` while GET /api/status is still loading (see SettingsTabs.tsx, which fetches it once and passes it down to all three status panels). */
+  status: SystemStatus | null;
+}
+
+/**
+ * Which LiteLLM providers have an API key configured, from
+ * `status.providers` (GET /api/status) -- previously a hardcoded
+ * `PROVIDERS` array here, ported verbatim from the prototype's
+ * `settingsScreen()` `models` tab body.
+ */
+export function ModelProvidersPanel({ status }: ModelProvidersPanelProps) {
+  if (status === null) {
+    return <div className="empty-hint">Loading…</div>;
+  }
+
   return (
     <div>
-      {PROVIDERS.map((provider) => (
+      {status.providers.map((provider) => (
         <div className="toggle-row" key={provider.name}>
           <div className="tt">{provider.name}</div>
-          <span className={`chip ${provider.status === "Connected" ? "on" : ""}`}>
-            {provider.status}
+          <span className={`chip ${provider.connected ? "on" : ""}`}>
+            {provider.connected ? "Connected" : "Not connected"}
           </span>
         </div>
       ))}

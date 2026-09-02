@@ -11,11 +11,34 @@ import {
   getConversations as apiGetConversations,
   getPersonas as apiGetPersonas,
   getMessages as apiGetMessages,
+  getDiffDetail as apiGetDiffDetail,
+  getPendingApprovals as apiGetPendingApprovals,
+  getActivity as apiGetActivity,
+  getStatus as apiGetStatus,
   type Conversation,
   type Message,
   type Persona,
+  type ActivityFeed,
+  type SystemStatus,
+  type PendingApproval,
 } from "./api";
-import { MOCK_CONVERSATIONS, MOCK_MESSAGES, MOCK_PERSONAS, MOCK_THREAD_MESSAGES, type DiffDetail, MOCK_DIFFS } from "./mockData";
+import {
+  MOCK_CONVERSATIONS,
+  MOCK_MESSAGES,
+  MOCK_PERSONAS,
+  MOCK_THREAD_MESSAGES,
+  type DiffDetail,
+  MOCK_DIFFS,
+  MOCK_ACTIVITY,
+  MOCK_STATUS,
+} from "./mockData";
+
+// Re-exported (not redeclared) from lib/api.ts, same reasoning as
+// DiffDetail above: GET /api/asks/pending is real now, so its response
+// shape is the authoritative one. Kept as a named export here so existing
+// `import { type PendingApproval } from "@/lib/safeApi"` call sites don't
+// need to change.
+export type { PendingApproval };
 
 export async function safeGetConversations(): Promise<Conversation[]> {
   try {
@@ -63,41 +86,66 @@ export async function getThreadMessages(_conversationId: string, threadId: strin
   return MOCK_THREAD_MESSAGES[threadId] ?? [];
 }
 
-// No backend endpoint exists yet for fetching a diff's full line-level
-// content by taskId (Message.diff only carries summary counts) — see the
-// contract gap noted in the final report. Falls back to lib/mockData.ts's
-// MOCK_DIFFS.
-export async function getDiffDetail(taskId: string): Promise<DiffDetail | null> {
-  return MOCK_DIFFS[taskId] ?? null;
-}
-
-export interface PendingApproval {
-  conversationId: string;
-  conversationLabel: string;
-  question: NonNullable<Message["approval"]>;
+// Fetches a diff's full line-level content by (conversationId, taskId) via
+// the real GET /api/conversations/{id}/diff/{taskId} endpoint. A thrown
+// error (network failure, backend unreachable) falls back to
+// lib/mockData.ts's MOCK_DIFFS — but a clean, confirmed 404 (apiGetDiffDetail
+// resolves to `null` rather than throwing) is left as `null` rather than
+// silently swapped for unrelated mock data.
+export async function getDiffDetail(conversationId: string, taskId: string): Promise<DiffDetail | null> {
+  try {
+    return await apiGetDiffDetail(conversationId, taskId);
+  } catch {
+    return MOCK_DIFFS[taskId] ?? null;
+  }
 }
 
 // The Activity screen's "Needs your input" section needs every pending
-// approval-intent ask across all conversations. No backend endpoint exists
-// yet for this (e.g. GET /api/asks?status=pending) — see the contract gap
-// noted in the final report. Scans each conversation's messages for an
-// `approval` field instead.
+// approval-intent ask across all conversations. Backed by the real
+// GET /api/asks/pending. Falls back to the previous N+1 scan (fetch every
+// conversation, then every conversation's messages, filtering for an
+// `approval` field) only when that call fails.
 export async function getPendingApprovals(): Promise<PendingApproval[]> {
-  const [conversations] = await Promise.all([safeGetConversations()]);
-  const out: PendingApproval[] = [];
-  for (const convo of conversations) {
-    const messages = await safeGetMessages(convo.id);
-    for (const m of messages) {
-      if (m.approval) {
-        out.push({
-          conversationId: convo.id,
-          conversationLabel: convo.name ?? convo.personaIds[0] ?? convo.id,
-          question: m.approval,
-        });
+  try {
+    return await apiGetPendingApprovals();
+  } catch {
+    const conversations = await safeGetConversations();
+    const out: PendingApproval[] = [];
+    for (const convo of conversations) {
+      const messages = await safeGetMessages(convo.id);
+      for (const m of messages) {
+        if (m.approval) {
+          out.push({
+            conversationId: convo.id,
+            conversationLabel: convo.name ?? convo.personaIds[0] ?? convo.id,
+            question: m.approval,
+          });
+        }
       }
     }
+    return out;
   }
-  return out;
+}
+
+// The Activity screen's "Running now" / "Recent" sections, backed by the
+// real GET /api/activity. Falls back to lib/mockData.ts's MOCK_ACTIVITY.
+export async function safeGetActivity(): Promise<ActivityFeed> {
+  try {
+    return await apiGetActivity();
+  } catch {
+    return MOCK_ACTIVITY;
+  }
+}
+
+// The Settings screen's Platforms / Model providers / Tools & MCP panels,
+// backed by the real GET /api/status. Falls back to lib/mockData.ts's
+// MOCK_STATUS (the same rows those panels used to hardcode directly).
+export async function safeGetStatus(): Promise<SystemStatus> {
+  try {
+    return await apiGetStatus();
+  } catch {
+    return MOCK_STATUS;
+  }
 }
 
 export interface DiffApprovalContext {
@@ -105,24 +153,16 @@ export interface DiffApprovalContext {
   question: NonNullable<Message["approval"]>;
 }
 
-// Contract gap: there's no explicit link between a diff's taskId and the
-// approval question that gates merging it — Message.diff and
-// Message.approval are two independent optional fields that can land on
-// different messages. Heuristic used here: find the conversation containing
-// a message whose diff.taskId matches, then return the first approval-intent
-// question found anywhere in that same conversation. Works for the one
-// diff/approval pair in lib/mockData.ts's fixtures; a real backend should
-// carry this link explicitly (e.g. the approval's payload referencing the
-// taskId it gates) rather than requiring a scan.
-export async function getApprovalForDiff(taskId: string): Promise<DiffApprovalContext | null> {
-  const conversations = await safeGetConversations();
-  for (const convo of conversations) {
-    const messages = await safeGetMessages(convo.id);
-    if (!messages.some((m) => m.diff?.taskId === taskId)) continue;
-    const approvalMessage = messages.find((m) => m.approval);
-    if (approvalMessage?.approval) {
-      return { conversationId: convo.id, question: approvalMessage.approval };
-    }
+// AskQuestion.relatedTaskId (lib/api.ts) is now the real, explicit link
+// between a diff's taskId and the approval question that gates merging it
+// — this is a precise, direct lookup within the one conversation the diff
+// screen already knows about (no cross-conversation scan needed, and no
+// heuristic "first approval found in the same conversation" guess).
+export async function getApprovalForDiff(conversationId: string, taskId: string): Promise<DiffApprovalContext | null> {
+  const messages = await safeGetMessages(conversationId);
+  const approvalMessage = messages.find((m) => m.approval?.relatedTaskId === taskId);
+  if (approvalMessage?.approval) {
+    return { conversationId, question: approvalMessage.approval };
   }
   return null;
 }
