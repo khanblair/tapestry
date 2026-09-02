@@ -1,6 +1,8 @@
 # Tapestry — Project Structure
 
-Full scaffold, reflecting the scoped spec plus everything verified against real source in `vendor-research/`. Nothing below exists yet except `docs/`'s content and the seven analysis reports currently at `vendor-research/` (still pending their move into `docs/vendor-research/` — see the footnote) — this is the plan, not a report of what's built.
+**Status: built.** This document was the pre-build plan; the tree below is what it was scoped against, not a live listing. All four backend phases and the full frontend now exist and are tested — 347 backend tests, 28 frontend unit tests, 16/18 e2e (2 correctly skipped as device-inapplicable), both Docker images build and run for real. Real implementation always drifts a little from a plan (extra `conftest.py` fixtures, a few extra `lib/` helper modules the frontend agents added as they reconciled with each other, `config.py`/`main.py` filled in) — the code and its own tests are the source of truth for exact current file contents; this doc stays useful for the *reasoning* behind the shape, which didn't change. The one drift worth correcting explicitly, since it was flagged as a real gap by name at several points during the build: the test tree below undercounted real test coverage. Actual test files, beyond what's listed: `tests/core/{conftest,test_conversations,test_approvals}.py`, `tests/models/test_litellm_client_stream.py`, `tests/storage/test_db.py`, `tests/skills/{test_loader,test_catalog_sync}.py`, `tests/graph/{conftest,test_checkpointer,test_streaming}.py`, `tests/tools/test_mcp_client.py`, `tests/adapters/conftest.py`, and a top-level `tests/test_main.py` — plus `web/tests/unit/components/{ActivityBlock,DiffViewer,PersonaEditForm}.test.tsx`.
+
+Original scaffold description, historical: full plan, reflecting the scoped spec plus everything verified against real source in `vendor-research/`.
 
 ```
 tapestry/

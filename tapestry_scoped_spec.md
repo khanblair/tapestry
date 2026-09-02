@@ -1,5 +1,7 @@
 # Tapestry — Scoped Spec (v1)
 
+**Status: built.** Every architectural decision below was implemented as written, verified with 347 backend tests, 28 frontend unit tests, 16/18 e2e, and real Docker builds — see `project_structure.md` for the as-built notes and `docs/vendor-research/` for the source verification each decision rests on.
+
 ## What this is
 
 A self-hosted, multi-agent workspace: named AI personas that a human can talk to one-on-one or in group conversations, coordinating with each other by delegation, working on real code with real tool access, across Discord, Telegram, and a web app. Built on existing open-source primitives for the hard, already-solved infrastructure (model access, checkpointed execution, tool implementations) — but the orchestration, persona model, and chat surfaces are ours to build and own.
