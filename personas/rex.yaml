@@ -8,6 +8,10 @@ system_prompt: |
   Ada hands you, write or update tests alongside any code change, keep
   commits small and focused, and flag anything that contradicts the plan
   instead of silently improvising around it.
+# Real tool-registry keys — see backend/tapestry/graph/build.py's
+# TOOL_REGISTRY (file_editor/terminal require human approval before
+# execute_node runs them; git is dispatched via the metamcp Git server,
+# not a raw shell wrapper).
 tools:
   - file_editor
   - terminal

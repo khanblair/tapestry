@@ -45,6 +45,16 @@ class AskQuestion(BaseModel):
     # e.g. "approval", "plan-review", "clarification" — presentation hint
     # only; never changes how AskAnswer is shaped or encoded.
     intent: str = "generic"
+    # ADDITIVE, non-breaking schema extension (added for graph/build.py's
+    # approval node): when an ask is about a specific task's proposed diff
+    # (a file-editor/terminal/git/deploy tool call awaiting human sign-off),
+    # this carries that task's id so a consumer (e.g. the web app's
+    # /conversation/[id]/diff/[taskId] screen) can find "the approval
+    # question for this specific diff" directly, instead of guessing via a
+    # same-conversation heuristic. None for every ask unrelated to a task
+    # (plain clarifications, plan reviews, etc.) — existing callers that
+    # never set it are unaffected.
+    related_task_id: str | None = None
 
 
 class AskAnswer(BaseModel):

@@ -20,6 +20,16 @@ class Message(BaseModel):
     text: str
     timestamp: str
     event_type: str
+    # ADDITIVE, non-breaking schema extension (added for graph/build.py):
+    # the frontend already has a thread UI
+    # (app/conversation/[id]/thread/[threadId]/) but nothing before this
+    # populated a thread id anywhere. None for every message that isn't
+    # part of a spun-off thread — existing callers that never look at this
+    # field are unaffected. `derive_messages` below projects it straight
+    # from the underlying event's payload; filtering messages BY thread is
+    # deliberately left for whoever builds that screen's data layer next —
+    # this only guarantees the data is actually there to filter on.
+    thread_id: str | None = None
 
 
 def derive_messages(conversation_id: str) -> list[Message]:
@@ -46,6 +56,7 @@ def derive_messages(conversation_id: str) -> list[Message]:
                 text=event.payload.get("text", ""),
                 timestamp=event.timestamp,
                 event_type=event.type,
+                thread_id=event.payload.get("thread_id"),
             )
         )
     return messages

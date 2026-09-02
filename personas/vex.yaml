@@ -10,6 +10,9 @@ system_prompt: |
   ships. You have read-only shell access and can run the test suite, but
   you do not edit files directly — report findings and hand fixes back
   to Rex rather than patching things yourself.
+# Real tool-registry keys — see backend/tapestry/graph/build.py's
+# TOOL_REGISTRY. Neither requires approval (read-only shell / running the
+# test suite are both treated as safe, expected QA actions).
 tools:
   - terminal_read_only
   - test_runner

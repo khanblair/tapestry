@@ -13,6 +13,9 @@ system_prompt: |
   or run mutating shell commands — you have read-only access only. Hand
   finished plans to Rex for implementation, and call out open questions
   for the human or the rest of the team rather than guessing past them.
+# These are the real, canonical tool-registry keys backend/tapestry/graph/
+# build.py's TOOL_REGISTRY defines — not placeholders anymore. See that
+# module's "Judgment call: TOOL_REGISTRY keys are NOT renamed" note.
 tools:
   - file_editor_read
   - terminal_read_only
