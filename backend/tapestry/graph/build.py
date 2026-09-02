@@ -137,7 +137,7 @@ from langgraph.types import interrupt
 
 from tapestry.core import events
 from tapestry.core.ask import AskQuestion
-from tapestry.core.conversations import derive_messages
+from tapestry.core.conversations import derive_membership, derive_messages
 from tapestry.core.delegation import DelegationRoundLimitExceeded, delegate
 from tapestry.core.personas import Persona, load_personas
 from tapestry.graph import budgets, streaming, verify
@@ -777,8 +777,42 @@ TOOL_SCHEMAS: dict[str, dict] = {
 }
 
 
-def _build_system_prompt(persona: Persona, catalog: list[SkillSummary]) -> str:
+def _roster_lines(persona: Persona, member_ids: list[str]) -> list[str]:
+    """Renders conversation membership so a persona can correctly tell "not
+    in this conversation" apart from "doesn't exist" -- the fix for a
+    live-tested bug where a persona, asked about a real persona who simply
+    wasn't a member of that particular conversation, answered "not a
+    recognized persona" (false; he existed, just wasn't in the room).
+    `PERSONAS` (module-level, whole-system registry) is the source for
+    every name/role/status looked up here, both for members and for the
+    "everyone else" list below.
+    """
+    lines = ["Conversation roster (this conversation's members):"]
+    for member_id in member_ids:
+        member = PERSONAS.get(member_id)
+        if member is None:
+            continue
+        marker = " [you]" if member_id == persona.id else ""
+        lines.append(f"- {member.name} ({member.role}) — {member.status}{marker}")
+    others = [p for pid, p in PERSONAS.items() if pid not in member_ids]
+    if others:
+        other_desc = ", ".join(f"{p.name} ({p.role}, {p.status})" for p in others)
+        lines.append(
+            "Other personas that exist in this workspace but are NOT in this "
+            f"conversation: {other_desc}. If asked about someone in this second "
+            "list, say they exist but aren't part of this conversation — never "
+            'call them "unrecognized." Only say that about a name in neither list.'
+        )
+    return lines
+
+
+def _build_system_prompt(
+    persona: Persona, catalog: list[SkillSummary], member_ids: list[str] | None = None
+) -> str:
     lines = [persona.system_prompt.strip(), ""]
+    if member_ids is not None:
+        lines.extend(_roster_lines(persona, member_ids))
+        lines.append("")
     if catalog:
         lines.append(
             f"Available skills (call the {SKILL_LOADER_TOOL_NAME!r} tool with "
@@ -922,7 +956,16 @@ async def persona_node(state: TapestryGraphState, config: RunnableConfig) -> dic
     sync_catalog(conversation_id, _SKILL_REGISTRY)
     catalog = _SKILL_REGISTRY.discover()
 
-    system_prompt = _build_system_prompt(persona, catalog)
+    # Looked up fresh every pass (not cached in state) so a membership or
+    # status change (e.g. a paused persona coming back online) is reflected
+    # on the very next reply, not stale. `or None`: a conversation with no
+    # recorded membership (no `conversation/created` event -- some tests
+    # invoke the graph directly without one) means "unknown," not "empty
+    # conversation" -- rendering an empty roster would wrongly tell a
+    # persona she herself isn't in the conversation, so the roster block is
+    # omitted entirely rather than shown wrong.
+    member_ids, _kind = derive_membership(conversation_id)
+    system_prompt = _build_system_prompt(persona, catalog, member_ids or None)
     effective_tools = _effective_tools(persona.tools, mode)
     tool_schemas = _build_tool_schemas(effective_tools)
 

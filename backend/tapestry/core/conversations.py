@@ -93,6 +93,22 @@ class TimelineItem(BaseModel):
     thread_id: str | None = None
 
 
+def derive_membership(conversation_id: str) -> tuple[list[str], str | None]:
+    """(persona_ids, kind) for this conversation, projected from its
+    `conversation/created` event -- the same data `web_adapter/api.py`'s
+    private `_conversation_meta` already extracts for the API layer, made
+    reusable here so `graph/build.py` (which must not import from
+    `adapters/`) can look up conversation membership too. `kind` is
+    `"dm"`/`"group"` when found, else `None` (e.g. a conversation the log
+    has no creation event for -- shouldn't happen, but a caller should
+    treat that as "unknown membership" rather than crash).
+    """
+    for event in events.read_events(conversation_id):
+        if event.type == "conversation/created":
+            return list(event.payload.get("persona_ids", [])), event.payload.get("kind")
+    return [], None
+
+
 def derive_timeline(conversation_id: str) -> list[TimelineItem]:
     """Project every human-displayable event into a `TimelineItem`, in log
     order — the deliberately WIDE sibling to `derive_messages` (see module

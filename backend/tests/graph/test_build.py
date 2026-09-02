@@ -193,6 +193,65 @@ def test_system_prompt_tells_the_model_not_to_load_skills_for_small_talk():
     assert "small talk" in prompt.lower()
 
 
+# ---------------------------------------------------------------------------
+# Conversation-roster awareness
+#
+# Live-tested bug: asked "ask rex if he's online" in a conversation Rex
+# wasn't a member of, Ada answered "It looks like Rex is not a recognized
+# persona" -- false, he's a real persona elsewhere in the system. Root
+# cause: persona_node never told the model who was actually in the room.
+# ---------------------------------------------------------------------------
+
+
+def test_system_prompt_lists_conversation_members_with_status():
+    ada = build.PERSONAS["ada"]
+    prompt = build._build_system_prompt(ada, [], ["ada", "nova"])
+    assert "Ada (Architect) — online [you]" in prompt
+    assert "Nova (DevOps) — paused" in prompt
+
+
+def test_system_prompt_distinguishes_non_member_from_nonexistent():
+    ada = build.PERSONAS["ada"]
+    prompt = build._build_system_prompt(ada, [], ["ada", "nova"])
+    # Rex is a real persona, just not in this conversation -- must be named
+    # as existing, not lumped in with an outright unknown name.
+    assert "Rex (Developer, online)" in prompt
+    assert "not a recognized persona" not in prompt.lower()
+
+
+def test_system_prompt_omits_roster_when_membership_is_unset():
+    # member_ids=None (the default) means "unknown," not "empty conversation"
+    # -- rendering an empty roster would wrongly tell a persona she herself
+    # isn't in the conversation. Covers the many existing tests that invoke
+    # the graph directly without ever appending a conversation/created event.
+    ada = build.PERSONAS["ada"]
+    prompt = build._build_system_prompt(ada, [])
+    assert "Conversation roster" not in prompt
+
+
+async def test_persona_node_wires_real_conversation_membership_into_the_prompt(tmp_path):
+    conversation_id = "conv-roster-1"
+    events_module.append_event(
+        conversation_id,
+        "conversation/created",
+        actor="you",
+        payload={"kind": "group", "name": "#roster-test", "persona_ids": ["ada", "rex"]},
+    )
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        call_model_mock = AsyncMock(return_value=_plain_response("hi"))
+        with patch.object(build, "call_model", call_model_mock):
+            state = build.new_state(conversation_id, "ada")
+            await graph.ainvoke(state, config)
+
+        system_prompt = call_model_mock.call_args.kwargs["messages"][0]["content"]
+        assert "Rex (Developer) — online [you]" not in system_prompt
+        assert "Ada (Architect) — online [you]" in system_prompt
+        assert "Nova (DevOps, paused)" in system_prompt  # not a member -- listed as existing elsewhere
+    finally:
+        await graph.checkpointer.conn.close()
+
+
 def test_new_state_fills_documented_defaults():
     state = build.new_state("conv-1", "rex")
     assert state["conversation_id"] == "conv-1"

@@ -113,6 +113,9 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
     ? conversation.personaIds.map((id) => personaById.get(id)).filter((p): p is Persona => Boolean(p))
     : [];
   const primaryPersona = !isGroup ? personaById.get(conversation.personaIds[0]) : undefined;
+  // Composer's "@"-autocomplete candidate list: every persona actually in
+  // this conversation, DM or group alike.
+  const conversationPersonas = isGroup ? groupPersonas : primaryPersona ? [primaryPersona] : [];
   const headerName = isGroup ? conversation.name ?? "Group" : primaryPersona?.name ?? "Unknown persona";
   // The lead persona (personaIds[0]) is authoritative for conversation-level
   // mode/model state for both a DM and a group — same convention the rest
@@ -223,6 +226,7 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
       <Composer
         conversationId={conversation.id}
         recipientName={headerName}
+        personas={conversationPersonas}
         onSent={(message) =>
           setMessages((prev) => (prev.some((m) => m.id === message.id) ? prev : [...prev, message]))
         }
