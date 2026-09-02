@@ -506,6 +506,48 @@ async def test_model_override_once_is_used_for_exactly_one_pass(tmp_path):
         await graph.checkpointer.conn.close()
 
 
+async def test_once_scope_set_via_aupdate_state_survives_until_the_next_new_state_turn(tmp_path):
+    """The REAL usage pattern a `scope=once` model-switch endpoint would
+    follow: `aupdate_state` sets the override on an already-existing
+    checkpoint, entirely separate from any `new_state()` call, and the
+    NEXT external turn (which always starts from a fresh `new_state()`,
+    per persona_node's own `starting_new_turn` handling) must still pick
+    it up -- `new_state()` must NOT silently wipe it out from under a
+    pending once-override set moments earlier. This is exactly the bug
+    `new_state()`'s own docstring on `model_override_once` documents.
+    """
+    conversation_id = "conv-once-2"
+    seen_models = []
+
+    async def call_model_capturing_model(model, messages, tools, **kwargs):
+        seen_models.append(model)
+        return _plain_response("ok")
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        # An UNRELATED prior turn already exists on this thread -- the
+        # realistic case (a conversation already in progress), not a
+        # brand-new one.
+        with patch.object(build, "call_model", call_model_capturing_model):
+            events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "first"})
+            await graph.ainvoke(build.new_state(conversation_id, "rex"), config)
+
+        # Set the once-override independently, exactly as the model-switch
+        # endpoint would -- NOT bundled into a new_state() call.
+        await graph.aupdate_state(config, {"model_override_once": "once-only-model"})
+
+        with patch.object(build, "call_model", call_model_capturing_model):
+            events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "second"})
+            await graph.ainvoke(build.new_state(conversation_id, "rex"), config)
+
+        assert seen_models == [build.PERSONAS["rex"].model, "once-only-model"]
+
+        snapshot = await graph.aget_state(config)
+        assert snapshot.values.get("model_override_once") is None
+    finally:
+        await graph.checkpointer.conn.close()
+
+
 async def test_session_scope_model_switch_is_used_for_the_whole_conversation(tmp_path):
     conversation_id = "conv-session-model-1"
     events_module.append_event(

@@ -243,6 +243,20 @@ def new_state(
     default filled in. `TypedDict` itself can't carry runtime defaults
     (`delegation_depth: int = 0` in the task brief is aspirational for a
     TypedDict), so this is the actual place those defaults live.
+
+    `model_override_once` is deliberately ABSENT from this dict, not set
+    to `None` -- every adapter calls `new_state()` fresh for EVERY
+    external turn (not just the first; see the `starting_new_turn` fix in
+    `persona_node`), and this return value becomes an `ainvoke` input that
+    REPLACES checkpointed state for any key it sets. A once-scope model
+    override is set by a separate action (the model-switch endpoint,
+    via `graph.aupdate_state`) specifically to survive the gap until the
+    NEXT `new_state()`-triggered turn consumes it -- if this function set
+    `model_override_once=None` here, every such override would be wiped
+    the instant the human's next message arrived, before persona_node
+    ever got to read it. Omitting the key lets LangGraph's merge keep
+    whatever was already checkpointed (a real override, or nothing at all
+    for a conversation where one was never set).
     """
     return TapestryGraphState(
         conversation_id=conversation_id,
@@ -256,7 +270,6 @@ def new_state(
         turn_id=None,
         approved=None,
         next_node="persona",
-        model_override_once=None,
     )
 
 
