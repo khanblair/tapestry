@@ -21,11 +21,15 @@ and appends a synthetic repair `turn/end` carrying
 `payload["reason"] == ORPHAN_REPAIR_REASON` ("interrupted"). That reason
 string is RESERVED exclusively for this synthetic repair path.
 
-Invariant assumed (not enforced) throughout core/: at most one `turn/start`
-is open at a time per conversation -- turns don't nest. `delegation.py`'s
-round-cap scoping and `close_orphaned_turns`'s "most recent open turn" logic
-both rely on this. If `graph/` ever needs concurrent/nested turns per
-conversation, both call sites need to be revisited together.
+Concurrent turns per conversation are expected, not an edge case: a tag-all
+fan-out spawns one turn per mentioned persona, each on its own LangGraph
+thread (`payload["graph_thread_id"]`), running at the same time. Matching
+and scoping are therefore always by id, never by "most recent" position:
+`delegation.py`'s round-cap scoping takes an explicit `turn_id` to slice
+from, and `close_orphaned_turns` only auto-closes turns whose
+`graph_thread_id` equals the conversation id (`is_main_thread_turn`) --
+a fan-out leg's own open turn is deliberately left alone, since a blind
+log scan can't tell a live paused approval apart from a crash.
 
     No other code anywhere in this codebase — including `graph/`, which
     will emit real `turn/end` events as live turn-stopping decisions — may
