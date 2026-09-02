@@ -59,8 +59,11 @@ Judgment calls worth reading before assuming a piece of this is arbitrary
    `_drive_turn` also forwards `graph.astream(..., stream_mode="custom")`'s
    raw frames verbatim (the coarse `persona/thinking`/`tool/status` status
    frames `graph/build.py` already emits), satisfying the "forward astream
-   custom events over the WS" requirement even though the current frontend
-   doesn't key off them yet.
+   custom events over the WS" requirement. The `tool/status` frames are no
+   longer merely forwarded-but-unused, either: `_record_running_activity`
+   reads them to populate `GET /api/activity`'s "running" list, the one
+   piece of activity state that genuinely cannot come from the durable
+   event log.
 
 3. **Which persona answers a new message**: `conversation.persona_ids[0]`
    is always the turn's entry persona — for a DM that's the only
@@ -93,17 +96,19 @@ Judgment calls worth reading before assuming a piece of this is arbitrary
    directly (`safeApi.ts`/`new-conversation/page.tsx` both flag this exact
    gap in their own comments).
 
-6. **`Message.activity`/`.diff` are honest, not fabricated.** They are
-   NEVER populated by this module. `tool/result` doesn't durably encode
-   "still running" (only the final result is logged — the live
-   in-progress state is exactly what `tool/status` custom-stream frames
-   are for, not history), and `task/diff_ready`'s payload
-   (`{task_id, files_changed, diff_summary}`, see `graph/build.py`'s
-   `execute_node`) carries no add/del line counts at all. Rather than
-   defaulting `diff.add`/`diff.deletions` to 0 (which would look like real
-   data), both fields are simply left `None` — a documented upstream gap,
-   in the same spirit as `graph/build.py`'s own "real per-token streaming
-   is NOT wired here" note.
+6. **`Message.activity`/`.diff` are honest, not fabricated.** `_project_messages`
+   emits a synthetic, empty-`text` `MessageOut` for every `tool/result`
+   event (`activity`, always `done=True` — the log only ever records a
+   tool call's FINAL result; "still running" is exactly what the live
+   `tool/status` custom-stream frames are for, never history) and for
+   every `task/diff_ready` event whose payload carries REAL captured
+   counts (`payload["additions"] is not None`, i.e.
+   `graph.diff_capture.capture_workspace_diff` actually succeeded).
+   `task/diff_ready` events where capture failed (non-git workspace,
+   `git` missing) are simply skipped — never surfaced as a message with
+   fabricated 0/0 add/del counts, same principle as before, just applied
+   at the per-event level instead of leaving the fields permanently
+   `None`. See `_tool_result_message`/`_diff_ready_message` below.
 
 7. **`core/personas.py` gained one new function, `save_persona`** (write
    the inverse of `load_personas`, for exactly one persona). Flagged here
@@ -137,10 +142,13 @@ Endpoint list
     POST   /api/conversations
     GET    /api/conversations/{conversation_id}/messages
     POST   /api/conversations/{conversation_id}/messages
+    GET    /api/conversations/{conversation_id}/diff/{task_id}
     POST   /api/conversations/{conversation_id}/ask/answers            (real, batch)
     POST   /api/conversations/{conversation_id}/ask/{question_id}/answer  (alias)
     GET    /api/search?q=...
     GET    /api/asks/pending
+    GET    /api/activity
+    GET    /api/status
     POST   /api/agents/pause-all           (POST /api/agents/pause also registered)
     WS     /ws/conversations/{conversation_id}
 """
@@ -169,6 +177,7 @@ from tapestry.core.ask import AskAnswer
 from tapestry.core.personas import Persona, load_personas, save_persona
 from tapestry.graph import build as graph_build
 from tapestry.storage.db import get_connection
+from tapestry.tools.mcp_client import MetaMCPClient, MetaMCPConfigurationError
 
 __all__ = ["create_app", "start"]
 
@@ -276,6 +285,7 @@ class AskQuestionOut(CamelModel):
     options: list[str] | None = None
     multi_select: bool | None = None
     intent: str | None = None
+    related_task_id: str | None = None
 
 
 class MessageActivityOut(CamelModel):
@@ -299,7 +309,8 @@ class MessageOut(CamelModel):
     timestamp: str
     event_type: str
     thread_id: str | None = None
-    # Never populated — see module docstring judgment call 6.
+    # Populated for synthetic tool/result and task/diff_ready entries only
+    # — see module docstring judgment call 6 and _project_messages below.
     activity: MessageActivityOut | None = None
     diff: MessageDiffOut | None = None
     approval: AskQuestionOut | None = None
@@ -350,6 +361,80 @@ class PendingApprovalOut(CamelModel):
     conversation_id: str
     conversation_label: str
     question: AskQuestionOut
+
+
+# --- Diff detail (GET .../diff/{task_id}) — full per-line content, distinct
+# from MessageOut.diff's summary-only chip. Field names match
+# web/lib/api.ts's DiffLine/DiffFile/DiffDetail exactly. ---
+
+
+class DiffLineOut(CamelModel):
+    type: str
+    line_number: int
+    content: str
+
+
+class DiffFileOut(CamelModel):
+    name: str
+    lines: list[DiffLineOut]
+
+
+class DiffDetailOut(CamelModel):
+    task_id: str
+    title: str
+    file_count: int
+    additions: int
+    deletions: int
+    files: list[DiffFileOut]
+
+
+# --- Cross-conversation activity feed (GET /api/activity) ---
+
+
+class ActivityItemOut(CamelModel):
+    conversation_id: str
+    conversation_label: str
+    actor: str
+    label: str
+    timestamp: str
+    task_id: str | None = None
+
+
+class ActivityOut(CamelModel):
+    running: list[ActivityItemOut]
+    recent: list[ActivityItemOut]
+
+
+# --- System status (GET /api/status) ---
+
+
+class PlatformStatusOut(CamelModel):
+    name: str
+    detail: str
+    connected: bool
+    always_on: bool
+
+
+class ProviderStatusOut(CamelModel):
+    name: str
+    connected: bool
+
+
+class McpServerStatusOut(CamelModel):
+    name: str
+    connected: bool
+
+
+class MetaMcpStatusOut(CamelModel):
+    running: bool
+    server_count: int
+
+
+class StatusOut(CamelModel):
+    platforms: list[PlatformStatusOut]
+    providers: list[ProviderStatusOut]
+    metamcp: MetaMcpStatusOut
+    mcp_servers: list[McpServerStatusOut]
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +625,65 @@ def _question_dict_to_out(question: dict) -> AskQuestionOut:
         options=question.get("options"),
         multi_select=question.get("multi_select"),
         intent=question.get("intent"),
+        related_task_id=question.get("related_task_id"),
+    )
+
+
+_ACTIVITY_RESULT_MAX_CHARS = 200
+
+
+def _tool_result_message(event: events.TapestryEvent) -> MessageOut:
+    """Project one `tool/result` event into a synthetic, empty-`text`
+    message carrying `.activity`. Every `tool/result` event represents an
+    already-finished call (the log never records "still running" — see
+    module docstring judgment call 6), so `done` is always `True`.
+    """
+    payload = event.payload
+    tool_name = payload.get("tool_name", "")
+    arguments = payload.get("arguments") or {}
+    detail = arguments.get("path") or arguments.get("command") or ""
+    label = f"{tool_name} {detail}".strip() or tool_name
+    if payload.get("is_error"):
+        label = f"{label} (failed)"
+    text = payload.get("text") or ""
+    result = text[:_ACTIVITY_RESULT_MAX_CHARS] if text else None
+    return MessageOut(
+        id=event.id,
+        conversation_id=event.conversation_id,
+        actor=event.actor,
+        text="",
+        timestamp=event.timestamp,
+        event_type=event.type,
+        thread_id=payload.get("thread_id"),
+        activity=MessageActivityOut(label=label, done=True, result=result),
+    )
+
+
+def _diff_ready_message(event: events.TapestryEvent) -> MessageOut | None:
+    """Project one `task/diff_ready` event into a synthetic, empty-`text`
+    message carrying `.diff`, or `None` when real capture failed
+    (`payload["additions"] is None`) — never fabricate 0/0 counts, see
+    module docstring judgment call 6.
+    """
+    payload = event.payload
+    additions = payload.get("additions")
+    if additions is None:
+        return None
+    files_changed = payload.get("files_changed") or []
+    return MessageOut(
+        id=event.id,
+        conversation_id=event.conversation_id,
+        actor=event.actor,
+        text="",
+        timestamp=event.timestamp,
+        event_type=event.type,
+        thread_id=payload.get("thread_id"),
+        diff=MessageDiffOut(
+            task_id=payload.get("task_id", ""),
+            files=len(files_changed),
+            add=additions,
+            deletions=payload.get("deletions") or 0,
+        ),
     )
 
 
@@ -579,6 +723,12 @@ def _project_messages(conversation_id: str) -> list[MessageOut]:
                         approval=_question_dict_to_out(question),
                     )
                 )
+        elif event.type == "tool/result":
+            out.append(_tool_result_message(event))
+        elif event.type == "task/diff_ready":
+            diff_message = _diff_ready_message(event)
+            if diff_message is not None:
+                out.append(diff_message)
     return out
 
 
@@ -621,6 +771,36 @@ def _conversation_label(row: sqlite3.Row) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cross-conversation activity feed helpers (GET /api/activity's "recent").
+# ---------------------------------------------------------------------------
+
+# The event types read_recent_events is scoped to for the "recent" list --
+# real, persisted task/delegation history only, never a raw firehose of
+# every event type ever logged (model/response, ask/answered, etc. would be
+# noise on an activity feed).
+_RECENT_ACTIVITY_TYPES: set[str] = {
+    "task/completed",
+    "task/diff_ready",
+    "delegation/sent",
+    "task/verification_failed",
+    "task/started",
+}
+
+_ACTIVITY_LABEL_TEMPLATES: dict[str, str] = {
+    "task/completed": "{actor} completed a task",
+    "task/diff_ready": "{actor} proposed a diff",
+    "delegation/sent": "{actor} delegated",
+    "task/verification_failed": "{actor}'s work failed verification",
+    "task/started": "{actor} started a task",
+}
+
+
+def _activity_label(event_type: str, actor: str) -> str:
+    template = _ACTIVITY_LABEL_TEMPLATES.get(event_type, "{actor} did something")
+    return template.format(actor=actor)
+
+
+# ---------------------------------------------------------------------------
 # WebSocket broadcast + turn-driving. See module docstring judgment call 2.
 # ---------------------------------------------------------------------------
 
@@ -641,6 +821,43 @@ async def _broadcast_new_messages(app: FastAPI, conversation_id: str) -> None:
         )
 
 
+def _record_running_activity(app: FastAPI, conversation_id: str, chunk: dict) -> None:
+    """Best-effort, in-memory-only tracking of in-flight tool calls, fed by
+    `graph/build.py`'s `execute_node` `streaming.emit("tool/status", ...)`
+    calls (`{"type": "tool/status", "payload": {"tool_name": ..., "status":
+    "running"|"done", ...}}` — the "custom" stream frame shape). This is
+    the ONE piece of activity state that genuinely cannot come from the
+    durable event log: `tool/result` only ever records a call's FINAL
+    result, never "still running".
+
+    Never raises — this must not crash `_drive_turn`'s custom-frame
+    handling over a chunk shape this function didn't anticipate; it's
+    best-effort live state, not a durable guarantee.
+    """
+    try:
+        if not isinstance(chunk, dict) or chunk.get("type") != "tool/status":
+            return
+        payload = chunk.get("payload") or {}
+        status = payload.get("status")
+        if status == "running":
+            # No persona id travels with this frame (see streaming.emit's
+            # payload above) -- fall back to the conversation's lead
+            # persona, an acceptable simplification per the task brief.
+            persona_ids, _, _ = _conversation_meta(conversation_id)
+            actor = persona_ids[0] if persona_ids else "system"
+            tool_name = payload.get("tool_name", "")
+            app.state.running_activity[conversation_id] = {
+                "actor": actor,
+                "label": f"running {tool_name}".strip(),
+                "timestamp": _now_iso(),
+                "task_id": None,
+            }
+        elif status == "done":
+            app.state.running_activity.pop(conversation_id, None)
+    except Exception:
+        pass
+
+
 async def _drive_turn(app: FastAPI, conversation_id: str, graph_input: Any) -> None:
     """Run one graph turn (or resume one) to completion or until it pauses
     at an approval interrupt, forwarding events out over this
@@ -657,7 +874,10 @@ async def _drive_turn(app: FastAPI, conversation_id: str, graph_input: Any) -> N
     additionally gets an explicit `ask/requested`-typed frame out
     immediately. Either way, `_broadcast_new_messages` runs after every
     step and is what actually delivers a fresh assistant reply or approval
-    prompt in the `{"type": "message", ...}` shape the frontend needs.
+    prompt in the `{"type": "message", ...}` shape the frontend needs. The
+    same custom frames also feed `_record_running_activity`, which the
+    backend itself now keys off of (`GET /api/activity`'s "running" list) —
+    no longer just proven-but-unused plumbing for a future frontend.
     """
     graph = app.state.graph
     config = {"configurable": {"thread_id": conversation_id}}
@@ -665,6 +885,7 @@ async def _drive_turn(app: FastAPI, conversation_id: str, graph_input: Any) -> N
         async for mode, chunk in graph.astream(graph_input, config, stream_mode=["custom", "values"]):
             if mode == "custom":
                 await _broadcast(app, conversation_id, chunk)
+                _record_running_activity(app, conversation_id, chunk)
             elif mode == "values" and isinstance(chunk, dict) and "__interrupt__" in chunk:
                 interrupts = chunk["__interrupt__"]
                 if interrupts:
@@ -678,6 +899,11 @@ async def _drive_turn(app: FastAPI, conversation_id: str, graph_input: Any) -> N
         # failure on the conversation's own WS stream rather than letting
         # it vanish into asyncio's default "exception was never retrieved"
         # log line with no link back to which conversation broke.
+        # Also clear any "running" row this turn left behind -- a tool_fn
+        # that raises inside execute_node never reaches its own "done"
+        # streaming.emit, and this is the only other place that turn's
+        # failure is guaranteed to pass through.
+        app.state.running_activity.pop(conversation_id, None)
         await _broadcast(
             app, conversation_id, {"type": "turn/error", "payload": {"error": str(exc)}}
         )
@@ -764,6 +990,12 @@ async def create_app() -> FastAPI:
         app.state.broadcast_message_ids = {}
         app.state.closed_orphan_conversations = set()
         app.state.background_tasks = set()
+        # In-memory-only, per-process registry of in-flight tool calls —
+        # parallel in spirit to ws_subscribers/broadcast_message_ids above.
+        # Never a second source of truth: the durable event log only ever
+        # records a tool call's FINAL result (tool/result), never "still
+        # running" — see _record_running_activity and GET /api/activity.
+        app.state.running_activity = {}
         try:
             yield
         finally:
@@ -899,6 +1131,50 @@ async def create_app() -> FastAPI:
         _spawn_turn(app, conversation_id, state)
         return message
 
+    @app.get(
+        "/api/conversations/{conversation_id}/diff/{task_id}", response_model=DiffDetailOut
+    )
+    async def get_diff_detail(conversation_id: str, task_id: str) -> DiffDetailOut:
+        """Full per-file, per-line diff detail for the diff review screen —
+        separate from `MessageOut.diff`'s summary-only chip. Takes the LAST
+        (most recent) `task/diff_ready` event matching `task_id`; 404s if
+        none exists, or if it exists but carries no real file detail
+        (`files` empty — capture failed, nothing real to show; see
+        module docstring judgment call 6).
+        """
+        match: events.TapestryEvent | None = None
+        for event in events.read_events(conversation_id):
+            if event.type == "task/diff_ready" and event.payload.get("task_id") == task_id:
+                match = event
+        if match is None or not (match.payload.get("files") or []):
+            raise HTTPException(
+                status_code=404, detail=f"no diff found for task {task_id!r}"
+            )
+
+        files = [
+            DiffFileOut(
+                name=file.get("name", ""),
+                lines=[
+                    DiffLineOut(
+                        type=line.get("type", "ctx"),
+                        line_number=line.get("line_number", 0),
+                        content=line.get("content", ""),
+                    )
+                    for line in (file.get("lines") or [])
+                ],
+            )
+            for file in match.payload["files"]
+        ]
+        title = f"Diff · {files[0].name}" if files else f"Diff · {task_id[:8]}"
+        return DiffDetailOut(
+            task_id=task_id,
+            title=title,
+            file_count=len(files),
+            additions=match.payload.get("additions") or 0,
+            deletions=match.payload.get("deletions") or 0,
+            files=files,
+        )
+
     # -- Ask / approvals ---------------------------------------------------
 
     @app.post("/api/conversations/{conversation_id}/ask/answers", status_code=204)
@@ -974,6 +1250,107 @@ async def create_app() -> FastAPI:
         ]
 
         return SearchResultsOut(messages=message_results, personas=persona_results)
+
+    # -- Activity feed (Activity screen's "Running now" / "Recent") --------
+
+    @app.get("/api/activity", response_model=ActivityOut)
+    async def get_activity() -> ActivityOut:
+        recent: list[ActivityItemOut] = []
+        for event in events.read_recent_events(types=_RECENT_ACTIVITY_TYPES, limit=20):
+            row = _get_conversation_row(event.conversation_id)
+            label = _conversation_label(row) if row is not None else event.conversation_id
+            recent.append(
+                ActivityItemOut(
+                    conversation_id=event.conversation_id,
+                    conversation_label=label,
+                    actor=event.actor,
+                    label=_activity_label(event.type, event.actor),
+                    timestamp=event.timestamp,
+                    task_id=event.payload.get("task_id"),
+                )
+            )
+
+        running: list[ActivityItemOut] = []
+        for conversation_id, info in app.state.running_activity.items():
+            row = _get_conversation_row(conversation_id)
+            label = _conversation_label(row) if row is not None else conversation_id
+            running.append(
+                ActivityItemOut(
+                    conversation_id=conversation_id,
+                    conversation_label=label,
+                    actor=info.get("actor", ""),
+                    label=info.get("label", ""),
+                    timestamp=info.get("timestamp", ""),
+                    task_id=info.get("task_id"),
+                )
+            )
+
+        return ActivityOut(running=running, recent=recent)
+
+    # -- System status (Settings screen's Platforms/Providers/Tools panels) --
+
+    @app.get("/api/status", response_model=StatusOut)
+    async def get_status() -> StatusOut:
+        discord_connected = bool(os.environ.get("DISCORD_BOT_TOKEN"))
+        telegram_connected = bool(os.environ.get("TELEGRAM_BOT_TOKEN"))
+        platforms = [
+            PlatformStatusOut(
+                name="Discord",
+                detail="Connected" if discord_connected else "Not connected",
+                connected=discord_connected,
+                always_on=False,
+            ),
+            PlatformStatusOut(
+                name="Telegram",
+                detail="Connected" if telegram_connected else "Not connected",
+                connected=telegram_connected,
+                always_on=False,
+            ),
+            PlatformStatusOut(
+                name="Web", detail="Always on", connected=True, always_on=True
+            ),
+        ]
+        providers = [
+            ProviderStatusOut(
+                name="Anthropic", connected=bool(os.environ.get("ANTHROPIC_API_KEY"))
+            ),
+            ProviderStatusOut(
+                name="DeepSeek", connected=bool(os.environ.get("DEEPSEEK_API_KEY"))
+            ),
+            ProviderStatusOut(
+                name="Gemini", connected=bool(os.environ.get("GEMINI_API_KEY"))
+            ),
+            # No env var exists for Qwen in this project -- always
+            # disconnected. Expected, not a bug.
+            ProviderStatusOut(name="Qwen", connected=False),
+            ProviderStatusOut(
+                name="OpenRouter", connected=bool(os.environ.get("OPENROUTER_API_KEY"))
+            ),
+        ]
+
+        try:
+            tools = await MetaMCPClient().list_tools()
+        except (MetaMCPConfigurationError, Exception):
+            # MetaMCPConfigurationError (no METAMCP_API_KEY configured) is
+            # already covered by the bare Exception below it -- listed
+            # explicitly anyway so the "no configuration" case reads as a
+            # named, expected outcome rather than an incidental catch-all.
+            # This endpoint must never 500 over metamcp being unavailable.
+            metamcp = MetaMcpStatusOut(running=False, server_count=0)
+            mcp_servers: list[McpServerStatusOut] = []
+        else:
+            # metamcp's own convention: {ServerName}__{originalToolName} --
+            # see tools/mcp_client.py's module docstring.
+            server_names = sorted({tool.get("name", "").split("__", 1)[0] for tool in tools})
+            metamcp = MetaMcpStatusOut(running=True, server_count=len(server_names))
+            # Every server returned here IS connected -- list_tools() only
+            # ever returns tools from servers metamcp is actually reachable
+            # through.
+            mcp_servers = [McpServerStatusOut(name=name, connected=True) for name in server_names]
+
+        return StatusOut(
+            platforms=platforms, providers=providers, metamcp=metamcp, mcp_servers=mcp_servers
+        )
 
     # -- Agents ---------------------------------------------------------------
 

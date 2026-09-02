@@ -523,6 +523,436 @@ def test_pause_alias_path_also_works(client):
 
 
 # ---------------------------------------------------------------------------
+# related_task_id round-trips through an approval ask
+# ---------------------------------------------------------------------------
+
+
+def test_approval_question_carries_related_task_id(client, monkeypatch):
+    propose = _tool_call_response(
+        "I'll create the file.",
+        "file_editor",
+        {"command": "create", "path": "/tmp/z.txt", "file_text": "hi"},
+    )
+    monkeypatch.setattr(graph_build, "call_model", AsyncMock(return_value=propose))
+    monkeypatch.setitem(
+        graph_build.TOOL_REGISTRY,
+        "file_editor",
+        AsyncMock(return_value=ToolResult(text="wrote it", is_error=False)),
+    )
+
+    conversation_id = "dm-rex"
+    client.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "please create /tmp/z.txt"},
+    )
+
+    import time
+
+    approval = None
+    for _ in range(50):
+        messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+        approvals = [m for m in messages if m.get("approval")]
+        if approvals:
+            approval = approvals[0]["approval"]
+            break
+        time.sleep(0.05)
+    assert approval is not None, "approval question never appeared"
+    assert approval["relatedTaskId"]
+
+    logged = events_module.read_events(conversation_id)
+    task_started = next(e for e in logged if e.type == "task/started")
+    assert approval["relatedTaskId"] == task_started.payload["task_id"]
+
+
+# ---------------------------------------------------------------------------
+# tool/result and task/diff_ready synthetic messages
+# ---------------------------------------------------------------------------
+
+
+def test_tool_result_event_becomes_a_synthetic_activity_message(client):
+    conversation_id = "dm-rex"
+    client.get(f"/api/conversations/{conversation_id}/messages")  # lazily vivify
+
+    events_module.append_event(
+        conversation_id,
+        "tool/result",
+        actor="rex",
+        payload={
+            "task_id": "task-1",
+            "tool_name": "file_editor",
+            "arguments": {"command": "create", "path": "/tmp/a.txt"},
+            "text": "x" * 500,
+            "is_error": False,
+        },
+    )
+
+    messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+    activity_messages = [m for m in messages if m.get("activity")]
+    assert len(activity_messages) == 1
+    assert activity_messages[0]["text"] == ""
+    activity = activity_messages[0]["activity"]
+    assert activity["done"] is True
+    assert "/tmp/a.txt" in activity["label"]
+    assert len(activity["result"]) == 200
+
+
+def test_tool_result_error_is_reflected_in_the_label(client):
+    conversation_id = "dm-rex"
+    client.get(f"/api/conversations/{conversation_id}/messages")
+
+    events_module.append_event(
+        conversation_id,
+        "tool/result",
+        actor="rex",
+        payload={
+            "task_id": "task-1",
+            "tool_name": "terminal",
+            "arguments": {"command": "false"},
+            "text": "command failed",
+            "is_error": True,
+        },
+    )
+
+    messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+    activity = next(m["activity"] for m in messages if m.get("activity"))
+    assert "(failed)" in activity["label"]
+
+
+def test_diff_ready_with_real_capture_becomes_a_synthetic_diff_message(client):
+    conversation_id = "dm-rex"
+    client.get(f"/api/conversations/{conversation_id}/messages")
+
+    events_module.append_event(
+        conversation_id,
+        "task/diff_ready",
+        actor="rex",
+        payload={
+            "task_id": "task-2",
+            "files_changed": ["a.py", "b.py"],
+            "diff_summary": "changed things",
+            "additions": 10,
+            "deletions": 3,
+            "truncated": False,
+            "files": [
+                {
+                    "name": "a.py",
+                    "additions": 10,
+                    "deletions": 3,
+                    "lines": [{"type": "add", "line_number": 1, "content": "x = 1"}],
+                }
+            ],
+        },
+    )
+
+    messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+    diff_messages = [m for m in messages if m.get("diff")]
+    assert len(diff_messages) == 1
+    assert diff_messages[0]["text"] == ""
+    diff = diff_messages[0]["diff"]
+    assert diff["taskId"] == "task-2"
+    assert diff["files"] == 2
+    assert diff["add"] == 10
+    assert diff["del"] == 3
+
+
+def test_diff_ready_with_failed_capture_is_omitted_never_fabricated(client):
+    conversation_id = "dm-rex"
+    client.get(f"/api/conversations/{conversation_id}/messages")
+
+    events_module.append_event(
+        conversation_id,
+        "task/diff_ready",
+        actor="rex",
+        payload={
+            "task_id": "task-3",
+            "files_changed": [],
+            "diff_summary": "changed things",
+            "additions": None,
+            "deletions": None,
+            "truncated": False,
+            "files": [],
+        },
+    )
+
+    messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+    assert all(m.get("diff") is None for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# Diff detail endpoint
+# ---------------------------------------------------------------------------
+
+
+def _diff_ready_payload(task_id: str, file_name: str, **overrides) -> dict:
+    payload = {
+        "task_id": task_id,
+        "files_changed": [file_name],
+        "diff_summary": f"changed {file_name}",
+        "additions": 2,
+        "deletions": 1,
+        "truncated": False,
+        "files": [
+            {
+                "name": file_name,
+                "additions": 2,
+                "deletions": 1,
+                "lines": [
+                    {"type": "ctx", "line_number": 1, "content": "def f():"},
+                    {"type": "add", "line_number": 2, "content": "    return 1"},
+                    {"type": "del", "line_number": 2, "content": "    return 0"},
+                ],
+            }
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_diff_detail_returns_full_per_file_line_content(client):
+    conversation_id = "dm-rex"
+    client.get(f"/api/conversations/{conversation_id}/messages")
+
+    events_module.append_event(
+        conversation_id,
+        "task/diff_ready",
+        actor="rex",
+        payload=_diff_ready_payload("task-4", "a.py"),
+    )
+
+    res = client.get(f"/api/conversations/{conversation_id}/diff/task-4")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["taskId"] == "task-4"
+    assert body["fileCount"] == 1
+    assert body["additions"] == 2
+    assert body["deletions"] == 1
+    assert body["files"][0]["name"] == "a.py"
+    assert body["files"][0]["lines"][1] == {
+        "type": "add",
+        "lineNumber": 2,
+        "content": "    return 1",
+    }
+
+
+def test_diff_detail_uses_the_most_recent_matching_event(client):
+    conversation_id = "dm-rex"
+    client.get(f"/api/conversations/{conversation_id}/messages")
+
+    events_module.append_event(
+        conversation_id,
+        "task/diff_ready",
+        actor="rex",
+        payload=_diff_ready_payload("task-5", "old.py"),
+    )
+    events_module.append_event(
+        conversation_id,
+        "task/diff_ready",
+        actor="rex",
+        payload=_diff_ready_payload("task-5", "new.py"),
+    )
+
+    res = client.get(f"/api/conversations/{conversation_id}/diff/task-5")
+    assert res.status_code == 200
+    assert res.json()["files"][0]["name"] == "new.py"
+
+
+def test_diff_detail_404s_when_no_matching_event(client):
+    conversation_id = "dm-rex"
+    client.get(f"/api/conversations/{conversation_id}/messages")
+    res = client.get(f"/api/conversations/{conversation_id}/diff/does-not-exist")
+    assert res.status_code == 404
+
+
+def test_diff_detail_404s_when_capture_failed(client):
+    conversation_id = "dm-rex"
+    client.get(f"/api/conversations/{conversation_id}/messages")
+    events_module.append_event(
+        conversation_id,
+        "task/diff_ready",
+        actor="rex",
+        payload={
+            "task_id": "task-6",
+            "files_changed": [],
+            "diff_summary": "x",
+            "additions": None,
+            "deletions": None,
+            "truncated": False,
+            "files": [],
+        },
+    )
+    res = client.get(f"/api/conversations/{conversation_id}/diff/task-6")
+    assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Cross-conversation activity feed
+# ---------------------------------------------------------------------------
+
+
+def test_activity_recent_reflects_real_events_across_conversations_newest_first(client):
+    client.post("/api/conversations", json={"kind": "dm", "personaIds": ["rex"]})
+    client.post(
+        "/api/conversations",
+        json={"kind": "group", "name": "#launch", "personaIds": ["ada", "vex"]},
+    )
+    group_conv_id = next(
+        c["id"] for c in client.get("/api/conversations").json() if c["kind"] == "group"
+    )
+
+    events_module.append_event(
+        "dm-rex", "task/started", actor="rex", payload={"task_id": "t1", "description": "x"}
+    )
+    events_module.append_event(
+        group_conv_id,
+        "task/completed",
+        actor="ada",
+        payload={"task_id": "t2", "notes": "done"},
+    )
+
+    res = client.get("/api/activity")
+    assert res.status_code == 200
+    recent = res.json()["recent"]
+    assert len(recent) == 2
+    # Newest first.
+    assert recent[0]["label"] == "ada completed a task"
+    assert recent[0]["conversationLabel"] == "#launch"
+    assert recent[0]["taskId"] == "t2"
+    assert recent[1]["label"] == "rex started a task"
+    assert recent[1]["conversationId"] == "dm-rex"
+    assert recent[1]["taskId"] == "t1"
+
+
+def test_activity_running_reflects_in_memory_state(client, app):
+    client.get("/api/conversations/dm-rex/messages")  # ensure the row exists
+    app.state.running_activity["dm-rex"] = {
+        "actor": "rex",
+        "label": "running file_editor",
+        "timestamp": "2025-01-01T00:00:00.000000+00:00",
+        "task_id": None,
+    }
+
+    res = client.get("/api/activity")
+    body = res.json()
+    running = [r for r in body["running"] if r["conversationId"] == "dm-rex"]
+    assert len(running) == 1
+    assert running[0]["label"] == "running file_editor"
+    assert running[0]["actor"] == "rex"
+    assert running[0]["conversationLabel"] == "dm-rex"
+
+
+def test_activity_running_reflects_a_real_in_flight_tool_call(client, monkeypatch):
+    """End-to-end proof of `_drive_turn` -> `_record_running_activity`
+    itself (not just the endpoint's serialization of hand-set state, as in
+    `test_activity_running_reflects_in_memory_state` above): a real
+    `streaming.emit("tool/status", ...)` custom frame, produced by a real
+    `execute_node` run, must be what populates and clears this entry.
+
+    `test_runner` (vex's tool, not gated by `TOOLS_REQUIRING_APPROVAL`) so
+    the turn goes straight persona -> execute with no interrupt to
+    negotiate, keeping this test to one exchange.
+    """
+    hang = asyncio.Event()
+
+    async def slow_test_runner(arguments: dict) -> ToolResult:
+        await hang.wait()
+        return ToolResult(text="all green", is_error=False)
+
+    propose = _tool_call_response("Running the tests.", "test_runner", {"command": "pytest"})
+    final = _plain_response("Tests passed.")
+    monkeypatch.setattr(graph_build, "call_model", AsyncMock(side_effect=[propose, final]))
+    monkeypatch.setitem(graph_build.TOOL_REGISTRY, "test_runner", slow_test_runner)
+
+    conversation_id = "dm-vex"
+    client.post(f"/api/conversations/{conversation_id}/messages", json={"text": "run the tests"})
+
+    import time
+
+    running_entry = None
+    for _ in range(50):
+        activity = client.get("/api/activity").json()
+        matches = [r for r in activity["running"] if r["conversationId"] == conversation_id]
+        if matches:
+            running_entry = matches[0]
+            break
+        time.sleep(0.05)
+    assert running_entry is not None, "running entry never appeared"
+    assert running_entry["label"] == "running test_runner"
+    assert running_entry["actor"] == "vex"
+
+    hang.set()  # let the tool call (and the rest of the turn) finish
+
+    for _ in range(50):
+        activity = client.get("/api/activity").json()
+        matches = [r for r in activity["running"] if r["conversationId"] == conversation_id]
+        if not matches:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("running entry never cleared after the tool call finished")
+
+
+# ---------------------------------------------------------------------------
+# System status
+# ---------------------------------------------------------------------------
+
+
+def test_status_reflects_env_vars_and_live_metamcp_tools(client, monkeypatch):
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "d-token")
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "a-key")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "o-key")
+
+    tools = [
+        {"name": "GitHub__list_repos"},
+        {"name": "GitHub__create_pr"},
+        {"name": "Deploy__trigger"},
+    ]
+    monkeypatch.setattr(api.MetaMCPClient, "list_tools", AsyncMock(return_value=tools))
+
+    res = client.get("/api/status")
+    assert res.status_code == 200
+    body = res.json()
+
+    platforms = {p["name"]: p for p in body["platforms"]}
+    assert platforms["Discord"]["connected"] is True
+    assert platforms["Telegram"]["connected"] is False
+    assert platforms["Web"] == {
+        "name": "Web",
+        "detail": "Always on",
+        "connected": True,
+        "alwaysOn": True,
+    }
+
+    providers = {p["name"]: p["connected"] for p in body["providers"]}
+    assert providers == {
+        "Anthropic": True,
+        "DeepSeek": False,
+        "Gemini": False,
+        "Qwen": False,
+        "OpenRouter": True,
+    }
+
+    assert body["metamcp"] == {"running": True, "serverCount": 2}
+    assert {s["name"] for s in body["mcpServers"]} == {"GitHub", "Deploy"}
+    assert all(s["connected"] for s in body["mcpServers"])
+
+
+def test_status_metamcp_failure_never_500s(client, monkeypatch):
+    async def boom(self):
+        raise api.MetaMCPConfigurationError("no key configured")
+
+    monkeypatch.setattr(api.MetaMCPClient, "list_tools", boom)
+
+    res = client.get("/api/status")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["metamcp"] == {"running": False, "serverCount": 0}
+    assert body["mcpServers"] == []
+
+
+# ---------------------------------------------------------------------------
 # CORS
 # ---------------------------------------------------------------------------
 
