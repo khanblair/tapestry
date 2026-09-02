@@ -7,10 +7,14 @@ dependencies = [
     "langgraph==1.2.11",
     "langgraph-checkpoint==4.2.0",
     "langgraph-checkpoint-sqlite==3.1.1",
-    "litellm==1.101.0",
+    "litellm==1.99.0",  # ANALYSIS-litellm.md cited 1.101.0 from the cloned repo's own source, but that
+                         # version was never actually published to PyPI (verified live against pypi.org/pypi/litellm/json,
+                         # 2026-09-02) — 1.99.0 is the real latest and what backend/tapestry/models/litellm_client.py
+                         # was actually built and tested against
     "openhands-sdk==1.44.1",
     "openhands-tools==1.44.1",
-    "mcp>=1.2.0",
+    "mcp>=2.0,<3",
+    "httpx2>=2.5.0",
     "discord.py>=2.4.0",
     "python-telegram-bot==22.8.0",
     "fastapi>=0.115.0",
@@ -28,6 +32,9 @@ dev = [
 
 [tool.uv]
 package = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [build-system]
 requires = ["hatchling"]

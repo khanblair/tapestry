@@ -1,0 +1,999 @@
+/* Tapestry design system — ported from the manually-tested HTML/CSS/JS
+ * prototype (tapestry-prototype-reference.html), minus the
+ * prototype-harness-only chrome (.shell, .lead, .meta-toolbar, .mt-
+ * variants, .frame variants, .device- variants) that only existed to
+ * drive the click-through demo's device/theme picker. Tokens,
+ * avatar/status, message list, activity
+ * block, diff chip, approval card, buttons, composer, overlay/modal, diff
+ * screen — this is the real design system every screen draws from, ported
+ * class-for-class for visual fidelity.
+ *
+ * Owned by the app-shell agent (this file lives in the app-shell/roster/
+ * conversation scope). This revision merges in — rather than overwrites —
+ * scaffolding another agent had already added for the overlay screens and
+ * the conversation+thread three-pane layout (`.overlay-layer`,
+ * `.modal-close`/`.modal-back`, `.conv-thread-shell`, `.thread-slot`); see
+ * the note above `.thread-slot` below for how that layout resolved (a
+ * real `@thread` parallel-route slot) and the flex-sizing fix that
+ * required in `.pane-shell` / `.thread-slot`.
+ *
+ * TWO deliberate, DIFFERENT breakpoints replace the prototype's
+ * JS-toggled `.device-mobile` / `.device-tablet` / `.device-desktop`
+ * simulator classes — one breakpoint is not enough to reproduce the
+ * prototype's actual behavior:
+ *   - 768px: roster/conversation single-pane collapse. In the prototype
+ *     this happens ONLY at the mobile (390px) bucket — tablet (834px)
+ *     always renders both panes side by side.
+ *   - 900px: overlay modal-vs-full-cover split, and the conversation/
+ *     thread three-pane layout. In the prototype this switches only at
+ *     the desktop (1180px) bucket — tablet (834px) still gets full-cover
+ *     overlays, not a modal.
+ *   Using a single breakpoint for both would make tablet-width viewports
+ *   wrong on one axis or the other; 768/900 reproduces the tablet
+ *   bucket's actual combination (two-pane, but full-cover overlays).
+ */
+
+:root {
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --surface-2: #f1f5f9;
+  --surface-hover: #e2e8f0;
+  --border: #e2e8f0;
+  --border-strong: #cbd5e1;
+  --text: #0f172a;
+  --text-muted: #64748b;
+  --text-faint: #94a3b8;
+  --accent: #16a34a;
+  --accent-fg: #ffffff;
+  --accent-wash: rgba(22, 163, 74, 0.1);
+  --danger: #dc2626;
+  --danger-wash: rgba(220, 38, 38, 0.08);
+  --warn: #d97706;
+  --diff-add-bg: rgba(22, 163, 74, 0.12);
+  --diff-add-fg: #15803d;
+  --diff-del-bg: rgba(220, 38, 38, 0.1);
+  --diff-del-fg: #b91c1c;
+  --status-online: #16a34a;
+  --status-busy: #d97706;
+  --status-paused: #64748b;
+  --status-offline: #cbd5e1;
+  --shadow: 0 8px 30px rgba(15, 23, 42, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f172a;
+    --surface: #1b2336;
+    --surface-2: #161d2e;
+    --surface-hover: #272f42;
+    --border: #293349;
+    --border-strong: #475569;
+    --text: #f8fafc;
+    --text-muted: #94a3b8;
+    --text-faint: #64748b;
+    --accent: #22c55e;
+    --accent-fg: #0b1220;
+    --accent-wash: rgba(34, 197, 94, 0.13);
+    --danger: #ef4444;
+    --danger-wash: rgba(239, 68, 68, 0.12);
+    --warn: #f59e0b;
+    --diff-add-bg: rgba(34, 197, 94, 0.15);
+    --diff-add-fg: #4ade80;
+    --diff-del-bg: rgba(239, 68, 68, 0.15);
+    --diff-del-fg: #f87171;
+    --status-online: #22c55e;
+    --status-busy: #f59e0b;
+    --status-paused: #94a3b8;
+    --status-offline: #475569;
+    --shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #0f172a;
+  --surface: #1b2336;
+  --surface-2: #161d2e;
+  --surface-hover: #272f42;
+  --border: #293349;
+  --border-strong: #475569;
+  --text: #f8fafc;
+  --text-muted: #94a3b8;
+  --text-faint: #64748b;
+  --accent: #22c55e;
+  --accent-fg: #0b1220;
+  --accent-wash: rgba(34, 197, 94, 0.13);
+  --danger: #ef4444;
+  --danger-wash: rgba(239, 68, 68, 0.12);
+  --warn: #f59e0b;
+  --diff-add-bg: rgba(34, 197, 94, 0.15);
+  --diff-add-fg: #4ade80;
+  --diff-del-bg: rgba(239, 68, 68, 0.15);
+  --diff-del-fg: #f87171;
+  --status-online: #22c55e;
+  --status-busy: #f59e0b;
+  --status-paused: #94a3b8;
+  --status-offline: #475569;
+  --shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+::selection {
+  background: var(--accent-wash);
+}
+button {
+  font-family: inherit;
+}
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.mono {
+  font-family: "JetBrains Mono", ui-monospace, "SF Mono", Consolas, monospace;
+}
+
+/* ---------- layout panes (roster / conversation / thread) ---------- */
+/* .pane-shell is a flex row of roster + conversation(+thread). Below
+   768px only one side is visible, chosen by `data-route` — "roster" set
+   by app/(roster)/page.tsx, "conversation" set by app/conversation/[id]/
+   (page.tsx and default.tsx — see that route's layout.tsx for why there
+   are two). Real routing (two separate pages/slots), not client state —
+   the prototype's `mobileView` toggle is just the URL now.
+
+   .pane-shell is used at TWO different nesting depths, which is why it
+   has no `width` set: on the roster route it's the top-level element
+   (a block-level flex container fills its containing block's width by
+   normal block layout, same as if width were 100% — no need to say so).
+   On the conversation route it's nested one level deeper, as a flex
+   CHILD of .conv-thread-shell (app/conversation/[id]/layout.tsx) sitting
+   next to .thread-slot — there, `flex: 1 1 auto` + `min-width: 0` let it
+   grow to fill the remaining space after the thread pane's fixed width
+   instead of competing on flex-basis with a stale `width: 100%` (which
+   made the flex-shrink math split the overflow roughly evenly instead of
+   giving the thread pane its actual 320px — same fix mirrored in
+   `.thread-slot:not(:empty)` below, which gets an explicit `flex: 0 0
+   320px` at the same breakpoint for exactly this reason). */
+.pane-shell {
+  display: flex;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 100%;
+}
+.pane-roster {
+  flex: 0 0 300px;
+  border-right: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.pane-conversation {
+  flex: 1 1 auto;
+  background: var(--bg);
+  min-width: 0;
+}
+.pane-thread {
+  flex: 1 1 auto;
+  width: 100%;
+  border-left: 1px solid var(--border);
+  background: var(--surface-2);
+  display: flex;
+  flex-direction: column;
+}
+/* Below 900px, `.thread-slot:not(:empty)` is a `position: fixed; inset: 0`
+   full-cover overlay (see the "conversation + thread three-pane layout"
+   block below) — `.pane-thread` needs to fill that, not stay pinned to its
+   desktop 320px width. Only at 900px+, where the thread is a real static
+   sidebar next to the conversation pane, does it get the fixed width. */
+@media (min-width: 900px) {
+  .pane-thread {
+    flex: 0 0 320px;
+    width: auto;
+  }
+}
+
+/* Back button in the conversation topbar — only needed when the roster
+   pane is hidden (below the 768px collapse), since above it the roster
+   is always visible alongside. */
+.conv-back-btn {
+  display: flex;
+}
+
+@media (max-width: 767px) {
+  .pane-roster,
+  .conv-thread-shell {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+  [data-route="roster"] .conv-thread-shell {
+    display: none;
+  }
+  [data-route="conversation"] .pane-roster {
+    display: none;
+  }
+}
+@media (min-width: 768px) {
+  .conv-back-btn {
+    display: none;
+  }
+}
+@media (min-width: 768px) and (max-width: 899px) {
+  .pane-roster {
+    flex-basis: 270px;
+  }
+}
+
+.topbar {
+  height: 56px;
+  flex: 0 0 56px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.topbar h2 {
+  font-size: 14.5px;
+  margin: 0;
+  font-weight: 600;
+}
+.topbar .sub {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+.icon-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s;
+}
+.icon-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.icon-btn.danger:hover {
+  background: var(--danger-wash);
+  color: var(--danger);
+}
+.spacer {
+  flex: 1 1 auto;
+}
+.scroll {
+  overflow-y: auto;
+  flex: 1 1 auto;
+}
+
+/* ---------- roster ---------- */
+.roster-search {
+  margin: 12px 12px 4px;
+  position: relative;
+}
+.roster-search input {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 8px 10px 8px 34px;
+  font-size: 13px;
+  color: var(--text);
+  font-family: inherit;
+}
+.roster-search input::placeholder {
+  color: var(--text-faint);
+}
+.roster-search svg {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-faint);
+  pointer-events: none;
+}
+.roster-section-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  padding: 14px 14px 6px;
+}
+.roster-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  margin: 0 6px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.12s;
+  text-decoration: none;
+  color: inherit;
+}
+.roster-row:hover {
+  background: var(--surface-hover);
+}
+.roster-row.active {
+  background: var(--accent-wash);
+}
+.roster-row .rname {
+  font-size: 13.5px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.roster-row .rprev {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+.roster-row .rtime {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  margin-left: auto;
+  align-self: flex-start;
+  padding-top: 2px;
+}
+.roster-badge {
+  background: var(--danger);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 99px;
+  min-width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+}
+
+/* ---------- avatar / status ---------- */
+.avatar {
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 14px;
+  color: #fff;
+  flex: 0 0 auto;
+  position: relative;
+}
+.avatar.sm {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  font-size: 11px;
+}
+.avatar.lg {
+  width: 64px;
+  height: 64px;
+  border-radius: 16px;
+  font-size: 22px;
+}
+.dot {
+  position: absolute;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  right: -2px;
+  bottom: -2px;
+  border: 2.5px solid var(--surface-2);
+}
+.dot.online {
+  background: var(--status-online);
+}
+.dot.busy {
+  background: var(--status-busy);
+}
+.dot.paused {
+  background: var(--status-paused);
+}
+.dot.offline {
+  background: var(--status-offline);
+}
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+.status-pill .sw {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+/* ---------- messages ---------- */
+.msg-list {
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.msg {
+  display: flex;
+  gap: 10px;
+}
+.msg .body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.msg-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+.msg-name {
+  font-size: 13.5px;
+  font-weight: 700;
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font-family: inherit;
+}
+.msg-name.clickable {
+  cursor: pointer;
+}
+.msg-name.clickable:hover {
+  text-decoration: underline;
+}
+.msg-time {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.msg-role {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-weight: 500;
+}
+.msg-text {
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--text);
+  white-space: pre-wrap;
+}
+.msg-text .mention {
+  color: var(--accent);
+  font-weight: 600;
+}
+.msg-text code {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  background: var(--surface-2);
+  padding: 1px 5px;
+  border-radius: 5px;
+}
+
+.activity-block {
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 10px;
+  padding: 9px 12px;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  cursor: default;
+}
+.activity-block.done {
+  color: var(--text-muted);
+}
+.activity-spin {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+  flex: 0 0 auto;
+}
+@media (prefers-reduced-motion: reduce) {
+  .activity-spin {
+    animation: none;
+  }
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.activity-check {
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+.activity-block .amono {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11.5px;
+}
+
+.diff-chip {
+  margin-top: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+  color: var(--text);
+  text-decoration: none;
+}
+.diff-chip:hover {
+  border-color: var(--border-strong);
+}
+.diff-chip .plus {
+  color: var(--diff-add-fg);
+  font-family: "JetBrains Mono", monospace;
+  font-weight: 600;
+}
+.diff-chip .minus {
+  color: var(--diff-del-fg);
+  font-family: "JetBrains Mono", monospace;
+  font-weight: 600;
+}
+
+.approval-card {
+  margin-top: 8px;
+  border: 1px solid var(--warn);
+  background: var(--surface);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+.approval-card.resolved {
+  border-color: var(--border);
+  opacity: 0.85;
+}
+.approval-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: var(--warn);
+}
+.approval-card.resolved .approval-head {
+  color: var(--accent);
+}
+.approval-desc {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+}
+.approval-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.btn {
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  padding: 7px 13px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 0.15s, border-color 0.15s;
+}
+.btn:hover {
+  background: var(--surface-hover);
+}
+.btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+.btn-primary:hover {
+  filter: brightness(1.06);
+}
+.btn-danger {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+.btn-danger:hover {
+  background: var(--danger-wash);
+}
+.btn-ghost {
+  border-color: transparent;
+  background: transparent;
+}
+.btn-ghost:hover {
+  background: var(--surface-hover);
+}
+.btn-block {
+  width: 100%;
+  justify-content: center;
+}
+.btn-sm {
+  padding: 5px 10px;
+  font-size: 11.5px;
+}
+
+/* ---------- composer ---------- */
+.composer {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border);
+  padding: 10px 14px;
+  background: var(--surface);
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+.composer .field {
+  flex: 1 1 auto;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  padding: 9px 12px;
+  font-size: 13px;
+  color: var(--text);
+  font-family: inherit;
+  resize: none;
+}
+.composer .field::placeholder {
+  color: var(--text-faint);
+}
+.composer .send {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.composer .send:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ---------- generic screen scaffolding ---------- */
+.screen-pad {
+  padding: 18px;
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.field-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  display: block;
+}
+.input,
+.textarea,
+select.input {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 9px 11px;
+  font-size: 13px;
+  color: var(--text);
+  font-family: inherit;
+}
+.textarea {
+  resize: vertical;
+  min-height: 70px;
+  line-height: 1.5;
+}
+.form-row {
+  margin-bottom: 14px;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 4px 9px;
+  border-radius: 99px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: default;
+}
+.chip.on {
+  background: var(--accent-wash);
+  border-color: transparent;
+  color: var(--accent);
+}
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 11px 2px;
+  border-bottom: 1px solid var(--border);
+}
+.toggle-row:last-child {
+  border-bottom: none;
+}
+.toggle-row .tt {
+  font-size: 13px;
+  font-weight: 600;
+}
+.toggle-row .td {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  margin-top: 1px;
+}
+.switch {
+  width: 36px;
+  height: 21px;
+  border-radius: 99px;
+  background: var(--border-strong);
+  position: relative;
+  cursor: pointer;
+  flex: 0 0 auto;
+  border: none;
+}
+.switch.on {
+  background: var(--accent);
+}
+.switch::after {
+  content: "";
+  position: absolute;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: #fff;
+  top: 2px;
+  left: 2px;
+  transition: left 0.15s;
+}
+.switch.on::after {
+  left: 17px;
+}
+.section-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-faint);
+  margin: 20px 2px 10px;
+}
+.section-title:first-child {
+  margin-top: 2px;
+}
+.list-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 11px 4px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  text-decoration: none;
+  color: inherit;
+}
+.list-item:last-child {
+  border-bottom: none;
+}
+.list-item:hover {
+  background: var(--surface-hover);
+  margin: 0 -8px;
+  padding-left: 12px;
+  padding-right: 12px;
+  border-radius: 9px;
+}
+.empty-hint {
+  font-size: 12px;
+  color: var(--text-faint);
+  padding: 2px;
+}
+
+/* ---------- overlay / modal (search / activity / new-conversation / diff / profile / settings) ---------- */
+.overlay-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+}
+.overlay-panel {
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+}
+.modal-close {
+  display: none;
+}
+.modal-back {
+  display: flex;
+}
+
+@media (min-width: 900px) {
+  .overlay-layer {
+    background: rgba(2, 6, 15, 0.55);
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .overlay-panel {
+    width: min(620px, 100%);
+    height: min(640px, 100%);
+    border-radius: 14px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+  }
+  .overlay-panel.wide {
+    width: min(880px, 100%);
+  }
+  .modal-close {
+    display: flex;
+  }
+  .modal-back {
+    display: none;
+  }
+}
+
+/* ---------- breadcrumbs (diff screen summary line) ---------- */
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+.crumbs b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* ---------- diff screen ---------- */
+.diff-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 10px 14px 0;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+.diff-tab {
+  padding: 8px 12px;
+  font-size: 12px;
+  font-family: "JetBrains Mono", monospace;
+  color: var(--text-muted);
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  background: transparent;
+  border-left: none;
+  border-right: none;
+  border-top: none;
+}
+.diff-tab.active {
+  color: var(--text);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.diff-line {
+  display: flex;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  line-height: 1.65;
+}
+.diff-line .ln {
+  width: 38px;
+  text-align: right;
+  padding-right: 10px;
+  color: var(--text-faint);
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+.diff-line .content {
+  white-space: pre;
+  flex: 1 1 auto;
+  padding-right: 14px;
+}
+.diff-line.add {
+  background: var(--diff-add-bg);
+  color: var(--diff-add-fg);
+}
+.diff-line.del {
+  background: var(--diff-del-bg);
+  color: var(--diff-del-fg);
+}
+.diff-line.ctx {
+  color: var(--text-muted);
+}
+
+/* ---------- conversation + thread three-pane layout (>=900px) ----------
+ * RESOLVED: app/conversation/[id]/layout.tsx now implements this with a
+ * real `@thread` parallel-route slot (its own header comment has the
+ * full mechanics). `.conv-thread-shell` is that layout's own wrapper
+ * (children = the conversation pane, `.thread-slot` = the `@thread`
+ * slot's content). Below 900px `.thread-slot` is a full-cover overlay
+ * whenever it has content (`:not(:empty)`, so an empty slot collapses
+ * with no extra markup); at 900px+ it becomes a real static third pane.
+ *
+ * `.thread-slot:not(:empty)` gets an explicit `flex: 0 0 320px` at
+ * 900px+ (matching `.pane-thread`'s own width) rather than sizing from
+ * its content — see the note on `.pane-shell` above for why: giving both
+ * flex siblings in `.conv-thread-shell` a precise flex-basis (320px
+ * fixed here, `flex: 1 1 auto` there) is what makes the thread pane
+ * actually end up 320px wide instead of whatever the flex-shrink math
+ * would otherwise average out to.
+ */
+.conv-thread-shell {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+}
+.thread-slot:empty {
+  display: none;
+}
+.thread-slot {
+  display: none;
+}
+.thread-slot:not(:empty) {
+  display: flex;
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+@media (min-width: 900px) {
+  .thread-slot:not(:empty) {
+    position: static;
+    inset: auto;
+    z-index: auto;
+    flex: 0 0 320px;
+  }
+}

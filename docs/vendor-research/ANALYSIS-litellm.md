@@ -1,6 +1,8 @@
 # LiteLLM verification for Tapestry
 
-Source: `vendor-research/litellm`, shallow clone of `github.com/BerriAI/litellm` at commit `5988d93fed159642d0d6fa13bcd11eb93b34c047` (2026-09-01), package version `1.101.0`. All file paths below are relative to that clone unless stated otherwise.
+Source: `vendor-research/litellm`, shallow clone of `github.com/BerriAI/litellm` at commit `5988d93fed159642d0d6fa13bcd11eb93b34c047` (2026-09-01), package version `1.101.0` per the clone's own source. All file paths below are relative to that clone unless stated otherwise.
+
+**Correction (found during implementation, 2026-09-02):** `1.101.0` was the clone's internal version string, not a published release — it 404s on PyPI. The real latest published version is `1.99.0`, confirmed live against `pypi.org/pypi/litellm/json`. Everything else in this report (API behavior, normalization, license, provider config) was verified against the actual library and still holds — only the version number was wrong, and `backend/pyproject.toml` now pins `1.99.0`.
 
 ## Summary
 

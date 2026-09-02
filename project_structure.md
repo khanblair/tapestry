@@ -280,7 +280,7 @@ There were no frontend tests at all before this pass — added two layers, match
 | `langgraph` | `1.2.11` | MIT |
 | `langgraph-checkpoint` | `4.2.0` | MIT |
 | `langgraph-checkpoint-sqlite` | `3.1.1` | MIT — `AsyncSqliteSaver` |
-| `litellm` | `1.101.0` | MIT — **do not** install the `proxy` extra (that's the only path an enterprise-licensed package enters) |
+| `litellm` | `1.99.0` | MIT — **do not** install the `proxy` extra (that's the only path an enterprise-licensed package enters). The cloned repo's own source reported `1.101.0`; that version was never actually published to PyPI — verified live against pypi.org during implementation |
 | `openhands-sdk` | `1.44.1` | MIT — **must match** `openhands-tools`' version exactly, or import breaks |
 | `openhands-tools` | `1.44.1` | MIT |
 | `mcp` | official SDK | client to metamcp at `localhost:12008` |
