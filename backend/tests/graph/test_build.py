@@ -503,6 +503,43 @@ async def test_delegation_to_unknown_persona_gives_feedback_instead_of_crashing(
         await graph.checkpointer.conn.close()
 
 
+async def test_delegation_to_a_paused_persona_gives_feedback_instead_of_running_it(tmp_path):
+    """tapestry_mentions_concurrency_status_spec.md §4/§5 decision 2's
+    gating has to cover delegation too, not just the human-facing
+    send_message/on_message front doors -- nova.yaml ships `status:
+    paused` deliberately (her own system_prompt requires explicit human
+    activation before any action), and delegation is a separate way an
+    arbitrary persona's turn can run with none of those front doors
+    involved. Same "feedback instead of crashing" shape as
+    `test_delegation_to_unknown_persona_gives_feedback_instead_of_crashing`.
+    """
+    conversation_id = "conv-delegate-paused-1"
+    assert build.PERSONAS["nova"].status == "paused", "nova must ship paused by default"
+
+    delegate_to_paused = _tool_call_response(
+        "Delegating the deploy to Nova.",
+        "delegate",
+        {"to_persona": "nova", "text": "please deploy"},
+    )
+    recover = _plain_response("Nova's paused -- I'll flag this for a human instead.")
+    call_model_mock = AsyncMock(side_effect=[delegate_to_paused, recover])
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        with patch.object(build, "call_model", call_model_mock):
+            state = build.new_state(conversation_id, "rex")
+            result = await graph.ainvoke(state, config)
+
+        assert result["persona_id"] == "rex"  # never switched to nova
+        assert result["next_node"] == "end"
+        logged = events_module.read_events(conversation_id)
+        assert not any(e.type == "delegation/sent" for e in logged), (
+            "the delegation must never actually have been sent"
+        )
+    finally:
+        await graph.checkpointer.conn.close()
+
+
 # ---------------------------------------------------------------------------
 # task_complete + verify integration
 # ---------------------------------------------------------------------------

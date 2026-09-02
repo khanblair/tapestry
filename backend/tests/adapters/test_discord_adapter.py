@@ -516,6 +516,30 @@ class TestOnMessage:
         client.drive_graph.assert_not_called()
         channel.send.assert_not_called()
 
+    async def test_message_to_a_paused_persona_is_rejected(self):
+        # REX fixture is online; give it a paused stand-in for this test
+        # only, so the assertion is precise about which persona triggered
+        # the gate.
+        paused_rex = REX.model_copy(update={"status": "paused"})
+        bot.PERSONAS["rex"] = paused_rex
+        try:
+            graph = FakeGraph(frames=[], snapshot=make_snapshot({"messages": []}))
+            client = make_client(graph)
+            client.drive_graph = AsyncMock()
+            channel = make_channel(discord.DMChannel, 42)
+            message = make_message("Rex, please help", channel=channel)
+
+            await bot.TapestryDiscordClient.on_message(client, message)
+
+            channel.send.assert_awaited_once()
+            (text,), _ = channel.send.await_args
+            assert "paused" in text
+            client.drive_graph.assert_not_awaited()
+            logged = events_module.read_events("discord-42")
+            assert not any(e.type == "user/message" for e in logged)
+        finally:
+            bot.PERSONAS["rex"] = REX
+
     async def test_dm_message_creates_conversation_and_appends_event(self):
         graph = FakeGraph(frames=[], snapshot=make_snapshot({"messages": []}))
         client = make_client(graph)

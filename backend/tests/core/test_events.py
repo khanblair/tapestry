@@ -6,6 +6,7 @@ from tapestry.core.events import (
     append_event,
     close_orphaned_turns,
     find_open_turns,
+    list_open_turns,
     read_events,
     read_recent_events,
 )
@@ -172,6 +173,62 @@ def test_close_orphaned_turns_still_works_after_sharing_find_open_turns():
 
     assert len(closed) == 1
     assert closed[0].payload["turn_id"] == start.id
+
+
+def test_list_open_turns_empty_log_returns_empty_dict():
+    assert list_open_turns() == {}
+
+
+def test_list_open_turns_no_open_turns_returns_empty_dict():
+    start = append_event("conv-1", "turn/start", "ada", {})
+    append_event("conv-1", "turn/end", "system", {"turn_id": start.id, "reason": "done"})
+
+    assert list_open_turns() == {}
+
+
+def test_list_open_turns_keyed_by_persona_actor():
+    start = append_event("conv-1", "turn/start", "rex", {})
+
+    open_turns = list_open_turns()
+
+    assert list(open_turns.keys()) == ["rex"]
+    assert open_turns["rex"] == start
+
+
+def test_list_open_turns_spans_every_conversation():
+    # A conversation this process hasn't "revisited" (no read_events call
+    # scoped to it) must still be found -- this is the whole point of NOT
+    # using read_recent_events' limit-bounded scan.
+    append_event("conv-1", "turn/start", "rex", {})
+    append_event("conv-2", "turn/start", "nova", {})
+
+    open_turns = list_open_turns()
+
+    assert set(open_turns.keys()) == {"rex", "nova"}
+
+
+def test_list_open_turns_several_open_at_once_for_different_personas_in_one_conversation():
+    # The concurrent tag-all fan-out shape -- see the function's own
+    # docstring. Each persona's own open turn must be found independently.
+    append_event("conv-1", "turn/start", "rex", {})
+    append_event("conv-1", "turn/start", "vex", {})
+
+    open_turns = list_open_turns()
+
+    assert set(open_turns.keys()) == {"rex", "vex"}
+
+
+def test_list_open_turns_not_fooled_by_a_stale_quiet_conversation():
+    # The exact gap read_recent_events(limit=...) has: pile up enough
+    # unrelated activity elsewhere that a limited scan would push an old
+    # open turn out of its window. list_open_turns must still find it.
+    open_start = append_event("conv-quiet", "turn/start", "nova", {})
+    for i in range(200):
+        append_event("conv-busy", "some/other-event", "system", {"n": i})
+
+    open_turns = list_open_turns()
+
+    assert open_turns.get("nova") == open_start
 
 
 def test_read_recent_events_spans_every_conversation():

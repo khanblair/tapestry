@@ -238,6 +238,51 @@ def find_open_turns(events: list[TapestryEvent]) -> dict[str, TapestryEvent]:
     return open_starts
 
 
+def list_open_turns() -> dict[str, TapestryEvent]:
+    """Return the currently open `turn/start` event for every persona that
+    has one, across ALL conversations, keyed by persona id (a `turn/start`
+    event's own `actor` — see `graph/build.py`'s `persona_node`, which sets
+    `actor=persona.id`).
+
+    A real, unbounded scan of every `turn/start`/`turn/end` row —
+    deliberately NOT `read_recent_events(limit=...)`, which is
+    cross-conversation but window-bounded and could miss, or misreport, an
+    old crashed turn sitting in a quiet conversation depending on how much
+    activity happened elsewhere in the meantime. This is the read side of
+    deriving a persona's live status (see `web_adapter/api.py`'s
+    `_persona_to_out`) rather than writing one to the persona's YAML —
+    that module has its own reasoning for why status must be a projection.
+
+    With concurrent tag-all fan-out (see
+    `tapestry_mentions_concurrency_status_spec.md` §2), several different
+    personas can legitimately have a `turn/start` open in the same
+    conversation at once — expected, not something this collapses away. If
+    the same persona somehow has more than one open turn (e.g. across two
+    different conversations), only one is returned — status only needs
+    "is this persona busy at all," not an exhaustive list of where.
+    """
+    conn = get_connection()
+    _ensure_schema(conn)
+    cursor = conn.execute(
+        "SELECT id, conversation_id, type, timestamp, actor, payload_json "
+        "FROM events WHERE type IN ('turn/start', 'turn/end') ORDER BY rowid ASC"
+    )
+    rows = cursor.fetchall()
+    all_events = [
+        TapestryEvent(
+            id=row[0],
+            conversation_id=row[1],
+            type=row[2],
+            timestamp=row[3],
+            actor=row[4],
+            payload=json.loads(row[5]),
+        )
+        for row in rows
+    ]
+    open_starts = find_open_turns(all_events)
+    return {event.actor: event for event in open_starts.values()}
+
+
 def close_orphaned_turns(conversation_id: str) -> list[TapestryEvent]:
     """Close any `turn/start` in this conversation with no matching `turn/end`.
 

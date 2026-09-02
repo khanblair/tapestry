@@ -1,10 +1,20 @@
 # Tapestry: Group Mentions, Turn Concurrency, and Live Status
 
-**Status: scoped, not built.** Follow-on to `tapestry_scoped_spec.md` (built)
-and `tapestry_modes_models_personas_spec.md` (built). Scopes three things the
+**Status: §1 and §4 built and tested; §2 (tag-all itself) not yet built.**
+Follow-on to `tapestry_scoped_spec.md` (built) and
+`tapestry_modes_models_personas_spec.md` (built). Scopes three things the
 user asked about, plus one severe pre-existing bug found while scoping the
 first one — the bug has to be fixed before tag-all can be built safely, so
 it's promoted to its own section and built first, alone.
+
+- §1 (concurrency guard) — built, tested, committed.
+- §3 (persona↔model) — confirmed, no code needed.
+- §4 (derived status + paused-gating, including the delegation-gating and
+  per-persona-resume additions caught in review) — built, tested,
+  committed.
+- §2 (tag-all / mention-routing / concurrent fan-out) — scoped in full
+  below, not yet built. The largest remaining piece; §6's build order
+  explains why it's last.
 
 Origin, verbatim: *"i create a group, send a message like 'hey guys, let's
 chat about tech' what will happen? then i tag all... also is a persona

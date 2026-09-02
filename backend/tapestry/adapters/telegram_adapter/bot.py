@@ -548,6 +548,20 @@ class TelegramAdapter:
 
             persona = match_named_persona(self.personas, message.text) or self._default_persona()
 
+            # Paused-persona gate -- see web_adapter/api.py's
+            # `_reject_if_persona_paused` and
+            # tapestry_mentions_concurrency_status_spec.md §4/§5 decision 2:
+            # `status == "paused"` must actually block a turn, not just
+            # display as paused (nova.yaml ships paused deliberately --
+            # her own system_prompt requires explicit human activation).
+            if persona.status == "paused":
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=f"{persona.name} is paused — resume them before messaging.",
+                    message_thread_id=thread_id,
+                )
+                return
+
             # core.conversations.Message.thread_id / TapestryGraphState
             # ["thread_id"] are both typed `str | None` (see
             # core/conversations.py and graph/build.py) -- Telegram's own

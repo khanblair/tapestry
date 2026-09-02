@@ -43,6 +43,7 @@ from langgraph.types import Command
 
 from tapestry.adapters.web_adapter import api
 from tapestry.core import events as events_module
+from tapestry.core.personas import Persona
 from tapestry.graph import build as graph_build
 from tapestry.models.litellm_client import ModelResponse
 from tapestry.tools.file_editor import ToolResult
@@ -126,6 +127,91 @@ def _tool_call_response(text: str, name: str, arguments: dict, call_id: str = "c
 # ---------------------------------------------------------------------------
 # Personas
 # ---------------------------------------------------------------------------
+
+
+def _test_persona(persona_id: str, status: str = "online") -> Persona:
+    return Persona(
+        id=persona_id,
+        name=persona_id.title(),
+        role="Tester",
+        model="claude-opus-4-6",
+        system_prompt="be helpful",
+        tools=[],
+        mcp_servers=[],
+        status=status,
+        color="#3B82F6",
+    )
+
+
+# ---------------------------------------------------------------------------
+# _derive_persona_status -- live status, derived not written
+# (tapestry_mentions_concurrency_status_spec.md §4)
+# ---------------------------------------------------------------------------
+
+
+def test_derive_persona_status_online_with_no_open_turn_passes_through():
+    assert api._derive_persona_status(_test_persona("rex", "online"), {}) == "online"
+
+
+def test_derive_persona_status_offline_with_no_open_turn_passes_through():
+    assert api._derive_persona_status(_test_persona("rex", "offline"), {}) == "offline"
+
+
+def test_derive_persona_status_busy_when_an_open_turn_exists():
+    persona = _test_persona("rex", "online")
+    open_turns = {"rex": events_module.TapestryEvent(
+        id="t1", conversation_id="c1", type="turn/start", timestamp="2026-01-01T00:00:00Z",
+        actor="rex", payload={},
+    )}
+    assert api._derive_persona_status(persona, open_turns) == "busy"
+
+
+def test_derive_persona_status_paused_wins_over_an_open_turn():
+    # nova.yaml ships status: paused deliberately (see personas/nova.yaml's
+    # own system_prompt) -- an explicit human/config decision must never be
+    # silently overridden by a transient open turn.
+    persona = _test_persona("nova", "paused")
+    open_turns = {"nova": events_module.TapestryEvent(
+        id="t1", conversation_id="c1", type="turn/start", timestamp="2026-01-01T00:00:00Z",
+        actor="nova", payload={},
+    )}
+    assert api._derive_persona_status(persona, open_turns) == "paused"
+
+
+def test_derive_persona_status_unaffected_by_another_personas_open_turn():
+    persona = _test_persona("rex", "online")
+    open_turns = {"vex": events_module.TapestryEvent(
+        id="t1", conversation_id="c1", type="turn/start", timestamp="2026-01-01T00:00:00Z",
+        actor="vex", payload={},
+    )}
+    assert api._derive_persona_status(persona, open_turns) == "online"
+
+
+def test_get_personas_reflects_a_currently_open_turn_as_busy(client, monkeypatch):
+    hang = asyncio.Event()
+
+    async def never_returns(*args, **kwargs):
+        await hang.wait()
+        return _plain_response("done")
+
+    monkeypatch.setattr(graph_build, "call_model", never_returns)
+
+    client.post("/api/conversations/dm-rex/messages", json={"text": "hi"})
+
+    import time
+
+    rex = None
+    for _ in range(50):
+        body = client.get("/api/personas").json()
+        rex = next(p for p in body if p["id"] == "rex")
+        if rex["status"] == "busy":
+            break
+        time.sleep(0.05)
+    assert rex is not None and rex["status"] == "busy"
+    ada = next(p for p in body if p["id"] == "ada")
+    assert ada["status"] == "online", "an unrelated persona must not be affected"
+
+    hang.set()  # let the background task unwind before the DB closes
 
 
 def test_get_personas_returns_the_real_yaml_backed_roster(client, personas_dir):
@@ -633,6 +719,75 @@ def test_pause_alias_path_also_works(client):
     res = client.post("/api/agents/pause")
     assert res.status_code == 204
     assert all(p["status"] == "paused" for p in client.get("/api/personas").json())
+
+
+# ---------------------------------------------------------------------------
+# Per-persona resume, and paused-persona gating
+# (tapestry_mentions_concurrency_status_spec.md §4/§5 decision 2)
+# ---------------------------------------------------------------------------
+
+
+def test_resume_agent_sets_exactly_that_persona_online_and_persists(client, personas_dir):
+    # nova.yaml ships status: paused by design (see its own system_prompt).
+    res = client.post("/api/agents/nova/resume")
+    assert res.status_code == 204
+
+    listed = {p["id"]: p["status"] for p in client.get("/api/personas").json()}
+    assert listed["nova"] == "online"
+    assert listed["rex"] == "online", "every other persona's status must be untouched"
+
+    import yaml as yaml_module
+
+    data = yaml_module.safe_load((personas_dir / "nova.yaml").read_text())
+    assert data["status"] == "online"
+
+
+def test_resume_agent_on_an_already_online_persona_is_a_no_op(client):
+    res = client.post("/api/agents/rex/resume")
+    assert res.status_code == 204
+    assert next(p for p in client.get("/api/personas").json() if p["id"] == "rex")["status"] == "online"
+
+
+def test_resume_agent_unknown_persona_404s(client):
+    res = client.post("/api/agents/does-not-exist/resume")
+    assert res.status_code == 404
+
+
+def test_pause_all_then_resume_one_leaves_the_rest_paused(client):
+    client.post("/api/agents/pause-all")
+    client.post("/api/agents/nova/resume")
+
+    listed = {p["id"]: p["status"] for p in client.get("/api/personas").json()}
+    assert listed["nova"] == "online"
+    assert listed["rex"] == "paused"
+    assert listed["ada"] == "paused"
+    assert listed["vex"] == "paused"
+
+
+def test_send_message_to_a_paused_persona_is_rejected(client):
+    client.post("/api/agents/pause-all")
+
+    res = client.post("/api/conversations/dm-rex/messages", json={"text": "hi rex"})
+
+    assert res.status_code == 409
+    assert "paused" in res.json()["detail"]
+    # the rejected message must never have been recorded as a user/message
+    # (conversation/created from lazy-vivifying the DM is fine/expected)
+    assert not any(
+        e.type == "user/message" for e in events_module.read_events("dm-rex")
+    )
+
+
+def test_send_message_works_again_after_resuming_the_paused_persona(client, monkeypatch):
+    monkeypatch.setattr(
+        graph_build, "call_model", AsyncMock(return_value=_plain_response("hi from rex"))
+    )
+    client.post("/api/agents/pause-all")
+    client.post("/api/agents/rex/resume")
+
+    res = client.post("/api/conversations/dm-rex/messages", json={"text": "hi rex"})
+
+    assert res.status_code == 201
 
 
 # ---------------------------------------------------------------------------

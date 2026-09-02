@@ -1120,6 +1120,34 @@ async def _handle_delegate(
             "next_node": "persona",
         }
 
+    # Paused-persona gate -- see web_adapter/api.py's
+    # `_reject_if_persona_paused` and
+    # tapestry_mentions_concurrency_status_spec.md §4/§5 decision 2. Gating
+    # only send_message/on_message (the human-facing front doors) isn't
+    # enough by itself: delegation is a SEPARATE way an arbitrary persona's
+    # turn runs, with none of those call sites involved at all. Left
+    # ungated here, Nova stays reachable exactly the way her own
+    # system_prompt says she must never be -- through Rex delegating to
+    # her, an agent granting the "standing authorization to deploy" she's
+    # designed to require a human for. Same shape as the unknown-persona
+    # case just above: fail the delegate call with feedback the delegating
+    # persona's own turn can see, never silently run the paused target.
+    if PERSONAS[to_persona].status == "paused":
+        feedback = {
+            "role": "tool",
+            "tool_call_id": "",
+            "content": (
+                f"Cannot delegate: {to_persona!r} is paused and must be resumed by a "
+                "human before it can be delegated to."
+            ),
+        }
+        return {
+            "messages": new_messages + [feedback],
+            "turn_id": turn_id,
+            "turn_count": turn_count + 1,
+            "next_node": "persona",
+        }
+
     try:
         # Persisted, checkpointed recursion-depth cap — checked BEFORE the
         # (separate) round cap that core.delegation.delegate() itself

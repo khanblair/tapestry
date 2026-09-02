@@ -424,6 +424,26 @@ class TestOnMessage:
         state = call_args[4]
         assert state["persona_id"] == "ada"  # default persona in a DM
 
+    async def test_message_to_a_paused_persona_is_rejected(self):
+        paused_rex = REX.model_copy(update={"status": "paused"})
+        personas = {"ada": ADA, "rex": paused_rex}
+        graph = FakeGraph(frames=[], snapshots=[make_snapshot({"messages": []})])
+        adapter = make_adapter(graph, personas=personas)
+        adapter.drive_graph = AsyncMock()
+        chat = make_chat(7, "supergroup")
+        message = make_message("Rex can you look into this", chat=chat)
+        update = make_update(message=message)
+        context = make_context()
+
+        await adapter.on_message(update, context)
+
+        adapter.drive_graph.assert_not_called()
+        context.bot.send_message.assert_awaited_once()
+        _, kwargs = context.bot.send_message.await_args
+        assert "paused" in kwargs["text"]
+        logged = events_module.read_events("telegram-7")
+        assert not any(e.type == "user/message" for e in logged)
+
     async def test_group_message_addressed_by_persona_name_resolves_that_persona(self):
         graph = FakeGraph(frames=[], snapshots=[make_snapshot({"messages": []})])
         adapter = make_adapter(graph)

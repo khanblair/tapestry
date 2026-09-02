@@ -456,6 +456,21 @@ class TapestryDiscordClient(discord.Client):
         thread_id = thread_id_for_channel(channel)
         await self.ensure_conversation(conversation_id, is_dm=is_dm)
 
+        persona_id = resolve_persona_id(content)
+
+        # Paused-persona gate -- see web_adapter/api.py's
+        # `_reject_if_persona_paused` and
+        # tapestry_mentions_concurrency_status_spec.md §4/§5 decision 2:
+        # `status == "paused"` must actually block a turn, not just display
+        # as paused (nova.yaml ships paused deliberately -- her own
+        # system_prompt requires explicit human activation first).
+        paused_persona = PERSONAS.get(persona_id)
+        if paused_persona is not None and paused_persona.status == "paused":
+            await channel.send(
+                f"_{paused_persona.name} is paused -- resume them before messaging._"
+            )
+            return
+
         # Concurrency guard -- see web_adapter/api.py's
         # `_reject_if_turn_in_progress` and
         # tapestry_mentions_concurrency_status_spec.md §1: a fresh
@@ -487,7 +502,6 @@ class TapestryDiscordClient(discord.Client):
         # in a `finally` on every exit path.
         self._turns_in_flight.add(conversation_id)
 
-        persona_id = resolve_persona_id(content)
         payload = {"text": content}
         if thread_id:
             payload["thread_id"] = thread_id

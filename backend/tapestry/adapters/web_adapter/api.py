@@ -152,6 +152,7 @@ Endpoint list
     GET    /api/activity
     GET    /api/status
     POST   /api/agents/pause-all           (POST /api/agents/pause also registered)
+    POST   /api/agents/{persona_id}/resume
     WS     /ws/conversations/{conversation_id}
 """
 
@@ -505,13 +506,54 @@ def _load_personas() -> dict[str, Persona]:
     return load_personas(_personas_dir())
 
 
-def _persona_to_out(persona: Persona) -> PersonaOut:
+def _derive_persona_status(
+    persona: Persona, open_turns: dict[str, events.TapestryEvent]
+) -> PersonaStatus:
+    """Live status, computed at read time — never written except by an
+    explicit human action (persona edit, "Pause all agents").
+
+    Precedence: `status == "paused"` in the persona's own config always
+    wins (`_pause_all_agents` writing that field is the deliberate,
+    explicit human action it's designed to be — see
+    `tapestry_mentions_concurrency_status_spec.md` §4). Otherwise
+    `"busy"` if `events.list_open_turns()` shows this persona currently
+    has a turn open (running, or paused at an approval) in any
+    conversation. Otherwise the persona's own configured value, unchanged
+    (in practice `"online"`/`"offline"` for every seed persona today).
+
+    Deliberately never writes `"busy"` back to the persona's YAML at
+    `turn/start` — a crash mid-turn would leave that written value stuck
+    forever, and YAML round-tripping has already been observed in this
+    project to lose hand-written comments on unrelated fields. Status is a
+    projection, the same invariant this whole event-sourced core holds for
+    messages and timelines.
+    """
+    if persona.status == "paused":
+        return "paused"
+    if persona.id in open_turns:
+        return "busy"
+    return persona.status
+
+
+def _persona_to_out(
+    persona: Persona, open_turns: dict[str, events.TapestryEvent] | None = None
+) -> PersonaOut:
+    """`open_turns`, when omitted, is computed fresh via a single
+    `events.list_open_turns()` scan — fine for the single-persona call
+    sites (create/update a persona). A caller rendering a whole roster
+    (`list_personas`, the persona search results) MUST compute it once and
+    pass it in instead — `list_open_turns` is a real, unbounded scan of
+    every `turn/start`/`turn/end` row, and calling it once per persona
+    would turn an N-persona roster render into N full scans.
+    """
+    if open_turns is None:
+        open_turns = events.list_open_turns()
     return PersonaOut(
         id=persona.id,
         name=persona.name,
         role=persona.role,
         model=persona.model,
-        status=persona.status,
+        status=_derive_persona_status(persona, open_turns),
         color=persona.color,
         system_prompt=persona.system_prompt,
         tools=list(persona.tools),
@@ -698,6 +740,33 @@ def _ensure_orphans_closed(conversation_id: str, app: FastAPI) -> None:
         return
     events.close_orphaned_turns(conversation_id)
     closed.add(conversation_id)
+
+
+def _reject_if_persona_paused(persona_id: str) -> None:
+    """Gate against starting a turn for a paused persona — see
+    `tapestry_mentions_concurrency_status_spec.md` §4/§5 decision 2:
+    `status == "paused"` must actually block a turn, not just display as
+    paused. Before this, "Pause all agents" (and `nova.yaml`'s own
+    deliberate `status: paused` default — her system prompt: "must be
+    explicitly activated by a human before taking any action") was purely
+    cosmetic; nothing anywhere read `persona.status` when deciding whether
+    to run a turn (confirmed by grep across `graph/build.py` and this
+    module before this fix existed).
+
+    Checked against the persona's own real config value, not
+    `_derive_persona_status`'s output — that also reports `"busy"` for a
+    live turn, which is never itself a reason to refuse a NEW one; only an
+    explicit `paused` flag is.
+    """
+    persona = _load_personas().get(persona_id)
+    if persona is not None and persona.status == "paused":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"persona {persona_id!r} is paused -- "
+                f"POST /api/agents/{persona_id}/resume before messaging it"
+            ),
+        )
 
 
 def _reject_if_turn_in_progress(app: FastAPI, conversation_id: str) -> None:
@@ -1198,7 +1267,8 @@ async def create_app() -> FastAPI:
 
     @app.get("/api/personas", response_model=list[PersonaOut])
     async def list_personas() -> list[PersonaOut]:
-        return [_persona_to_out(p) for p in _load_personas().values()]
+        open_turns = events.list_open_turns()
+        return [_persona_to_out(p, open_turns) for p in _load_personas().values()]
 
     @app.post("/api/personas", response_model=PersonaOut, status_code=201)
     async def create_persona(draft: PersonaDraftIn) -> PersonaOut:
@@ -1315,6 +1385,7 @@ async def create_app() -> FastAPI:
                 status_code=422,
                 detail=f"conversation {conversation_id!r} has no personas to respond",
             )
+        _reject_if_persona_paused(persona_ids[0])
         _reject_if_turn_in_progress(app, conversation_id)
         message = _append_user_message(conversation_id, body.text)
 
@@ -1493,8 +1564,9 @@ async def create_app() -> FastAPI:
                         )
                     )
 
+        search_open_turns = events.list_open_turns()
         persona_results = [
-            SearchPersonaResultOut(persona=_persona_to_out(p))
+            SearchPersonaResultOut(persona=_persona_to_out(p, search_open_turns))
             for p in _load_personas().values()
             if lowered in p.name.lower() or lowered in p.role.lower()
         ]
@@ -1619,6 +1691,30 @@ async def create_app() -> FastAPI:
     @app.post("/api/agents/pause", status_code=204)
     async def pause_all_agents_alias() -> Response:
         await _pause_all_agents()
+        return Response(status_code=204)
+
+    @app.post("/api/agents/{persona_id}/resume", status_code=204)
+    async def resume_agent(persona_id: str) -> Response:
+        """The other half of `_reject_if_persona_paused` shipping at all —
+        see `tapestry_mentions_concurrency_status_spec.md` §4/§5 decision
+        2. Deliberately per-persona, not a blanket `resume-all`: a blanket
+        resume was the first idea here too, and was dropped on review --
+        `nova.yaml` ships `status: paused` deliberately (her own
+        system_prompt: "must be explicitly activated by a human before
+        taking any action"), and a human hitting pause-all to mean "stop
+        my chat agents for a minute" then resume-all to undo it would
+        silently reactivate Nova too, exactly the standing authorization
+        her design forbids. This endpoint is what actually makes her
+        design usable: a human explicitly activating *her*, specifically.
+        """
+        directory = _personas_dir()
+        personas = load_personas(directory)
+        persona = personas.get(persona_id)
+        if persona is None:
+            raise HTTPException(status_code=404, detail=f"persona {persona_id!r} not found")
+        if persona.status == "paused":
+            save_persona(persona.model_copy(update={"status": "online"}), directory)
+            _refresh_graph_personas(directory)
         return Response(status_code=204)
 
     # -- WebSocket --------------------------------------------------------
