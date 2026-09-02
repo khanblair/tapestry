@@ -143,6 +143,8 @@ Endpoint list
     GET    /api/conversations/{conversation_id}/messages
     POST   /api/conversations/{conversation_id}/messages
     GET    /api/conversations/{conversation_id}/diff/{task_id}
+    POST   /api/conversations/{conversation_id}/mode
+    POST   /api/conversations/{conversation_id}/model
     POST   /api/conversations/{conversation_id}/ask/answers            (real, batch)
     POST   /api/conversations/{conversation_id}/ask/{question_id}/answer  (alias)
     GET    /api/search?q=...
@@ -174,6 +176,7 @@ from pydantic.alias_generators import to_camel
 
 from tapestry.core import events
 from tapestry.core.ask import AskAnswer
+from tapestry.core.personas import Mode as PersonaMode
 from tapestry.core.personas import Persona, load_personas, save_persona
 from tapestry.graph import build as graph_build
 from tapestry.storage.db import get_connection
@@ -233,6 +236,14 @@ class PersonaOut(CamelModel):
     system_prompt: str = ""
     tools: list[str] = Field(default_factory=list)
     mcp: list[str] = Field(default_factory=list)
+    # tapestry_modes_models_personas_spec.md §3 -- mirrors core.personas.
+    # Persona's new optional fields one-for-one, camelCased on the wire.
+    fallback_models: list[str] = Field(default_factory=list)
+    guardian_model: str | None = None
+    reasoning_effort: str | None = None
+    default_mode: str = "manual"
+    max_turns: int | None = None
+    max_delegation_depth: int | None = None
 
 
 class PersonaDraftIn(CamelModel):
@@ -246,6 +257,18 @@ class PersonaDraftIn(CamelModel):
     system_prompt: str | None = None
     tools: list[str] | None = None
     mcp: list[str] | None = None
+    fallback_models: list[str] | None = None
+    guardian_model: str | None = None
+    reasoning_effort: str | None = None
+    # Literal-typed (not bare `str`), same reasoning as `status` above:
+    # FastAPI must reject an invalid mode at request-parsing time (422),
+    # not let it reach `_update_persona`'s `model_copy(update=...)` --
+    # pydantic v2's `model_copy` does NOT re-validate, so a bad literal
+    # there would get written straight into the persona's YAML and then
+    # permanently break every subsequent `load_personas()` call.
+    default_mode: PersonaMode | None = None
+    max_turns: int | None = None
+    max_delegation_depth: int | None = None
 
 
 class PersonaUpdateIn(CamelModel):
@@ -261,6 +284,18 @@ class PersonaUpdateIn(CamelModel):
     system_prompt: str | None = None
     tools: list[str] | None = None
     mcp: list[str] | None = None
+    fallback_models: list[str] | None = None
+    guardian_model: str | None = None
+    reasoning_effort: str | None = None
+    # Literal-typed (not bare `str`), same reasoning as `status` above:
+    # FastAPI must reject an invalid mode at request-parsing time (422),
+    # not let it reach `_update_persona`'s `model_copy(update=...)` --
+    # pydantic v2's `model_copy` does NOT re-validate, so a bad literal
+    # there would get written straight into the persona's YAML and then
+    # permanently break every subsequent `load_personas()` call.
+    default_mode: PersonaMode | None = None
+    max_turns: int | None = None
+    max_delegation_depth: int | None = None
 
 
 class ConversationOut(CamelModel):
@@ -270,12 +305,36 @@ class ConversationOut(CamelModel):
     persona_ids: list[str]
     last_preview: str | None = None
     updated_at: str
+    # The lead persona's (persona_ids[0]) current effective mode/model --
+    # session/global scope only, per spec §1.6/§2.2. See
+    # _conversation_row_to_out for how these are resolved.
+    mode: str
+    model: str
 
 
 class ConversationCreateIn(CamelModel):
     kind: Literal["dm", "group"]
     name: str | None = None
     persona_ids: list[str] = Field(default_factory=list)
+
+
+class ModeChangeIn(CamelModel):
+    """`POST /api/conversations/{id}/mode` body — matches `web/lib/api.ts`'s
+    `setConversationMode`.
+    """
+
+    mode: str
+    persona_id: str
+
+
+class ModelSwitchIn(CamelModel):
+    """`POST /api/conversations/{id}/model` body — matches `web/lib/api.ts`'s
+    `setConversationModel`.
+    """
+
+    model: str
+    persona_id: str
+    scope: Literal["once", "session"]
 
 
 class AskQuestionOut(CamelModel):
@@ -457,6 +516,12 @@ def _persona_to_out(persona: Persona) -> PersonaOut:
         system_prompt=persona.system_prompt,
         tools=list(persona.tools),
         mcp=list(persona.mcp_servers),
+        fallback_models=list(persona.fallback_models),
+        guardian_model=persona.guardian_model,
+        reasoning_effort=persona.reasoning_effort,
+        default_mode=persona.default_mode,
+        max_turns=persona.max_turns,
+        max_delegation_depth=persona.max_delegation_depth,
     )
 
 
@@ -559,8 +624,39 @@ def _conversation_meta(conversation_id: str) -> tuple[list[str], str | None, str
     return persona_ids, last_preview, last_timestamp
 
 
+def _conversation_mode_and_model(conversation_id: str, persona_ids: list[str]) -> tuple[str, str]:
+    """The lead persona's (`persona_ids[0]`) current effective mode/model --
+    judgment call 3's same "which persona is authoritative" convention,
+    applied here to mode/model resolution. Defaults to `("manual", "")`
+    when there is no lead persona to resolve against (an empty
+    `persona_ids`, or a persona id no longer present in `_load_personas()`)
+    rather than crashing -- an existing edge case this file already guards
+    elsewhere (see `send_message`'s own empty-`persona_ids` 422).
+
+    `resolve_model` is called with an EMPTY `state` dict deliberately: a
+    "once" scope override lives only in live LangGraph checkpoint state
+    (`model_override_once`), which this synchronous, non-graph helper has
+    no access to -- and per spec §2.2/`Conversation.mode`'s own comment in
+    `web/lib/api.ts`, a once-scope override is a one-shot value for the
+    very next turn, not standing conversation state worth surfacing as
+    "the" current model anyway. `resolve_model`'s own `state.get(
+    "model_override_once")` on an empty dict returns `None` and falls
+    through to session-scope (the `persona/model_switched` event log) or
+    the persona's own global default -- exactly what's wanted here.
+    """
+    if not persona_ids:
+        return "manual", ""
+    lead = _load_personas().get(persona_ids[0])
+    if lead is None:
+        return "manual", ""
+    mode = graph_build.resolve_mode(conversation_id, lead)
+    model, _consumed_once = graph_build.resolve_model({}, conversation_id, lead)
+    return mode, model
+
+
 def _conversation_row_to_out(row: sqlite3.Row) -> ConversationOut:
     persona_ids, last_preview, last_timestamp = _conversation_meta(row["id"])
+    mode, model = _conversation_mode_and_model(row["id"], persona_ids)
     return ConversationOut(
         id=row["id"],
         kind=row["kind"],
@@ -568,6 +664,8 @@ def _conversation_row_to_out(row: sqlite3.Row) -> ConversationOut:
         persona_ids=persona_ids,
         last_preview=last_preview,
         updated_at=last_timestamp or row["created_at"],
+        mode=mode,
+        model=model,
     )
 
 
@@ -1036,6 +1134,12 @@ async def create_app() -> FastAPI:
             mcp_servers=list(draft.mcp or []),
             status=draft.status or "online",
             color=draft.color or "#6B7280",
+            fallback_models=list(draft.fallback_models or []),
+            guardian_model=draft.guardian_model,
+            reasoning_effort=draft.reasoning_effort,
+            default_mode=draft.default_mode or "manual",
+            max_turns=draft.max_turns,
+            max_delegation_depth=draft.max_delegation_depth,
         )
         save_persona(persona, directory)
         _refresh_graph_personas(directory)
@@ -1056,6 +1160,12 @@ async def create_app() -> FastAPI:
             "system_prompt": draft.system_prompt,
             "tools": draft.tools,
             "mcp_servers": draft.mcp,
+            "fallback_models": draft.fallback_models,
+            "guardian_model": draft.guardian_model,
+            "reasoning_effort": draft.reasoning_effort,
+            "default_mode": draft.default_mode,
+            "max_turns": draft.max_turns,
+            "max_delegation_depth": draft.max_delegation_depth,
         }
         updated = current.model_copy(update={k: v for k, v in updates.items() if v is not None})
         save_persona(updated, directory)
@@ -1174,6 +1284,64 @@ async def create_app() -> FastAPI:
             deletions=match.payload.get("deletions") or 0,
             files=files,
         )
+
+    # -- Modes & models (tapestry_modes_models_personas_spec.md §1.6/§2.2) --
+
+    def _require_conversation_persona(conversation_id: str, persona_id: str) -> None:
+        """422s unless `persona_id` is actually one of this conversation's
+        participants -- same "reject a request-body id the conversation
+        doesn't recognize" shape as `create_conversation`'s own "unknown
+        persona ids" 422, applied here to mode/model switch requests.
+        """
+        persona_ids, _, _ = _conversation_meta(conversation_id)
+        if persona_id not in persona_ids:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"persona {persona_id!r} is not part of conversation "
+                    f"{conversation_id!r}"
+                ),
+            )
+
+    @app.post("/api/conversations/{conversation_id}/mode", status_code=204)
+    async def set_conversation_mode(conversation_id: str, body: ModeChangeIn) -> Response:
+        _ensure_conversation(conversation_id, app)
+        if body.mode not in graph_build.VALID_MODES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"invalid mode {body.mode!r}; must be one of {sorted(graph_build.VALID_MODES)}",
+            )
+        _require_conversation_persona(conversation_id, body.persona_id)
+        events.append_event(
+            conversation_id,
+            "mode/changed",
+            actor="you",
+            payload={"mode": body.mode, "persona_id": body.persona_id},
+        )
+        return Response(status_code=204)
+
+    @app.post("/api/conversations/{conversation_id}/model", status_code=204)
+    async def set_conversation_model(conversation_id: str, body: ModelSwitchIn) -> Response:
+        _ensure_conversation(conversation_id, app)
+        _require_conversation_persona(conversation_id, body.persona_id)
+        if body.scope == "session":
+            events.append_event(
+                conversation_id,
+                "persona/model_switched",
+                actor="you",
+                payload={"model": body.model, "persona_id": body.persona_id},
+            )
+        else:
+            # "once" scope: lives only in live LangGraph checkpoint state,
+            # not the durable event log -- persona_node reads it back via
+            # graph_build.resolve_model and clears it after exactly one
+            # consuming pass (see that module's own TapestryGraphState.
+            # model_override_once comment). Same config shape
+            # _drive_turn/_resume_with_answer already use elsewhere in this
+            # file.
+            config = {"configurable": {"thread_id": conversation_id}}
+            await app.state.graph.aupdate_state(config, {"model_override_once": body.model})
+        return Response(status_code=204)
 
     # -- Ask / approvals ---------------------------------------------------
 

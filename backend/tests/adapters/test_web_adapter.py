@@ -955,6 +955,204 @@ def test_status_metamcp_failure_never_500s(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Persona new fields (tapestry_modes_models_personas_spec.md §3) round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_create_persona_round_trips_all_new_fields(client, personas_dir):
+    res = client.post(
+        "/api/personas",
+        json={
+            "name": "Gale",
+            "role": "Guardian",
+            "model": "claude-sonnet-5",
+            "fallbackModels": ["claude-opus-4-6", "gemini/gemini-3-pro"],
+            "guardianModel": "claude-haiku-5",
+            "reasoningEffort": "high",
+            "defaultMode": "auto",
+            "maxTurns": 12,
+            "maxDelegationDepth": 3,
+        },
+    )
+    assert res.status_code == 201
+    body = res.json()
+    assert body["id"] == "gale"
+    assert body["fallbackModels"] == ["claude-opus-4-6", "gemini/gemini-3-pro"]
+    assert body["guardianModel"] == "claude-haiku-5"
+    assert body["reasoningEffort"] == "high"
+    assert body["defaultMode"] == "auto"
+    assert body["maxTurns"] == 12
+    assert body["maxDelegationDepth"] == 3
+
+    fetched = next(p for p in client.get("/api/personas").json() if p["id"] == "gale")
+    assert fetched == body
+
+    patched = client.patch("/api/personas/gale", json={"maxTurns": 20})
+    assert patched.status_code == 200
+    patched_body = patched.json()
+    assert patched_body["maxTurns"] == 20
+    # Untouched new fields preserved across the partial update.
+    assert patched_body["guardianModel"] == "claude-haiku-5"
+    assert patched_body["defaultMode"] == "auto"
+    assert patched_body["fallbackModels"] == ["claude-opus-4-6", "gemini/gemini-3-pro"]
+
+    refetched = next(p for p in client.get("/api/personas").json() if p["id"] == "gale")
+    assert refetched["maxTurns"] == 20
+
+
+def test_update_persona_rejects_invalid_default_mode(client):
+    """`default_mode` must be validated at request-parsing time (422), not
+    let a bad literal reach `_update_persona`'s `model_copy(update=...)` --
+    pydantic v2's `model_copy` does not re-validate, so an unvalidated bad
+    value there would get written straight into the persona's YAML and
+    permanently break every subsequent `load_personas()`/`GET /api/personas`
+    call. This is a regression test for exactly that failure mode.
+    """
+    res = client.patch("/api/personas/rex", json={"defaultMode": "not-a-real-mode"})
+    assert res.status_code == 422
+
+    # The API must still be healthy afterward -- nothing was written.
+    listed = client.get("/api/personas")
+    assert listed.status_code == 200
+    assert any(p["id"] == "rex" for p in listed.json())
+
+
+def test_create_persona_defaults_new_fields_when_omitted(client, personas_dir):
+    res = client.post(
+        "/api/personas", json={"name": "Plain", "role": "x", "model": "claude-sonnet-5"}
+    )
+    assert res.status_code == 201
+    body = res.json()
+    assert body["fallbackModels"] == []
+    assert body["guardianModel"] is None
+    assert body["reasoningEffort"] is None
+    assert body["defaultMode"] == "manual"
+    assert body["maxTurns"] is None
+    assert body["maxDelegationDepth"] is None
+
+
+# ---------------------------------------------------------------------------
+# Conversation.mode / .model -- default persona reflection with no
+# mode/changed or persona/model_switched events yet.
+# ---------------------------------------------------------------------------
+
+
+def test_conversation_out_reflects_persona_defaults_with_no_events(client):
+    res = client.get("/api/conversations/dm-rex/messages")  # lazily vivify
+    assert res.status_code == 200
+
+    listed = client.get("/api/conversations").json()
+    conv = next(c for c in listed if c["id"] == "dm-rex")
+    # rex.yaml sets no default_mode -> core.personas.Persona's own default.
+    assert conv["mode"] == "manual"
+    # rex.yaml's own model field, verbatim.
+    assert conv["model"] == "deepseek/deepseek-chat"
+
+
+# ---------------------------------------------------------------------------
+# Mode switching (POST /api/conversations/{id}/mode)
+# ---------------------------------------------------------------------------
+
+
+def test_set_conversation_mode_rejects_invalid_mode(client):
+    client.get("/api/conversations/dm-rex/messages")  # vivify
+    res = client.post(
+        "/api/conversations/dm-rex/mode", json={"mode": "not-a-real-mode", "personaId": "rex"}
+    )
+    assert res.status_code == 422
+
+
+def test_set_conversation_mode_rejects_persona_not_in_conversation(client):
+    client.get("/api/conversations/dm-rex/messages")  # vivify -- only rex is a participant
+    res = client.post("/api/conversations/dm-rex/mode", json={"mode": "auto", "personaId": "ada"})
+    assert res.status_code == 422
+
+
+def test_set_conversation_mode_appends_event_and_reflected_in_list(client):
+    client.get("/api/conversations/dm-rex/messages")  # vivify
+    res = client.post("/api/conversations/dm-rex/mode", json={"mode": "auto", "personaId": "rex"})
+    assert res.status_code == 204
+
+    logged = events_module.read_events("dm-rex")
+    mode_events = [e for e in logged if e.type == "mode/changed"]
+    assert len(mode_events) == 1
+    assert mode_events[0].payload == {"mode": "auto", "persona_id": "rex"}
+
+    listed = client.get("/api/conversations").json()
+    conv = next(c for c in listed if c["id"] == "dm-rex")
+    assert conv["mode"] == "auto"
+
+
+# ---------------------------------------------------------------------------
+# Model switching (POST /api/conversations/{id}/model)
+# ---------------------------------------------------------------------------
+
+
+def test_set_conversation_model_rejects_persona_not_in_conversation(client):
+    client.get("/api/conversations/dm-rex/messages")  # vivify
+    res = client.post(
+        "/api/conversations/dm-rex/model",
+        json={"model": "claude-opus-4-6", "personaId": "ada", "scope": "session"},
+    )
+    assert res.status_code == 422
+
+
+def test_set_conversation_model_session_scope_appends_event_and_reflected_in_list(client):
+    client.get("/api/conversations/dm-rex/messages")  # vivify
+    res = client.post(
+        "/api/conversations/dm-rex/model",
+        json={"model": "claude-opus-4-6", "personaId": "rex", "scope": "session"},
+    )
+    assert res.status_code == 204
+
+    logged = events_module.read_events("dm-rex")
+    switch_events = [e for e in logged if e.type == "persona/model_switched"]
+    assert len(switch_events) == 1
+    assert switch_events[0].payload == {"model": "claude-opus-4-6", "persona_id": "rex"}
+
+    listed = client.get("/api/conversations").json()
+    conv = next(c for c in listed if c["id"] == "dm-rex")
+    assert conv["model"] == "claude-opus-4-6"
+
+
+def test_set_conversation_model_once_scope_overrides_the_next_turns_model_call(
+    client, monkeypatch
+):
+    call_model_mock = AsyncMock(return_value=_plain_response("hi"))
+    monkeypatch.setattr(graph_build, "call_model", call_model_mock)
+
+    conversation_id = "dm-rex"
+    client.get(f"/api/conversations/{conversation_id}/messages")  # vivify
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/model",
+        json={"model": "claude-opus-4-6", "personaId": "rex", "scope": "once"},
+    )
+    assert res.status_code == 204
+
+    send_res = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hello"}
+    )
+    assert send_res.status_code == 201
+
+    import time
+
+    for _ in range(50):
+        if call_model_mock.await_count >= 1:
+            break
+        time.sleep(0.05)
+
+    assert call_model_mock.await_count >= 1
+    _, kwargs = call_model_mock.call_args_list[0]
+    assert kwargs["model"] == "claude-opus-4-6"
+
+    # A "once" override is genuinely ephemeral -- never durably logged as a
+    # persona/model_switched event, unlike session scope above.
+    logged = events_module.read_events(conversation_id)
+    assert not any(e.type == "persona/model_switched" for e in logged)
+
+
+# ---------------------------------------------------------------------------
 # CORS
 # ---------------------------------------------------------------------------
 
