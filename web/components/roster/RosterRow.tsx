@@ -1,7 +1,7 @@
 import Link from "next/link";
 import type { Conversation, Persona } from "@/lib/api";
 import { GroupAvatar, PersonaAvatar } from "@/components/persona/PersonaAvatar";
-import { formatRelativeTime } from "@/lib/time";
+import { RelativeTime } from "@/components/roster/RelativeTime";
 
 export interface RosterRowProps {
   conversation: Conversation;
@@ -26,7 +26,9 @@ export function RosterRow({ conversation, personas, active }: RosterRowProps) {
         <div className="rname">{name}</div>
         {conversation.lastPreview && <div className="rprev">{conversation.lastPreview}</div>}
       </div>
-      <div className="rtime">{formatRelativeTime(conversation.updatedAt)}</div>
+      <div className="rtime">
+        <RelativeTime iso={conversation.updatedAt} />
+      </div>
     </Link>
   );
 }
