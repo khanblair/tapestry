@@ -74,7 +74,7 @@ const ADA: Persona = {
   model: "Claude Opus 4.8",
   status: "online",
   color: "#3B82F6",
-  bio: "Plans system design.",
+  systemPrompt: "Plans system design.",
   tools: ["File read"],
 };
 const REX: Persona = {
@@ -84,7 +84,7 @@ const REX: Persona = {
   model: "DeepSeek V3.2",
   status: "busy",
   color: "#8B5CF6",
-  bio: "Implements features.",
+  systemPrompt: "Implements features.",
   tools: ["File edit", "Shell exec"],
 };
 const ROSTER = [ADA, REX];

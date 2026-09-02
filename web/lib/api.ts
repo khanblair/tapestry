@@ -18,10 +18,14 @@ export interface Persona {
   model: string;
   status: "online" | "busy" | "paused" | "offline";
   color: string;
-  // --- additive (optional) — needed by the profile screen (bio, tools)
-  // and the persona-management edit form (tools, mcp). Not present on the
-  // wire yet? Treat as undefined and render nothing.
-  bio?: string;
+  // --- additive (optional) — needed by the profile screen and the
+  // persona-management edit form. Not present on the wire yet? Treat as
+  // undefined and render nothing. `systemPrompt` is the one field name
+  // for this concept end-to-end: backend's core/personas.py Persona
+  // model calls it `system_prompt`, and createPersona/updatePersona
+  // below already used `systemPrompt` — this used to be a second name
+  // (`bio`) for the same field, reconciled to one name.
+  systemPrompt?: string;
   tools?: string[];
   mcp?: string[];
 }
@@ -118,17 +122,12 @@ export async function getPersonas(): Promise<Persona[]> {
 /**
  * Request payload for create/update — NOT the same as `Persona` above.
  *
- * KNOWN NAMING MISMATCH, not yet reconciled: this uses `systemPrompt`
+ * Reconciled: both this and `Persona.systemPrompt` now use the one name
  * (per the scoped spec's own term, "its own standing instructions (a
- * system prompt)"), while the response type `Persona` calls the same
- * concept `bio` (this file's earlier additive field, already relied on
- * by lib/mockData.ts, lib/personaDetails.ts, and the profile screen).
- * Both names refer to the same thing on the wire. Before wiring this up
- * to the real backend, someone needs to pick one name and rename the
- * other everywhere it's used — flagged here rather than silently
- * papered over, since renaming unilaterally right now would touch
- * several sibling-owned files that already have passing tests against
- * the current names.
+ * system prompt)"), matching backend/tapestry/core/personas.py's
+ * `Persona.system_prompt` field. This used to be a naming mismatch
+ * (`bio` on the response type, `systemPrompt` here) — fixed everywhere
+ * it was used: lib/mockData.ts, PersonaEditForm.tsx, PersonaProfileView.tsx.
  */
 export interface PersonaDraft {
   name: string;

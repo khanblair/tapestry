@@ -75,7 +75,7 @@ export function PersonaProfileView({ personaId }: PersonaProfileViewProps) {
 
           <div className="section-title">Standing instructions</div>
           <div style={{ fontSize: 13, color: "var(--text-muted)", lineHeight: 1.55 }}>
-            {persona.bio || <span className="empty-hint">No standing instructions set.</span>}
+            {persona.systemPrompt || <span className="empty-hint">No standing instructions set.</span>}
           </div>
 
           <div className="section-title">Permissions</div>

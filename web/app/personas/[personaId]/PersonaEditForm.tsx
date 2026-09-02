@@ -34,7 +34,7 @@ function draftFromPersona(p: Persona): DraftState {
     name: p.name,
     role: p.role,
     model: p.model,
-    systemPrompt: p.bio ?? "",
+    systemPrompt: p.systemPrompt ?? "",
     tools: p.tools ?? [],
   };
 }
