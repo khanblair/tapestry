@@ -72,7 +72,7 @@ def _persona(**overrides) -> Persona:
 
 
 # ---------------------------------------------------------------------------
-# Pure unit tests: _effective_tools, _resolve_mode, _resolve_model
+# Pure unit tests: _effective_tools, resolve_mode, resolve_model
 # ---------------------------------------------------------------------------
 
 
@@ -96,7 +96,7 @@ class TestEffectiveTools:
 class TestResolveMode:
     def test_falls_back_to_persona_default_mode_with_no_events(self):
         persona = _persona(default_mode="accept_edits")
-        assert build._resolve_mode("conv-modes-1", persona) == "accept_edits"
+        assert build.resolve_mode("conv-modes-1", persona) == "accept_edits"
 
     def test_reads_the_most_recent_mode_changed_event(self):
         persona = _persona(id="p1", default_mode="manual")
@@ -106,28 +106,28 @@ class TestResolveMode:
         events_module.append_event(
             "conv-modes-2", "mode/changed", "system", {"mode": "auto", "persona_id": "p1"}
         )
-        assert build._resolve_mode("conv-modes-2", persona) == "auto"
+        assert build.resolve_mode("conv-modes-2", persona) == "auto"
 
     def test_is_scoped_to_the_persona_id(self):
         persona = _persona(id="p1", default_mode="manual")
         events_module.append_event(
             "conv-modes-3", "mode/changed", "system", {"mode": "bypass", "persona_id": "someone-else"}
         )
-        assert build._resolve_mode("conv-modes-3", persona) == "manual"
+        assert build.resolve_mode("conv-modes-3", persona) == "manual"
 
     def test_ignores_an_invalid_mode_value(self):
         persona = _persona(id="p1", default_mode="manual")
         events_module.append_event(
             "conv-modes-4", "mode/changed", "system", {"mode": "not-a-real-mode", "persona_id": "p1"}
         )
-        assert build._resolve_mode("conv-modes-4", persona) == "manual"
+        assert build.resolve_mode("conv-modes-4", persona) == "manual"
 
 
 class TestResolveModel:
     def test_falls_back_to_persona_model_with_nothing_set(self):
         persona = _persona(model="global-default")
         state = build.new_state("conv-models-1", persona.id)
-        model, consumed = build._resolve_model(state, "conv-models-1", persona)
+        model, consumed = build.resolve_model(state, "conv-models-1", persona)
         assert model == "global-default"
         assert consumed is False
 
@@ -137,7 +137,7 @@ class TestResolveModel:
             "conv-models-2", "persona/model_switched", "you", {"model": "session-model", "persona_id": "p1"}
         )
         state = build.new_state("conv-models-2", persona.id)
-        model, consumed = build._resolve_model(state, "conv-models-2", persona)
+        model, consumed = build.resolve_model(state, "conv-models-2", persona)
         assert model == "session-model"
         assert consumed is False
 
@@ -148,7 +148,7 @@ class TestResolveModel:
         )
         state = build.new_state("conv-models-3", persona.id)
         state["model_override_once"] = "once-model"
-        model, consumed = build._resolve_model(state, "conv-models-3", persona)
+        model, consumed = build.resolve_model(state, "conv-models-3", persona)
         assert model == "once-model"
         assert consumed is True
 
@@ -158,7 +158,7 @@ class TestResolveModel:
             "conv-models-4", "persona/model_switched", "you", {"model": "session-model", "persona_id": "someone-else"}
         )
         state = build.new_state("conv-models-4", persona.id)
-        model, _ = build._resolve_model(state, "conv-models-4", persona)
+        model, _ = build.resolve_model(state, "conv-models-4", persona)
         assert model == "global-default"
 
 

@@ -155,6 +155,115 @@ async def test_plain_reply_ends_the_turn_and_logs_events(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Regression: cross-turn conversation memory. Every adapter invokes the
+# graph with a fresh new_state() -- messages: [] -- for EVERY external
+# turn, not just the first; passed as ainvoke input against an existing
+# checkpointed thread, that genuinely replaces the messages channel rather
+# than merging into it (confirmed empirically, not assumed). Without
+# persona_node rebuilding history from the event log at the start of a new
+# turn, a persona has zero memory of anything before the current message.
+# ---------------------------------------------------------------------------
+
+
+async def test_second_turn_includes_the_first_turns_history(tmp_path):
+    conversation_id = "conv-memory-1"
+    captured_messages = []
+
+    async def call_model_capturing(model, messages, tools, **kwargs):
+        captured_messages.append(list(messages))
+        return ModelResponse(text=f"reply {len(captured_messages)}", tool_calls=None, model_used=model)
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        with patch.object(build, "call_model", call_model_capturing):
+            events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "first message"})
+            await graph.ainvoke(build.new_state(conversation_id, "rex"), config)
+
+            events_module.append_event(
+                conversation_id, "user/message", actor="you", payload={"text": "second message"}
+            )
+            await graph.ainvoke(build.new_state(conversation_id, "rex"), config)
+
+        turn_2_messages = captured_messages[1]
+        # system prompt, "first message", the first turn's own reply, then
+        # "second message" -- in that order, nothing dropped.
+        contents = [m["content"] for m in turn_2_messages]
+        assert "first message" in contents
+        assert "reply 1" in contents
+        assert contents[-1] == "second message"
+        roles_by_content = {m["content"]: m["role"] for m in turn_2_messages}
+        assert roles_by_content["first message"] == "user"
+        assert roles_by_content["reply 1"] == "assistant"
+    finally:
+        await graph.checkpointer.conn.close()
+
+
+async def test_within_a_single_turns_tool_loop_history_is_unaffected(tmp_path):
+    """The fix must not touch the ALREADY-correct within-turn behavior:
+    the propose -> execute -> observe loop (same turn_id, multiple
+    persona_node passes inside one ainvoke) keeps accumulating via
+    state["messages"] exactly as before -- it must not re-read the event
+    log (which wouldn't even have the in-flight tool exchange logged as a
+    /message-suffixed event yet) on every internal pass.
+    """
+    conversation_id = "conv-memory-2"
+    call_count = {"file_editor": 0}
+
+    async def fake_file_editor(arguments: dict) -> ToolResult:
+        call_count["file_editor"] += 1
+        return ToolResult(text="wrote it", is_error=False)
+
+    propose = _tool_call_response("Creating.", "file_editor", {"command": "create", "path": "/tmp/x.txt"})
+    final = _plain_response("Done.")
+    call_model_mock = AsyncMock(side_effect=[propose, final])
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        events_module.append_event(
+            conversation_id, "mode/changed", "you", {"mode": "bypass", "persona_id": "rex"}
+        )
+        with patch.object(build, "call_model", call_model_mock), patch.dict(
+            build.TOOL_REGISTRY, {"file_editor": fake_file_editor}
+        ):
+            events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "make the file"})
+            result = await graph.ainvoke(build.new_state(conversation_id, "rex"), config)
+
+        assert call_count["file_editor"] == 1
+        assert result["next_node"] == "end"
+    finally:
+        await graph.checkpointer.conn.close()
+
+
+async def test_group_conversation_attributes_other_personas_messages(tmp_path):
+    """A message from a persona OTHER than the one about to respond is
+    still role: "user" (not "assistant" -- it isn't this persona's own
+    prior output) but prefixed with who actually said it.
+    """
+    conversation_id = "conv-memory-3"
+    captured_messages = []
+
+    async def call_model_capturing(model, messages, tools, **kwargs):
+        captured_messages.append(list(messages))
+        return ModelResponse(text="ok", tool_calls=None, model_used=model)
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "let's plan this"})
+        events_module.append_event(conversation_id, "assistant/message", actor="ada", payload={"text": "here's the plan"})
+        events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "go ahead, rex"})
+
+        with patch.object(build, "call_model", call_model_capturing):
+            await graph.ainvoke(build.new_state(conversation_id, "rex"), config)
+
+        messages = captured_messages[0]
+        ada_message = next(m for m in messages if "here's the plan" in m["content"])
+        assert ada_message["role"] == "user"
+        assert ada_message["content"] == "ada: here's the plan"
+    finally:
+        await graph.checkpointer.conn.close()
+
+
+# ---------------------------------------------------------------------------
 # The critical test: approval interrupt/resume proves the node split works
 # ---------------------------------------------------------------------------
 

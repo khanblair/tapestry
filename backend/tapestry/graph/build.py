@@ -363,7 +363,7 @@ def _effective_tools(persona_tools: list[str], mode: str) -> list[str]:
     return persona_tools
 
 
-def _resolve_mode(conversation_id: str, persona: Persona) -> str:
+def resolve_mode(conversation_id: str, persona: Persona) -> str:
     """The active mode for `persona` in `conversation_id`: the most recent
     `mode/changed` event scoped to this persona, falling back to `persona.
     default_mode` when none exists yet. Per spec §1.6, mode is neither
@@ -379,7 +379,7 @@ def _resolve_mode(conversation_id: str, persona: Persona) -> str:
     return persona.default_mode
 
 
-def _resolve_model(
+def resolve_model(
     state: TapestryGraphState, conversation_id: str, persona: Persona
 ) -> tuple[str, bool]:
     """The effective model for this call: `state["model_override_once"]`
@@ -810,6 +810,39 @@ def _original_ask(conversation_id: str) -> str:
     return ""
 
 
+def _chat_messages_from_log(conversation_id: str, persona: Persona) -> list[dict]:
+    """Cross-turn conversation history for a NEW turn, rebuilt from
+    `core.conversations.derive_messages` (the event log's narrow,
+    model-facing message projection — see that module's own docstring on
+    why it's deliberately narrower than the human-facing timeline) rather
+    than trusted from `state["messages"]`. See the `starting_new_turn`
+    branch in `persona_node` for why this exists at all: every adapter
+    passes a fresh `messages: []` on every external turn, which would
+    otherwise wipe cross-turn memory entirely.
+
+    `message.text` empty is skipped (an event that projected with no real
+    text — shouldn't normally happen for `/message`-suffixed events, but
+    an empty message would be actively wrong context, not just useless).
+    A message from a DIFFERENT persona than the one about to respond (only
+    possible in a group conversation) is still given `role: "user"` — from
+    this persona's point of view another persona's message is exactly
+    like another voice in the room, not this persona's own prior output —
+    but prefixed with who actually said it, so the model isn't misled
+    into thinking the human said it.
+    """
+    chat_messages: list[dict] = []
+    for message in derive_messages(conversation_id):
+        if not message.text:
+            continue
+        if message.actor == persona.id:
+            chat_messages.append({"role": "assistant", "content": message.text})
+        elif message.actor == "you":
+            chat_messages.append({"role": "user", "content": message.text})
+        else:
+            chat_messages.append({"role": "user", "content": f"{message.actor}: {message.text}"})
+    return chat_messages
+
+
 # ---------------------------------------------------------------------------
 # persona_node
 # ---------------------------------------------------------------------------
@@ -831,8 +864,8 @@ async def persona_node(state: TapestryGraphState) -> dict:
     # the persona node before proceeding").
     budgets.check_turn_budget(turn_count, max_turns=persona.max_turns or budgets.DEFAULT_MAX_TURNS)
 
-    mode = _resolve_mode(conversation_id, persona)
-    effective_model, consumed_once = _resolve_model(state, conversation_id, persona)
+    mode = resolve_mode(conversation_id, persona)
+    effective_model, consumed_once = resolve_model(state, conversation_id, persona)
 
     # Every return path below must clear a consumed once-scope override
     # (spec §2.2: it applies to exactly this one persona_node pass, never
@@ -843,6 +876,7 @@ async def persona_node(state: TapestryGraphState) -> dict:
             return {**result, "model_override_once": None}
         return result
 
+    starting_new_turn = state.get("turn_id") is None
     turn_id = state.get("turn_id")
     if turn_id is None:
         turn_start_event = events.append_event(
@@ -859,7 +893,28 @@ async def persona_node(state: TapestryGraphState) -> dict:
     system_prompt = _build_system_prompt(persona, catalog)
     effective_tools = _effective_tools(persona.tools, mode)
     tool_schemas = _build_tool_schemas(effective_tools)
-    messages = [{"role": "system", "content": system_prompt}] + list(state.get("messages", []))
+
+    if starting_new_turn:
+        # Every adapter (web/Discord/Telegram) invokes the graph with a
+        # FRESH new_state() — `messages: []` — for every external turn,
+        # including the second, third, ... message of an ongoing
+        # conversation, not just the first. Passed as `ainvoke` input
+        # against an existing checkpointed thread, that `messages: []`
+        # REPLACES the channel (confirmed empirically: `state["messages"]`
+        # genuinely comes back empty on a second turn, not merged) --
+        # without this branch, a persona would have zero memory of
+        # anything before the current turn. So at the start of a new
+        # external turn (turn_id was None), cross-turn history is rebuilt
+        # from the event log instead of trusted from `state["messages"]`.
+        # WITHIN a turn (the propose -> execute -> observe tool-call loop,
+        # possibly spanning a delegation hand-off to another persona) this
+        # branch never runs again -- turn_id is already set, so
+        # `state["messages"]` keeps accumulating in memory exactly as it
+        # already correctly does today.
+        history = _chat_messages_from_log(conversation_id, persona)
+    else:
+        history = list(state.get("messages", []))
+    messages = [{"role": "system", "content": system_prompt}] + history
 
     streaming.emit(
         "persona/thinking", {"persona_id": persona.id, "conversation_id": conversation_id}
