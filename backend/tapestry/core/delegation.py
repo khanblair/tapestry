@@ -38,23 +38,41 @@ class DelegationMessage(BaseModel):
 
 def _events_since_current_turn_start(
     all_events: list[events.TapestryEvent],
+    turn_id: str | None = None,
 ) -> list[events.TapestryEvent]:
-    """Slice `all_events` down to the currently-open turn, if any.
+    """Slice `all_events` down to one turn's span.
 
-    Mirrors the same turn/start <-> turn/end matching events.py uses for
-    crash recovery: a turn/start is "open" until a later turn/end whose
-    payload["turn_id"] names it. Returns the suffix of `all_events` starting
-    at the most recently opened still-open turn/start; returns the full
-    list unchanged if no turn is currently open.
+    When `turn_id` is given, slices from THAT turn's own `turn/start`
+    event directly -- unambiguous even when several turns are
+    concurrently open in one conversation (tag-all's fan-out, see
+    `tapestry_mentions_concurrency_status_spec.md` §2.3), since a
+    delegating persona's own turn_id is always in scope at the call site
+    (`graph/build.py`'s `_handle_delegate` already has it).
+
+    Without `turn_id` (kept for backward compatibility with any caller
+    that doesn't have one in hand), falls back to the OLD heuristic:
+    mirrors the same turn/start <-> turn/end matching events.py uses for
+    crash recovery, and returns the suffix starting at the most recently
+    opened still-open turn/start. That heuristic is a positional GUESS --
+    correct only when at most one turn is ever open per conversation at a
+    time, which every caller except the fan-out spawner guarantees; with
+    concurrent fan-out legs open, "most recently opened" and "this
+    persona's own turn" are not necessarily the same turn.
     """
+    if turn_id is not None:
+        for index, event in enumerate(all_events):
+            if event.type == "turn/start" and event.id == turn_id:
+                return all_events[index:]
+        return all_events  # turn_id not found in the log -- conservative fallback
+
     open_start_indices: dict[str, int] = {}
     for index, event in enumerate(all_events):
         if event.type == "turn/start":
             open_start_indices[event.id] = index
         elif event.type == "turn/end":
-            turn_id = event.payload.get("turn_id")
-            if turn_id is not None:
-                open_start_indices.pop(turn_id, None)
+            closed_turn_id = event.payload.get("turn_id")
+            if closed_turn_id is not None:
+                open_start_indices.pop(closed_turn_id, None)
 
     if not open_start_indices:
         return all_events
@@ -68,6 +86,7 @@ async def delegate(
     to_persona: str,
     text: str,
     max_rounds: int = 3,
+    turn_id: str | None = None,
 ) -> DelegationMessage:
     """Send one delegation message from `from_persona` to `to_persona`.
 
@@ -75,9 +94,16 @@ async def delegate(
     text, round}` in its payload. Raises `DelegationRoundLimitExceeded`
     before appending anything if this send would exceed `max_rounds` for
     this exact (from_persona, to_persona) pair within the current turn.
+
+    `turn_id`, when given, scopes the round-count exactly to the CALLING
+    persona's own turn -- required for correctness once concurrent tag-all
+    fan-out legs can be open at once (see
+    `_events_since_current_turn_start`'s own docstring). Every real caller
+    (`graph/build.py`'s `_handle_delegate`) always has one; omitted only by
+    tests exercising `delegate()` directly without a turn in progress.
     """
     all_events = events.read_events(conversation_id)
-    scoped_events = _events_since_current_turn_start(all_events)
+    scoped_events = _events_since_current_turn_start(all_events, turn_id)
     prior_rounds = sum(
         1
         for event in scoped_events

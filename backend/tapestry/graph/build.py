@@ -1171,7 +1171,13 @@ async def _handle_delegate(
             delegation_depth,
             max_depth=persona.max_delegation_depth or budgets.DEFAULT_MAX_DELEGATION_DEPTH,
         )
-        await delegate(conversation_id, from_persona=persona.id, to_persona=to_persona, text=text)
+        await delegate(
+            conversation_id,
+            from_persona=persona.id,
+            to_persona=to_persona,
+            text=text,
+            turn_id=turn_id,
+        )
     except (DelegationDepthExceeded, DelegationRoundLimitExceeded) as exc:
         # A hard cap is a real stopping decision, not a crash to hide —
         # close the turn with a real reason before letting it propagate.
