@@ -91,18 +91,34 @@ above) rather than a ninth persona-YAML permission entry.
 Judgment call: real per-token streaming is NOT wired here
 -------------------------------------------------------------
 `streaming.py` is built exactly per the verified research
-(`stream_mode="custom"` + `StreamWriter`). But `models.litellm_client.
-call_model` — "the only place LiteLLM gets called from," a tested policy
-layer with empty-completion retry and context-window normalization — makes
-a single non-streaming `litellm.acompletion()` call; it has no `stream=
-True` code path to pull incremental tokens from. Bypassing it here to get
-raw token streaming would silently drop that policy layer for every
-persona call. So `persona_node`/`execute_node` emit coarse status frames
-(`"persona/thinking"`, `"persona/responded"`, `"tool/status"`) via
-`streaming.emit`, proving the wiring end-to-end, but NOT per-token deltas.
-Real token streaming needs a `call_model(..., stream=True)` variant added
-to `models/litellm_client.py` first — flagged here explicitly as a real
-gap for whoever builds the adapters, not silently worked around.
+(`stream_mode="custom"` + `StreamWriter`). `persona_node`/`execute_node`
+emit coarse status frames (`"persona/thinking"`, `"persona/responded"`,
+`"tool/status"`) via `streaming.emit`, proving the wiring end-to-end, but
+NOT per-token deltas.
+
+UPDATE: the precondition this note originally flagged — "real token
+streaming needs a `call_model(..., stream=True)` variant added to
+`models/litellm_client.py` first" — is now met. `models.litellm_client.
+call_model_stream` exists (same empty-completion-retry and
+context-window-reclassification policies as `call_model`, adapted for a
+stream; see its docstring). `persona_node` still calls the non-streaming
+`call_model` below, deliberately: `call_model_stream` yields `StreamChunk`
+fragments (`delta_text` / `tool_call_delta` / `finish_reason` / `usage`),
+not a single `ModelResponse` object, and `persona_node` needs exactly one
+`ModelResponse`-shaped thing — `response.text`, `response.tool_calls[0]`,
+`response.cost`, `response.input_tokens/output_tokens` — to build the
+durable `"model/response"` event that `budgets.measure_conversation_cost`
+sums over. Wiring the streaming variant in here means first deciding, for
+this node specifically: where the chunk-to-`ModelResponse` reconstruction
+lives (recipe is in `call_model_stream`'s docstring), and whether the
+durable event/tool-dispatch commits after the first attempt or only once
+`call_model_stream` returns without raising (a retry-duplication question
+`call_model_stream`'s docstring answers for the raw stream, but
+`persona_node`'s own event-logging and tool-approval flow need their own
+answer, since those are checkpointed, not transient like `streaming.emit`
+frames). That's real design work belonging to whoever wires the
+Discord/Telegram/web adapters — left as an explicit, actionable follow-up
+rather than guessed at here.
 """
 
 from __future__ import annotations

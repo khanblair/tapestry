@@ -44,3 +44,28 @@ def load_personas(directory: str = "personas") -> dict[str, Persona]:
         persona = Persona(**data)
         personas[persona.id] = persona
     return personas
+
+
+def save_persona(persona: Persona, directory: str = "personas") -> None:
+    """Write `persona` to `<directory>/<persona.id>.yaml`, creating or
+    overwriting the file. The write-side inverse of `load_personas` for one
+    persona at a time.
+
+    Added for `adapters/web_adapter/api.py`'s persona create/update/pause-all
+    endpoints — `load_personas` was read-only, and persona *content* is
+    explicitly documented (this module's own header) as living in
+    `personas/*.yaml`, not in any database, so a real create/update endpoint
+    has nowhere else to durably persist a change. Kept intentionally
+    symmetrical with `load_personas`: same YAML shape (`Persona.model_dump()`
+    written back with `yaml.safe_dump`), same filename convention
+    (`<id>.yaml`), so a file this writes loads back byte-for-byte equivalent
+    via `load_personas`. `directory` is created if it doesn't exist yet
+    (harmless for the real `personas/` dir, which always does; useful for
+    callers pointed at an isolated directory, e.g. tests).
+    """
+    directory_path = Path(directory)
+    directory_path.mkdir(parents=True, exist_ok=True)
+    yaml_path = directory_path / f"{persona.id}.yaml"
+    data = persona.model_dump(mode="python")
+    with yaml_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)

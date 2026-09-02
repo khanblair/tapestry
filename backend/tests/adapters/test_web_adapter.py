@@ -1,0 +1,532 @@
+"""Tests for `tapestry.adapters.web_adapter.api` — the third chat surface.
+
+Deliberately end-to-end, per the task brief: every test runs against a REAL
+temp-file SQLite backend (`TAPESTRY_DB_PATH`) and a REAL checkpointer
+(`TAPESTRY_CHECKPOINT_PATH`), through a REAL `TestClient` driving the actual
+FastAPI app returned by `create_app()` — nothing about the HTTP/WS layer,
+the event log, or the graph's checkpoint/interrupt/resume mechanics is
+mocked. The only mock anywhere in this file is `graph.build.call_model`
+(`tests/graph/test_build.py`'s own established pattern) — there is no API
+key or network access in this environment, and every other test file in
+this repo that exercises the graph mocks exactly that one seam.
+
+Isolation, and why it matters here specifically
+-------------------------------------------------
+`graph.build.PERSONAS` is a module-level dict loaded once at import time
+from the REAL `personas/*.yaml` directory at the repo root. This file's
+persona-mutating endpoints (create/update/pause-all) write real YAML to
+disk and then refresh that exact dict in place (see `api.py`'s judgment
+call 8) — so a careless test here would permanently rewrite the real
+`personas/ada.yaml` etc. and could also leak a mutated `PERSONAS` dict into
+`tests/graph/test_build.py`'s own assertions if both run in the same pytest
+session. Two fixtures below exist specifically to prevent that:
+
+- `personas_dir` copies the real `personas/*.yaml` files into a `tmp_path`
+  directory and points `TAPESTRY_PERSONAS_DIR` at the copy — every write
+  in this file lands there, never on the real files.
+- `restore_graph_personas` (autouse) snapshots `graph.build.PERSONAS`
+  before each test and restores it byte-for-byte after, regardless of
+  pass/fail, so no test in this file can leak a mutated registry into any
+  other test file in the same session.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import shutil
+from unittest.mock import AsyncMock
+
+import pytest
+from fastapi.testclient import TestClient
+from langgraph.types import Command
+
+from tapestry.adapters.web_adapter import api
+from tapestry.core import events as events_module
+from tapestry.graph import build as graph_build
+from tapestry.models.litellm_client import ModelResponse
+from tapestry.tools.file_editor import ToolResult
+
+REAL_PERSONAS_DIR = api._REPO_ROOT / "personas"
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def personas_dir(tmp_path):
+    directory = tmp_path / "personas"
+    directory.mkdir()
+    for yaml_path in REAL_PERSONAS_DIR.glob("*.yaml"):
+        shutil.copy(yaml_path, directory / yaml_path.name)
+    return directory
+
+
+@pytest.fixture(autouse=True)
+def restore_graph_personas():
+    original = dict(graph_build.PERSONAS)
+    yield
+    graph_build.PERSONAS.clear()
+    graph_build.PERSONAS.update(original)
+
+
+@pytest.fixture
+def app(monkeypatch, tmp_path, personas_dir):
+    db_path = str(tmp_path / "tapestry.sqlite")
+    monkeypatch.setenv("TAPESTRY_DB_PATH", db_path)
+    monkeypatch.setenv("TAPESTRY_CHECKPOINT_PATH", str(tmp_path / "checkpoints.sqlite"))
+    monkeypatch.setenv("TAPESTRY_PERSONAS_DIR", str(personas_dir))
+    # create_app() itself does no real async work (graph-building happens
+    # in the lifespan startup, driven by whatever loop actually serves the
+    # app — see api.py's create_app docstring), so it's safe to run to
+    # completion in a throwaway loop here.
+    built = asyncio.run(api.create_app())
+    yield built
+
+    # storage.db.get_connection() caches one real sqlite3.Connection per
+    # resolved path, process-wide, and never closes it on its own (see
+    # that module's own comment: it's designed for one long-lived path in
+    # the real app). Left open across 20+ tests each pointed at their own
+    # tmp_path file, that's 20+ leaked file descriptors with no
+    # corresponding cleanup. Close this test's connection explicitly
+    # rather than relying on GC finalization timing.
+    from tapestry.storage import db as db_module
+
+    conn = db_module._connections.pop(db_path, None)
+    if conn is not None:
+        conn.close()
+
+
+@pytest.fixture
+def client(app):
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+def _tool_call(name: str, arguments: dict, call_id: str = "call_1") -> dict:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments)},
+    }
+
+
+def _plain_response(text: str) -> ModelResponse:
+    return ModelResponse(text=text, tool_calls=None)
+
+
+def _tool_call_response(text: str, name: str, arguments: dict, call_id: str = "call_1") -> ModelResponse:
+    return ModelResponse(text=text, tool_calls=[_tool_call(name, arguments, call_id)])
+
+
+# ---------------------------------------------------------------------------
+# Personas
+# ---------------------------------------------------------------------------
+
+
+def test_get_personas_returns_the_real_yaml_backed_roster(client, personas_dir):
+    res = client.get("/api/personas")
+    assert res.status_code == 200
+    body = res.json()
+    ids = {p["id"] for p in body}
+    assert ids == {"ada", "rex", "vex", "nova"}
+    ada = next(p for p in body if p["id"] == "ada")
+    # camelCase on the wire; systemPrompt/mcp are the real field names,
+    # not systemPrompt/mcpServers.
+    assert ada["systemPrompt"].startswith("You are Ada")
+    assert ada["role"] == "Architect"
+    assert ada["mcp"] == []
+
+
+def test_create_persona_writes_yaml_and_is_immediately_listable(client, personas_dir):
+    res = client.post(
+        "/api/personas",
+        json={
+            "name": "Zed",
+            "role": "Release Manager",
+            "model": "claude-sonnet-5",
+            "systemPrompt": "You are Zed.",
+            "tools": ["terminal_read_only"],
+        },
+    )
+    assert res.status_code == 201
+    body = res.json()
+    assert body["id"] == "zed"
+    assert body["status"] == "online"  # default
+    assert body["color"]  # default color populated
+
+    yaml_path = personas_dir / "zed.yaml"
+    assert yaml_path.exists()
+
+    listed = client.get("/api/personas").json()
+    assert any(p["id"] == "zed" for p in listed)
+
+    # graph.build.PERSONAS was refreshed in place -- the new persona is
+    # immediately usable by the graph, not just listable over the API.
+    assert "zed" in graph_build.PERSONAS
+
+
+def test_create_persona_never_touches_the_real_repo_personas_dir(client, personas_dir):
+    client.post(
+        "/api/personas",
+        json={"name": "Leak Check", "role": "x", "model": "claude-sonnet-5"},
+    )
+    assert not (REAL_PERSONAS_DIR / "leak-check.yaml").exists()
+
+
+def test_update_persona_patch_applies_partial_fields_only(client):
+    res = client.patch("/api/personas/vex", json={"role": "Principal QA"})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["role"] == "Principal QA"
+    assert body["name"] == "Vex"  # untouched field preserved
+    assert body["tools"] == ["terminal_read_only", "test_runner"]  # untouched
+
+
+def test_update_persona_put_alias_also_works(client):
+    res = client.put("/api/personas/nova", json={"status": "online"})
+    assert res.status_code == 200
+    assert res.json()["status"] == "online"
+
+
+def test_update_unknown_persona_404s(client):
+    res = client.patch("/api/personas/does-not-exist", json={"role": "x"})
+    assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Conversations
+# ---------------------------------------------------------------------------
+
+
+def test_create_conversation_dm_then_list(client):
+    res = client.post("/api/conversations", json={"kind": "dm", "personaIds": ["rex"]})
+    assert res.status_code == 201
+    body = res.json()
+    assert body["id"] == "dm-rex"
+    assert body["kind"] == "dm"
+    assert body["personaIds"] == ["rex"]
+    assert body["updatedAt"]
+
+    listed = client.get("/api/conversations").json()
+    assert any(c["id"] == "dm-rex" for c in listed)
+
+
+def test_create_conversation_is_idempotent_for_the_same_dm_id(client):
+    first = client.post("/api/conversations", json={"kind": "dm", "personaIds": ["ada"]})
+    second = client.post("/api/conversations", json={"kind": "dm", "personaIds": ["ada"]})
+    assert first.json()["id"] == second.json()["id"] == "dm-ada"
+
+
+def test_create_group_conversation(client):
+    res = client.post(
+        "/api/conversations",
+        json={"kind": "group", "name": "#auth-rework", "personaIds": ["ada", "rex", "vex"]},
+    )
+    assert res.status_code == 201
+    body = res.json()
+    assert body["kind"] == "group"
+    assert body["name"] == "#auth-rework"
+    assert set(body["personaIds"]) == {"ada", "rex", "vex"}
+
+
+def test_create_conversation_rejects_unknown_persona(client):
+    res = client.post("/api/conversations", json={"kind": "dm", "personaIds": ["ghost"]})
+    assert res.status_code == 422
+
+
+def test_get_messages_lazily_vivifies_a_dm_conversation_by_id_convention(client):
+    # No prior POST /api/conversations at all -- matches
+    # new-conversation/page.tsx's real behavior of linking straight to
+    # /conversation/dm-<id>.
+    res = client.get("/api/conversations/dm-vex/messages")
+    assert res.status_code == 200
+    assert res.json() == []
+
+    listed = client.get("/api/conversations").json()
+    assert any(c["id"] == "dm-vex" for c in listed)
+
+
+def test_get_messages_404s_for_an_unknown_non_dm_conversation(client):
+    res = client.get("/api/conversations/grp-nonexistent/messages")
+    assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# sendMessage: never blocks on the agent turn
+# ---------------------------------------------------------------------------
+
+
+def test_send_message_returns_immediately_with_the_user_message(client, monkeypatch):
+    # call_model hangs "forever" (until the test ends) -- if sendMessage
+    # blocked on the turn, this request would time out the test.
+    hang = asyncio.Event()
+
+    async def never_returns(*args, **kwargs):
+        await hang.wait()
+        raise AssertionError("should not be reached")
+
+    monkeypatch.setattr(graph_build, "call_model", never_returns)
+
+    res = client.post(
+        "/api/conversations/dm-rex/messages", json={"text": "hello there"}
+    )
+    assert res.status_code == 201
+    body = res.json()
+    assert body["text"] == "hello there"
+    assert body["actor"] == "you"
+    assert body["conversationId"] == "dm-rex"
+
+    hang.set()  # let the background task unwind before the DB closes
+
+
+def test_send_message_persists_and_appears_in_get_messages(client, monkeypatch):
+    monkeypatch.setattr(
+        graph_build, "call_model", AsyncMock(return_value=_plain_response("hi from rex"))
+    )
+    client.post("/api/conversations/dm-rex/messages", json={"text": "ping"})
+
+    # Give the background asyncio task a moment to run inside the
+    # TestClient's own portal loop.
+    import time
+
+    for _ in range(50):
+        messages = client.get("/api/conversations/dm-rex/messages").json()
+        if any(m["actor"] == "rex" for m in messages):
+            break
+        time.sleep(0.05)
+    else:
+        messages = client.get("/api/conversations/dm-rex/messages").json()
+
+    texts = [m["text"] for m in messages]
+    assert "ping" in texts
+    assert "hi from rex" in texts
+
+
+# ---------------------------------------------------------------------------
+# The critical end-to-end path: send -> WS "message" frames -> interrupt
+# surfaces -> answer -> resume -> tool runs exactly once -> final reply
+# arrives over the WS too.
+# ---------------------------------------------------------------------------
+
+
+def test_full_turn_over_websocket_with_approval_interrupt_and_resume(client, monkeypatch):
+    call_count = {"file_editor": 0}
+
+    async def fake_file_editor(arguments: dict) -> ToolResult:
+        call_count["file_editor"] += 1
+        return ToolResult(text="wrote the file", is_error=False)
+
+    propose = _tool_call_response(
+        "I'll create the file.",
+        "file_editor",
+        {"command": "create", "path": "/tmp/x.txt", "file_text": "hi"},
+    )
+    final = _plain_response("Done, file created.")
+    call_model_mock = AsyncMock(side_effect=[propose, final])
+    monkeypatch.setattr(graph_build, "call_model", call_model_mock)
+    monkeypatch.setitem(graph_build.TOOL_REGISTRY, "file_editor", fake_file_editor)
+
+    conversation_id = "dm-rex"
+
+    with client.websocket_connect(f"/ws/conversations/{conversation_id}") as ws:
+        send_res = client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"text": "please create /tmp/x.txt"},
+        )
+        assert send_res.status_code == 201
+
+        # Drain frames until the approval prompt arrives as a "message"
+        # frame carrying `.approval` (this is what
+        # ConversationView.tsx's live subscription actually reacts to).
+        approval_payload = None
+        for _ in range(200):
+            frame = ws.receive_json()
+            if frame["type"] == "message" and frame["payload"].get("approval"):
+                approval_payload = frame["payload"]["approval"]
+                break
+        assert approval_payload is not None, "approval prompt never arrived over the WS"
+        assert call_count["file_editor"] == 0, "tool must not run while paused"
+
+        question_id = approval_payload["id"]
+
+        answer_res = client.post(
+            f"/api/conversations/{conversation_id}/ask/{question_id}/answer",
+            json={"selected": ["approve"]},
+        )
+        assert answer_res.status_code == 204
+
+        final_text = None
+        for _ in range(200):
+            frame = ws.receive_json()
+            if frame["type"] == "message" and frame["payload"].get("text") == "Done, file created.":
+                final_text = frame["payload"]["text"]
+                break
+        assert final_text == "Done, file created."
+
+    assert call_count["file_editor"] == 1, "tool must run exactly once, after resume"
+
+    logged = events_module.read_events(conversation_id)
+    assert sum(1 for e in logged if e.type == "ask/requested") == 1
+    assert sum(1 for e in logged if e.type == "ask/answered") == 1
+    assert sum(1 for e in logged if e.type == "tool/result") == 1
+
+
+def test_answer_ask_batch_endpoint_resumes_too(client, monkeypatch):
+    call_count = {"terminal": 0}
+
+    async def fake_terminal(arguments: dict) -> ToolResult:
+        call_count["terminal"] += 1
+        return ToolResult(text="ran it", is_error=False)
+
+    propose = _tool_call_response("Running a command.", "terminal", {"command": "echo hi"})
+    final = _plain_response("Ran it.")
+    call_model_mock = AsyncMock(side_effect=[propose, final])
+    monkeypatch.setattr(graph_build, "call_model", call_model_mock)
+    monkeypatch.setitem(graph_build.TOOL_REGISTRY, "terminal", fake_terminal)
+
+    conversation_id = "dm-rex"
+    client.post(f"/api/conversations/{conversation_id}/messages", json={"text": "run echo hi"})
+
+    import time
+
+    pending_id = None
+    for _ in range(50):
+        messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+        approvals = [m for m in messages if m.get("approval")]
+        if approvals:
+            pending_id = approvals[0]["approval"]["id"]
+            break
+        time.sleep(0.05)
+    assert pending_id is not None
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/ask/answers",
+        json={"answers": [{"id": pending_id, "selected": ["approve"]}]},
+    )
+    assert res.status_code == 204
+
+    for _ in range(50):
+        if call_count["terminal"] == 1:
+            break
+        time.sleep(0.05)
+    assert call_count["terminal"] == 1
+
+
+def test_answer_ask_with_no_pending_approval_returns_409(client, monkeypatch):
+    # api._resume_with_answer polls briefly before giving up (a real
+    # client can race the approval WS notification against the
+    # checkpoint actually being persisted as paused -- see that
+    # function's own docstring). Shorten the budget so this true-negative
+    # case doesn't have to sit through the full poll window.
+    monkeypatch.setattr(api, "_RESUME_POLL_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(api, "_RESUME_POLL_INTERVAL_SECONDS", 0.05)
+
+    res = client.post(
+        "/api/conversations/dm-rex/ask/answers",
+        json={"answers": [{"id": "bogus", "selected": ["approve"]}]},
+    )
+    assert res.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+
+
+def test_search_finds_messages_and_personas(client, monkeypatch):
+    monkeypatch.setattr(
+        graph_build, "call_model", AsyncMock(return_value=_plain_response("the scope is narrowed"))
+    )
+    client.post(
+        "/api/conversations/dm-rex/messages", json={"text": "please narrow the oauth scope"}
+    )
+
+    import time
+
+    for _ in range(50):
+        results = client.get("/api/search", params={"q": "narrow"}).json()
+        if results["messages"]:
+            break
+        time.sleep(0.05)
+
+    results = client.get("/api/search", params={"q": "narrow"}).json()
+    assert any("narrow" in m["snippet"].lower() for m in results["messages"])
+
+    persona_results = client.get("/api/search", params={"q": "Architect"}).json()
+    assert any(p["persona"]["id"] == "ada" for p in persona_results["personas"])
+
+
+def test_search_with_empty_query_returns_empty_results(client):
+    res = client.get("/api/search", params={"q": ""})
+    assert res.status_code == 200
+    assert res.json() == {"messages": [], "personas": []}
+
+
+# ---------------------------------------------------------------------------
+# Pending asks
+# ---------------------------------------------------------------------------
+
+
+def test_pending_asks_lists_unanswered_approvals_across_conversations(client, monkeypatch):
+    propose = _tool_call_response(
+        "Creating a file.", "file_editor", {"command": "create", "path": "/tmp/y.txt"}
+    )
+    monkeypatch.setattr(graph_build, "call_model", AsyncMock(return_value=propose))
+    monkeypatch.setitem(
+        graph_build.TOOL_REGISTRY,
+        "file_editor",
+        AsyncMock(return_value=ToolResult(text="ok", is_error=False)),
+    )
+
+    client.post("/api/conversations/dm-rex/messages", json={"text": "create /tmp/y.txt"})
+
+    import time
+
+    for _ in range(50):
+        pending = client.get("/api/asks/pending").json()
+        if pending:
+            break
+        time.sleep(0.05)
+
+    pending = client.get("/api/asks/pending").json()
+    assert any(p["conversationId"] == "dm-rex" for p in pending)
+
+
+# ---------------------------------------------------------------------------
+# Agents pause-all
+# ---------------------------------------------------------------------------
+
+
+def test_pause_all_agents_sets_every_persona_paused_and_persists(client, personas_dir):
+    res = client.post("/api/agents/pause-all")
+    assert res.status_code == 204
+
+    listed = client.get("/api/personas").json()
+    assert all(p["status"] == "paused" for p in listed)
+    assert all(p.status == "paused" for p in graph_build.PERSONAS.values())
+
+    # Persisted to the (isolated) yaml files, not just in memory.
+    import yaml as yaml_module
+
+    for yaml_path in personas_dir.glob("*.yaml"):
+        data = yaml_module.safe_load(yaml_path.read_text())
+        assert data["status"] == "paused"
+
+
+def test_pause_alias_path_also_works(client):
+    res = client.post("/api/agents/pause")
+    assert res.status_code == 204
+    assert all(p["status"] == "paused" for p in client.get("/api/personas").json())
+
+
+# ---------------------------------------------------------------------------
+# CORS
+# ---------------------------------------------------------------------------
+
+
+def test_cors_allows_the_nextjs_dev_origin(client):
+    res = client.get("/api/personas", headers={"Origin": "http://localhost:3000"})
+    assert res.headers.get("access-control-allow-origin") == "http://localhost:3000"
