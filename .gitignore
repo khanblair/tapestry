@@ -24,5 +24,14 @@ pnpm-debug.log*
 # os
 .DS_Store
 
+# build/test artifacts
+*.tsbuildinfo
+test-results/
+playwright-report/
+.next/
+
+# local dev tooling config
+.claude/launch.json
+
 # scratch
 _test-preview.html
