@@ -488,9 +488,20 @@ class TapestryDiscordClient(discord.Client):
                 "moment._"
             )
             return
-        open_turns = events.find_open_turns(events.read_events(conversation_id))
+        # Filtered to the MAIN thread only -- mirrors web_adapter/api.py's
+        # equivalent guard (spec §2.2). Tag-all fan-out itself is only
+        # built for the web adapter's group conversations (Discord's own
+        # conversation ids are a disjoint namespace, so it can never
+        # actually see a fan-out-leg turn/start today) -- kept here anyway
+        # so this guard shares one correct idiom with the web adapter
+        # rather than silently drifting if that ever changes.
+        open_turns = [
+            e
+            for e in events.find_open_turns(events.read_events(conversation_id)).values()
+            if events.is_main_thread_turn(e, conversation_id)
+        ]
         if open_turns:
-            stalled_persona = list(open_turns.values())[-1].actor
+            stalled_persona = open_turns[-1].actor
             await channel.send(
                 f"_{stalled_persona} is still working on the last message (or waiting "
                 "on your approval) -- send this again once that's done._"

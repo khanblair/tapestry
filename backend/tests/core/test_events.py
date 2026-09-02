@@ -6,6 +6,7 @@ from tapestry.core.events import (
     append_event,
     close_orphaned_turns,
     find_open_turns,
+    is_main_thread_turn,
     list_open_turns,
     read_events,
     read_recent_events,
@@ -162,6 +163,42 @@ def test_find_open_turns_ignores_turn_end_with_no_turn_id():
     open_turns = find_open_turns(read_events("conv-1"))
 
     assert list(open_turns.keys()) == [start.id]
+
+
+def test_is_main_thread_turn_true_when_graph_thread_id_matches_conversation():
+    event = append_event(
+        "conv-1", "turn/start", "rex", {"graph_thread_id": "conv-1"}
+    )
+    assert is_main_thread_turn(event, "conv-1") is True
+
+
+def test_is_main_thread_turn_false_for_a_fanout_leg():
+    event = append_event(
+        "conv-1", "turn/start", "rex", {"graph_thread_id": "conv-1::mention::rex::m1"}
+    )
+    assert is_main_thread_turn(event, "conv-1") is False
+
+
+def test_is_main_thread_turn_true_when_field_absent_predates_fanout():
+    event = append_event("conv-1", "turn/start", "rex", {})
+    assert is_main_thread_turn(event, "conv-1") is True
+
+
+def test_close_orphaned_turns_never_closes_an_open_fanout_leg():
+    main_start = append_event(
+        "conv-1", "turn/start", "rex", {"graph_thread_id": "conv-1"}
+    )
+    fanout_start = append_event(
+        "conv-1", "turn/start", "vex", {"graph_thread_id": "conv-1::mention::vex::m1"}
+    )
+
+    closed = close_orphaned_turns("conv-1")
+
+    assert len(closed) == 1
+    assert closed[0].payload["turn_id"] == main_start.id
+    # the fan-out leg's own open turn/start is left untouched
+    still_open = find_open_turns(read_events("conv-1"))
+    assert fanout_start.id in still_open
 
 
 def test_close_orphaned_turns_still_works_after_sharing_find_open_turns():

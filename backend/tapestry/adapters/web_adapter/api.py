@@ -804,12 +804,20 @@ def _reject_if_turn_in_progress(app: FastAPI, conversation_id: str) -> None:
                 "-- wait for it to finish before sending another message"
             ),
         )
-    open_turns = events.find_open_turns(events.read_events(conversation_id))
+    # Filtered to the MAIN thread only -- an open tag-all fan-out leg (see
+    # §2.2) must never block a plain message or a new tag-all send; each
+    # fan-out leg guards only itself (its thread_id is fresh/single-use per
+    # send, so there's nothing to race there in the first place).
+    open_turns = [
+        e
+        for e in events.find_open_turns(events.read_events(conversation_id)).values()
+        if events.is_main_thread_turn(e, conversation_id)
+    ]
     if not open_turns:
         return
     # Most recently opened, for the error message -- see find_open_turns'
-    # own docstring: pre-fan-out at most one is ever open anyway.
-    turn = list(open_turns.values())[-1]
+    # own docstring: at most one main-thread turn is ever open anyway.
+    turn = open_turns[-1]
     raise HTTPException(
         status_code=409,
         detail=(

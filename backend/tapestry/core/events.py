@@ -283,13 +283,38 @@ def list_open_turns() -> dict[str, TapestryEvent]:
     return {event.actor: event for event in open_starts.values()}
 
 
-def close_orphaned_turns(conversation_id: str) -> list[TapestryEvent]:
-    """Close any `turn/start` in this conversation with no matching `turn/end`.
+def is_main_thread_turn(event: TapestryEvent, conversation_id: str) -> bool:
+    """True if `event` (a `turn/start`) ran on `conversation_id`'s own
+    LangGraph checkpoint thread — as opposed to a tag-all fan-out leg's own
+    thread (see `graph/build.py`'s `persona_node` and
+    `tapestry_mentions_concurrency_status_spec.md` §2.2).
 
-    Any `turn/start` left unmatched after scanning the whole log (see
+    A `turn/start` with no `graph_thread_id` at all (recorded before this
+    field existed) is treated as main-thread — that's the only kind of
+    turn that could exist before fan-out shipped.
+    """
+    return event.payload.get("graph_thread_id", conversation_id) == conversation_id
+
+
+def close_orphaned_turns(conversation_id: str) -> list[TapestryEvent]:
+    """Close any MAIN-THREAD `turn/start` in this conversation with no
+    matching `turn/end`.
+
+    Any such `turn/start` left unmatched after scanning the whole log (see
     `find_open_turns`) gets a synthetic `turn/end` appended, with
     `actor="system"` and
     `payload={"turn_id": <start id>, "reason": ORPHAN_REPAIR_REASON}`.
+
+    Deliberately does NOT auto-close a fan-out leg's own open `turn/start`
+    (`is_main_thread_turn` filters those out) — a blind log-only scan can't
+    tell a fan-out leg that's still genuinely paused at a live approval
+    apart from one truly abandoned by a crash, and closing the wrong one
+    would silently orphan a real, resumable interrupt. A crashed fan-out
+    leg is a known, accepted gap left open by this filter (it stays
+    "busy" in status derivation indefinitely) rather than risking that —
+    see `tapestry_mentions_concurrency_status_spec.md` §1's own note that
+    a proper fix would cross-check each leg's own LangGraph checkpoint
+    before closing it, not yet built.
 
     Returns the list of synthetic repair events created (empty if nothing
     was orphaned). Intended to be called once per conversation at
@@ -298,7 +323,9 @@ def close_orphaned_turns(conversation_id: str) -> list[TapestryEvent]:
     open_starts = find_open_turns(read_events(conversation_id))
 
     closed: list[TapestryEvent] = []
-    for turn_id in open_starts:
+    for turn_id, start_event in open_starts.items():
+        if not is_main_thread_turn(start_event, conversation_id):
+            continue
         closed_event = append_event(
             conversation_id=conversation_id,
             type="turn/end",
