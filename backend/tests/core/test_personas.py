@@ -121,7 +121,7 @@ def test_load_personas_on_empty_directory_returns_empty_dict(tmp_path):
 def test_real_roster_files_parse_and_match_the_scoped_spec():
     personas = load_personas(str(REAL_PERSONAS_DIR))
 
-    assert set(personas.keys()) == {"ada", "rex", "vex", "nova"}
+    assert set(personas.keys()) == {"ada", "rex", "vex", "nova", "sage", "kai"}
 
     assert personas["ada"].role == "Architect"
     assert personas["ada"].status == "online"
@@ -137,3 +137,22 @@ def test_real_roster_files_parse_and_match_the_scoped_spec():
     assert personas["nova"].role == "DevOps"
     assert personas["nova"].status == "paused"
     assert personas["nova"].color == "#14B8A6"
+
+    # Non-dev, general-chat personas -- no dev tools, bypass by default so
+    # the (already-existing) lead-persona-only mode dropdown bug can't
+    # leave them stuck asking for approval they'll never need.
+    assert personas["sage"].tools == []
+    assert personas["sage"].default_mode == "bypass"
+    assert personas["sage"].proactive is True
+
+    assert personas["kai"].tools == []
+    assert personas["kai"].default_mode == "bypass"
+    assert personas["kai"].proactive is False
+
+
+def test_persona_proactive_defaults_false():
+    # Every persona.yaml written before this field existed must still load
+    # with the same behavior it always had: never initiating on its own.
+    personas = load_personas(str(REAL_PERSONAS_DIR))
+    assert personas["ada"].proactive is False
+    assert personas["rex"].proactive is False

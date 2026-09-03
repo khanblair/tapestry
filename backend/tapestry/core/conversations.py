@@ -75,11 +75,12 @@ def derive_messages(conversation_id: str) -> list[Message]:
 # Pure internal bookkeeping, excluded from the timeline: `model/response`
 # (cost/token accounting, not display content — an explicit user decision,
 # not a default), `turn/start`/`turn/end` (graph-loop bracketing, no
-# human-facing content of their own), `conversation/created` (conversation
-# metadata already reflected in the `Conversation` object itself, not an
+# human-facing content of their own), `conversation/created` and
+# `conversation/context_set` (conversation metadata already reflected in the
+# `Conversation` object itself -- see `ConversationOut.context` -- not an
 # event that happened *during* the conversation).
 _TIMELINE_EXCLUDED_TYPES = frozenset(
-    {"model/response", "turn/start", "turn/end", "conversation/created"}
+    {"model/response", "turn/start", "turn/end", "conversation/created", "conversation/context_set"}
 )
 
 
@@ -107,6 +108,19 @@ def derive_membership(conversation_id: str) -> tuple[list[str], str | None]:
         if event.type == "conversation/created":
             return list(event.payload.get("persona_ids", [])), event.payload.get("kind")
     return [], None
+
+
+def derive_conversation_context(conversation_id: str) -> str | None:
+    """Human-set ground rules/context for this conversation, or `None` if
+    never set. Projected the same way `resolve_mode` (`graph/build.py`)
+    resolves a persona's mode -- reverse-scan the log for the most recent
+    `conversation/context_set` event -- so "set" and "edit" are the same
+    write (append a new event) and there is nothing to migrate.
+    """
+    for event in reversed(events.read_events(conversation_id)):
+        if event.type == "conversation/context_set":
+            return event.payload.get("context") or None
+    return None
 
 
 def derive_timeline(conversation_id: str) -> list[TimelineItem]:

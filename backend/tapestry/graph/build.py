@@ -126,6 +126,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import uuid
 from pathlib import Path
 from typing import Awaitable, Callable, Literal, TypedDict
@@ -137,7 +138,11 @@ from langgraph.types import interrupt
 
 from tapestry.core import events
 from tapestry.core.ask import AskQuestion
-from tapestry.core.conversations import derive_membership, derive_messages
+from tapestry.core.conversations import (
+    derive_conversation_context,
+    derive_membership,
+    derive_messages,
+)
 from tapestry.core.delegation import DelegationRoundLimitExceeded, delegate
 from tapestry.core.personas import Persona, load_personas
 from tapestry.graph import budgets, streaming, verify
@@ -231,6 +236,23 @@ class TapestryGraphState(TypedDict, total=False):
     # same mechanism session/global scope don't need since those live in
     # the event log instead.
     model_override_once: str | None
+    # Set by `web_adapter/api.py`'s `_run_continuation_session` for every
+    # round after the first of an autonomous tag-all continuation -- never
+    # by an ordinary adapter turn. Gates two things together in
+    # `persona_node`: whether `pass_turn` is offered at all
+    # (`_build_tool_schemas`'s `include_pass_turn`) and whether the model is
+    # told this round is optional (`_build_system_prompt`'s
+    # `is_continuation_round`). Always explicitly set by whoever builds this
+    # state (unlike `model_override_once`, there is no "preserve whatever
+    # was checkpointed" case here -- every turn's own round-ness is known
+    # upfront by its caller).
+    is_continuation_round: bool
+    # Set by `web_adapter/api.py`'s proactive check-in background loop for
+    # the ONE turn it spawns when a proactive persona's DM has sat idle
+    # since the human's own last message -- never by an ordinary
+    # human-triggered turn. Unlike `is_continuation_round` this never
+    # recurs on its own; it's a single unprompted message, not a loop.
+    is_proactive_checkin: bool
 
 
 def new_state(
@@ -239,6 +261,8 @@ def new_state(
     *,
     thread_id: str | None = None,
     task_id: str | None = None,
+    is_continuation_round: bool = False,
+    is_proactive_checkin: bool = False,
 ) -> TapestryGraphState:
     """Build a fresh initial state dict with every field's documented
     default filled in. `TypedDict` itself can't carry runtime defaults
@@ -271,6 +295,8 @@ def new_state(
         turn_id=None,
         approved=None,
         next_node="persona",
+        is_continuation_round=is_continuation_round,
+        is_proactive_checkin=is_proactive_checkin,
     )
 
 
@@ -314,6 +340,13 @@ _DEFAULT_DEPLOY_MCP_PREFIX = "Deploy__"
 DELEGATE_TOOL_NAME = "delegate"
 TASK_COMPLETE_TOOL_NAME = "task_complete"
 SKILL_LOADER_TOOL_NAME = "skill_loader"
+# Only ever offered during an autonomous continuation round (`persona_node`
+# gates it on `state["is_continuation_round"]`, via `_build_tool_schemas`'s
+# `include_pass_turn`) -- never on the mandatory first reply to being
+# `@`-tagged. See `_handle_pass_turn` / `web_adapter/api.py`'s
+# `_run_continuation_session` for the rest of the round-continuation
+# mechanism this exists for.
+PASS_TURN_TOOL_NAME = "pass_turn"
 
 # Tools whose proposal must go through approval_node's interrupt() gate
 # before execute_node ever runs them -- anything that mutates files,
@@ -670,10 +703,10 @@ def _function_schema(name: str, description: str, parameters: dict) -> dict:
 
 # Function-calling schemas passed to `models.litellm_client.call_model`'s
 # `tools=` argument (LiteLLM/OpenAI function-calling shape). Every
-# TOOL_REGISTRY key has a matching schema here; DELEGATE_TOOL_NAME and
-# TASK_COMPLETE_TOOL_NAME are intercepted directly inside persona_node
-# (never dispatched through TOOL_REGISTRY/execute_node) but still need
-# schemas so the model can actually call them.
+# TOOL_REGISTRY key has a matching schema here; DELEGATE_TOOL_NAME,
+# TASK_COMPLETE_TOOL_NAME, and PASS_TURN_TOOL_NAME are intercepted directly
+# inside persona_node (never dispatched through TOOL_REGISTRY/execute_node)
+# but still need schemas so the model can actually call them.
 TOOL_SCHEMAS: dict[str, dict] = {
     "file_editor_read": _function_schema(
         "file_editor_read",
@@ -774,6 +807,15 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "(graph.verify) before it actually closes — it may come back rejected.",
         {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]},
     ),
+    PASS_TURN_TOOL_NAME: _function_schema(
+        PASS_TURN_TOOL_NAME,
+        "Decline to add anything to this round of an ongoing group "
+        "conversation. Only offered during an autonomous continuation round "
+        "(nobody just tagged you or asked you something new) -- passing is "
+        "the normal, expected outcome most rounds, not a failure to "
+        "contribute. Call this instead of manufacturing a reply.",
+        {"type": "object", "properties": {}, "required": []},
+    ),
 }
 
 
@@ -793,7 +835,7 @@ def _roster_lines(persona: Persona, member_ids: list[str]) -> list[str]:
         if member is None:
             continue
         marker = " [you]" if member_id == persona.id else ""
-        lines.append(f"- {member.name} ({member.role}) — {member.status}{marker}")
+        lines.append(f"- {member.name} ({member.role}, {member.status}){marker}")
     others = [p for pid, p in PERSONAS.items() if pid not in member_ids]
     if others:
         other_desc = ", ".join(f"{p.name} ({p.role}, {p.status})" for p in others)
@@ -817,28 +859,110 @@ def _group_dialogue_guidance() -> list[str]:
     sufficient -- nothing tells the model that reading it matters.
     """
     return [
-        "You are one of several personas in this conversation, not the only "
-        "one replying. If another persona has already said something in "
-        "this exchange, actually read and respond to it -- agree, disagree, "
-        "add something specific, or build on their point -- rather than "
-        "answering the human independently as if you hadn't seen it. Sound "
-        "like a person in a group chat, not several copies of the same "
-        "assistant: don't repeat a greeting someone already gave, don't "
-        "over-agree with what a sibling just said, and don't restate "
-        "context someone else already covered.",
+        "You're one of several people in this chat, not the only one "
+        "replying. Actually respond to what a sibling just said instead "
+        "of answering independently as if you hadn't seen it -- but don't "
+        "just validate it either. Add something specific, disagree, or "
+        "move the point forward. Don't repeat a greeting someone already "
+        "gave or restate context someone else already covered.",
+        "",
+    ]
+
+
+_BREVITY_GUIDANCE = [
+    "Keep it short: 1-3 sentences by default, under ~50 words. This is a "
+    "chat message, not a document. Go longer only when the question "
+    "genuinely needs a list or a real explanation, and even then stop "
+    "once you've said it.",
+    "Write like a person texting a coworker, not an assistant answering "
+    "a ticket. No em dashes, use commas or periods instead. Skip openers "
+    "like \"I completely agree,\" \"That's a great point,\" or \"I love "
+    "that\" -- just make your point.",
+    "",
+]
+
+
+def _continuation_guidance() -> list[str]:
+    """Only rendered when `persona_node` passes `is_continuation_round=True`
+    -- i.e. this reply is happening on its own, in an autonomous
+    continuation round (`web_adapter/api.py`'s `_run_continuation_session`),
+    not as a direct reply to being tagged or asked something. Pairs with
+    `PASS_TURN_TOOL_NAME` being offered on the same round: this is the text
+    that tells the model the tool exists and when to prefer it.
+    """
+    return [
+        "This is an AUTONOMOUS CONTINUATION round: nobody just tagged you "
+        "or asked something new, the group is simply still open after the "
+        "last round. If you've got nothing real to add, call pass_turn "
+        "instead of manufacturing a reply -- that's the normal outcome "
+        "most rounds, not a failure to contribute. EXCEPTION: if the "
+        "human's original message asked for an extended or timed exchange "
+        "(\"hold a conversation,\" \"keep talking,\" \"for a couple "
+        "minutes\"), don't cut it short just because you personally are "
+        "out of ideas -- stay in it and keep it moving until that request "
+        "is reasonably satisfied.",
+        "",
+    ]
+
+
+def _proactive_checkin_guidance() -> list[str]:
+    """Only rendered when `persona_node` passes `is_proactive_checkin=True`
+    -- the one turn `web_adapter/api.py`'s proactive check-in loop spawns
+    when a `proactive` persona's DM has sat idle since the human's own
+    last message. Every other turn, including a plain reply, is a REACTION
+    to something the human just said; this is the one case where there is
+    no new human message to react to at all.
+    """
+    return [
+        "Nobody has messaged in a while -- you're reaching out FIRST, "
+        "unprompted. That's a normal thing for you to do, not an "
+        "interruption. Keep it short and warm. If you know things about "
+        "this person from earlier in the conversation, reference something "
+        "specific instead of opening cold. Ask a real question, don't just "
+        "say hi and leave it there.",
+        "",
+    ]
+
+
+def _conversation_context_guidance(context: str) -> list[str]:
+    """Rendered ABOVE `persona.system_prompt`, not after it like every other
+    guidance block -- this is the one instruction that must outrank a
+    persona's own character description (e.g. Kai's "you talk about
+    training, recovery, habits" losing to a human-set "no work talk in this
+    thread" if it were buried below four other guidance blocks the way
+    brevity/roster/continuation guidance is).
+    """
+    return [
+        "The human running this conversation set ground rules for it. "
+        "These take precedence over your own instructions below if the two "
+        "ever conflict:",
+        context.strip(),
         "",
     ]
 
 
 def _build_system_prompt(
-    persona: Persona, catalog: list[SkillSummary], member_ids: list[str] | None = None
+    persona: Persona,
+    catalog: list[SkillSummary],
+    member_ids: list[str] | None = None,
+    *,
+    is_continuation_round: bool = False,
+    is_proactive_checkin: bool = False,
+    conversation_context: str | None = None,
 ) -> str:
-    lines = [persona.system_prompt.strip(), ""]
+    lines: list[str] = []
+    if conversation_context:
+        lines.extend(_conversation_context_guidance(conversation_context))
+    lines.extend([persona.system_prompt.strip(), "", *_BREVITY_GUIDANCE])
     if member_ids is not None:
         lines.extend(_roster_lines(persona, member_ids))
         lines.append("")
         if len(member_ids) > 1:
             lines.extend(_group_dialogue_guidance())
+    if is_continuation_round:
+        lines.extend(_continuation_guidance())
+    if is_proactive_checkin:
+        lines.extend(_proactive_checkin_guidance())
     if catalog:
         lines.append(
             f"Available skills (call the {SKILL_LOADER_TOOL_NAME!r} tool with "
@@ -855,13 +979,15 @@ def _build_system_prompt(
     return "\n".join(lines)
 
 
-def _build_tool_schemas(tool_names: list[str]) -> list[dict]:
+def _build_tool_schemas(tool_names: list[str], *, include_pass_turn: bool = False) -> list[dict]:
     schemas = [TOOL_SCHEMAS[name] for name in tool_names if name in TOOL_SCHEMAS]
     # Core orchestration capabilities every persona has, regardless of its
     # own permissioned `tools:` list.
     schemas.append(TOOL_SCHEMAS[SKILL_LOADER_TOOL_NAME])
     schemas.append(TOOL_SCHEMAS[DELEGATE_TOOL_NAME])
     schemas.append(TOOL_SCHEMAS[TASK_COMPLETE_TOOL_NAME])
+    if include_pass_turn:
+        schemas.append(TOOL_SCHEMAS[PASS_TURN_TOOL_NAME])
     return schemas
 
 
@@ -920,6 +1046,42 @@ def _chat_messages_from_log(conversation_id: str, persona: Persona) -> list[dict
         else:
             chat_messages.append({"role": "user", "content": f"{message.actor}: {message.text}"})
     return chat_messages
+
+
+# ---------------------------------------------------------------------------
+# Reply pacing -- UX ask, not in the original scope doc: a plain reply
+# landing the literal instant the model finishes reads as inhumanly fast
+# and leaves no real window for a human to react before the next thing
+# happens (compounded once round-continuation can fire another round right
+# after). Both constants and this whole seam are deliberately separate
+# from `web_adapter/api.py`'s own `_breathing_pause` (the pause BETWEEN
+# continuation rounds) -- this one paces a single reply's own delivery,
+# regardless of whether a round-continuation loop is involved at all.
+# ---------------------------------------------------------------------------
+
+_MIN_REPLY_DELAY_SECONDS = 1.0
+_MAX_REPLY_DELAY_SECONDS = 6.0
+_REPLY_DELAY_CHARS_PER_SECOND = 45
+
+
+def _reply_delay_seconds(text: str) -> float:
+    """Simulated "typing time" before a plain reply is appended/broadcast,
+    roughly scaled to its length (a rough silent-reading-speed proxy for
+    typing, not a claim about real typing speed) with jitter so it doesn't
+    feel metronomic, clamped to a sane range so a one-word reply doesn't
+    feel instant and a long one doesn't feel absurd.
+    """
+    estimated = len(text) / _REPLY_DELAY_CHARS_PER_SECOND
+    jittered = estimated * random.uniform(0.85, 1.15)
+    return max(_MIN_REPLY_DELAY_SECONDS, min(_MAX_REPLY_DELAY_SECONDS, jittered))
+
+
+async def _breathing_pause(seconds: float) -> None:
+    """Isolated seam so tests can monkeypatch this to a no-op instead of
+    actually waiting -- every test that mocks `call_model` for a plain
+    reply would otherwise sleep for real. See `tests/graph/conftest.py`.
+    """
+    await asyncio.sleep(seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -991,9 +1153,19 @@ async def persona_node(state: TapestryGraphState, config: RunnableConfig) -> dic
     # persona she herself isn't in the conversation, so the roster block is
     # omitted entirely rather than shown wrong.
     member_ids, _kind = derive_membership(conversation_id)
-    system_prompt = _build_system_prompt(persona, catalog, member_ids or None)
+    is_continuation_round = bool(state.get("is_continuation_round"))
+    is_proactive_checkin = bool(state.get("is_proactive_checkin"))
+    conversation_context = derive_conversation_context(conversation_id)
+    system_prompt = _build_system_prompt(
+        persona,
+        catalog,
+        member_ids or None,
+        is_continuation_round=is_continuation_round,
+        is_proactive_checkin=is_proactive_checkin,
+        conversation_context=conversation_context,
+    )
     effective_tools = _effective_tools(persona.tools, mode)
-    tool_schemas = _build_tool_schemas(effective_tools)
+    tool_schemas = _build_tool_schemas(effective_tools, include_pass_turn=is_continuation_round)
 
     if starting_new_turn:
         # Every adapter (web/Discord/Telegram) invokes the graph with a
@@ -1013,6 +1185,28 @@ async def persona_node(state: TapestryGraphState, config: RunnableConfig) -> dic
         # `state["messages"]` keeps accumulating in memory exactly as it
         # already correctly does today.
         history = _chat_messages_from_log(conversation_id, persona)
+        if is_proactive_checkin:
+            # A proactive check-in's own history ends with THIS persona's
+            # own last reply (role: "assistant") -- unlike a continuation
+            # round, where a sibling's reply remaps to role: "user" (see
+            # _chat_messages_from_log), a DM has no sibling to remap.
+            # Calling the model on a message list that ends on "assistant"
+            # with nothing after it produced real, live failures for one
+            # model (litellm's EmptyResponseError, 3/3 empty completions) --
+            # this synthetic trailing turn restores a normal, alternating
+            # shape and gives the model an explicit prompt to react to,
+            # reinforcing (not replacing) _proactive_checkin_guidance's own
+            # system-prompt instruction.
+            history = history + [
+                {
+                    "role": "user",
+                    "content": (
+                        "[This conversation has been quiet for a while. "
+                        "Reach out first, unprompted -- see your "
+                        "instructions above for how.]"
+                    ),
+                }
+            ]
     else:
         history = list(state.get("messages", []))
     messages = [{"role": "system", "content": system_prompt}] + history
@@ -1068,11 +1262,23 @@ async def persona_node(state: TapestryGraphState, config: RunnableConfig) -> dic
     if tool_call is None:
         # Plain reply: no tool proposed, no delegation, no completion
         # claim. The turn ends here.
+        await _breathing_pause(_reply_delay_seconds(response.text))
+        message_payload = _with_thread(state, {"text": response.text})
+        if is_proactive_checkin:
+            # Marks this message as an UNANSWERED proactive nudge, not an
+            # ordinary reply -- `web_adapter/api.py`'s
+            # `_proactive_checkin_targets` reads this back to tell "she
+            # already reached out, don't nudge again" apart from "she gave
+            # a normal reply and it's been quiet since, nudge is fine."
+            # Without this distinction, a nudge and a normal reply are
+            # indistinguishable by actor alone, and the loop can never
+            # re-fire after the first ever exchange in a DM.
+            message_payload = {**message_payload, "proactive": True}
         events.append_event(
             conversation_id,
             "assistant/message",
             actor=persona.id,
-            payload=_with_thread(state, {"text": response.text}),
+            payload=message_payload,
         )
         events.append_event(
             conversation_id,
@@ -1097,6 +1303,9 @@ async def persona_node(state: TapestryGraphState, config: RunnableConfig) -> dic
         return _finish(
             await _handle_task_complete(state, persona, turn_id, arguments, new_messages)
         )
+
+    if tool_name == PASS_TURN_TOOL_NAME:
+        return _finish(await _handle_pass_turn(state, persona, turn_id, new_messages))
 
     if tool_name not in TOOL_REGISTRY or (
         tool_name != SKILL_LOADER_TOOL_NAME and tool_name not in effective_tools
@@ -1322,9 +1531,21 @@ async def _handle_task_complete(
         actor=persona.id,
         payload=_with_thread(state, {"task_id": task_id, "notes": result.notes}),
     )
+    # Must be `role: "tool"`, not `"user"` -- `new_messages` (built by the
+    # caller, persona_node) already ends with the assistant's own
+    # tool_calls message for this task_complete call, and every OpenAI-
+    # compatible provider rejects a request where that isn't immediately
+    # followed by a matching tool-role response (see _handle_delegate's own
+    # error-feedback messages just above, same shape). Found live: DeepSeek
+    # 400'd with "insufficient tool messages following tool_calls message"
+    # the moment a companion persona's self-verification failed here.
+    call_id = ""
+    if new_messages and new_messages[-1].get("tool_calls"):
+        call_id = new_messages[-1]["tool_calls"][0].get("id", "")
     feedback = {
-        "role": "user",
-        "content": f"Self-verification failed — this task is not actually complete yet:\n{result.notes}",
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": f"Self-verification failed, this task is not actually complete yet:\n{result.notes}",
     }
     return {
         "messages": new_messages + [feedback],
@@ -1332,6 +1553,31 @@ async def _handle_task_complete(
         "turn_count": turn_count + 1,
         "next_node": "persona",
     }
+
+
+async def _handle_pass_turn(
+    state: TapestryGraphState, persona: Persona, turn_id: str, new_messages: list[dict]
+) -> dict:
+    """`persona/passed` deliberately doesn't end in `/message` (see
+    `core.conversations.derive_messages`'s own type check) -- a pass has
+    nothing for a human to read as a chat bubble, but it still lands in the
+    wider `derive_timeline` projection so a human watching the activity
+    feed can see a persona genuinely chose not to add anything, rather
+    than reading as silence. `turn/end`'s `reason="passed"` is what `web_
+    adapter/api.py`'s `_leg_outcome` reads back to decide this persona
+    drops out of the next continuation round.
+    """
+    conversation_id = state["conversation_id"]
+    events.append_event(
+        conversation_id, "persona/passed", actor=persona.id, payload=_with_thread(state, {})
+    )
+    events.append_event(
+        conversation_id,
+        "turn/end",
+        actor=persona.id,
+        payload={"turn_id": turn_id, "reason": "passed"},
+    )
+    return {"messages": new_messages, "turn_id": turn_id, "next_node": "end"}
 
 
 def _route_from_persona(state: TapestryGraphState) -> str:

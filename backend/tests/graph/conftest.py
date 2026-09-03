@@ -37,6 +37,7 @@ import sqlite3
 import pytest
 
 from tapestry.core import events as events_module
+from tapestry.graph import build
 
 
 @pytest.fixture(autouse=True)
@@ -45,3 +46,19 @@ def db_connection(monkeypatch):
     monkeypatch.setattr(events_module, "get_connection", lambda: conn)
     yield conn
     conn.close()
+
+
+@pytest.fixture(autouse=True)
+def no_reply_breathing_pause(monkeypatch):
+    """`persona_node`'s plain-reply path now sleeps for a few real seconds
+    of simulated "typing time" before landing (see `build._breathing_pause`
+    / `build._reply_delay_seconds`) — a deliberate UX pacing choice, not
+    something any test here should actually have to wait through. Patched
+    to an instant no-op for every test in this package; the delay
+    calculation itself is covered by its own direct unit tests instead.
+    """
+
+    async def _instant(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(build, "_breathing_pause", _instant)

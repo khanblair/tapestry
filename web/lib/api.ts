@@ -60,6 +60,10 @@ export interface Conversation {
   // current mode/model).
   mode: Mode;
   model: string;
+  // Human-set ground rules for this conversation, rendered into every
+  // member's system prompt above their own persona instructions. undefined
+  // when never set.
+  context?: string;
 }
 
 export interface Message {
@@ -335,6 +339,7 @@ export interface ConversationDraft {
   kind: "dm" | "group";
   name?: string;
   personaIds: string[];
+  context?: string;
 }
 
 // Backend mints the id: `dm-{personaId}` for a dm, `grp-{uuid}` for a
@@ -345,6 +350,15 @@ export async function createConversation(draft: ConversationDraft): Promise<Conv
   return request<Conversation>("/api/conversations", {
     method: "POST",
     body: JSON.stringify(draft),
+  });
+}
+
+// Sets or updates a conversation's ground rules after creation — same write
+// either way (backend just appends another conversation/context_set event).
+export async function setConversationContext(conversationId: string, context: string): Promise<void> {
+  await request<void>(`/api/conversations/${encodeURIComponent(conversationId)}/context`, {
+    method: "POST",
+    body: JSON.stringify({ context }),
   });
 }
 

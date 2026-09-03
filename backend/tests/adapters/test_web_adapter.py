@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
 import time
 from unittest.mock import AsyncMock
@@ -72,6 +73,25 @@ def restore_graph_personas():
     yield
     graph_build.PERSONAS.clear()
     graph_build.PERSONAS.update(original)
+
+
+@pytest.fixture(autouse=True)
+def no_breathing_pauses(monkeypatch):
+    """Two separate real-time pauses were added for UX pacing -- a plain
+    reply's own "typing time" (`graph.build._breathing_pause`) and the gap
+    BETWEEN autonomous continuation rounds (`api._breathing_pause`). Both
+    are patched to instant no-ops here so this file's end-to-end tests
+    (which poll on a short, real wall-clock budget) aren't sensitive to
+    them; `test_web_adapter.py`'s own dedicated tests below cover the
+    pauses' actual behavior by inspecting timing/call order directly
+    rather than waiting through the real delay.
+    """
+
+    async def _instant(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(graph_build, "_breathing_pause", _instant)
+    monkeypatch.setattr(api, "_breathing_pause", _instant)
 
 
 @pytest.fixture
@@ -276,7 +296,7 @@ def test_get_personas_returns_the_real_yaml_backed_roster(client, personas_dir):
     assert res.status_code == 200
     body = res.json()
     ids = {p["id"] for p in body}
-    assert ids == {"ada", "rex", "vex", "nova"}
+    assert ids == {"ada", "rex", "vex", "nova", "sage", "kai"}
     ada = next(p for p in body if p["id"] == "ada")
     # camelCase on the wire; systemPrompt/mcp are the real field names,
     # not systemPrompt/mcpServers.
@@ -380,6 +400,53 @@ def test_create_group_conversation(client):
 def test_create_conversation_rejects_unknown_persona(client):
     res = client.post("/api/conversations", json={"kind": "dm", "personaIds": ["ghost"]})
     assert res.status_code == 422
+
+
+def test_create_conversation_with_context_set_upfront(client):
+    res = client.post(
+        "/api/conversations",
+        json={
+            "kind": "group",
+            "name": "#hangout",
+            "personaIds": ["ada", "rex"],
+            "context": "Casual hangout only, no work talk.",
+        },
+    )
+    assert res.status_code == 201
+    assert res.json()["context"] == "Casual hangout only, no work talk."
+
+
+def test_create_conversation_without_context_leaves_it_none(client):
+    res = client.post("/api/conversations", json={"kind": "dm", "personaIds": ["rex"]})
+    assert res.json()["context"] is None
+
+
+def test_set_conversation_context_after_creation(client):
+    client.post("/api/conversations", json={"kind": "dm", "personaIds": ["rex"]})
+
+    res = client.post("/api/conversations/dm-rex/context", json={"context": "Keep it brief."})
+    assert res.status_code == 204
+
+    listed = client.get("/api/conversations").json()
+    conv = next(c for c in listed if c["id"] == "dm-rex")
+    assert conv["context"] == "Keep it brief."
+
+
+def test_set_conversation_context_can_be_updated(client):
+    client.post("/api/conversations", json={"kind": "dm", "personaIds": ["rex"]})
+    client.post("/api/conversations/dm-rex/context", json={"context": "First rule."})
+
+    res = client.post("/api/conversations/dm-rex/context", json={"context": "Updated rule."})
+    assert res.status_code == 204
+
+    listed = client.get("/api/conversations").json()
+    conv = next(c for c in listed if c["id"] == "dm-rex")
+    assert conv["context"] == "Updated rule."
+
+
+def test_set_conversation_context_404s_for_unknown_non_dm_conversation(client):
+    res = client.post("/api/conversations/grp-does-not-exist/context", json={"context": "x"})
+    assert res.status_code == 404
 
 
 def test_get_messages_lazily_vivifies_a_dm_conversation_by_id_convention(client):
@@ -587,7 +654,7 @@ def test_second_message_rejected_while_first_turn_still_running(client, monkeypa
     hang.set()  # let the background task unwind before the DB closes
 
 
-def test_a_crashed_turn_self_heals_instead_of_wedging_the_conversation(client, monkeypatch):
+def test_a_crashed_turn_self_heals_instead_of_wedging_the_conversation(client, monkeypatch, caplog):
     """Found via real browser testing (not in the original scope doc): a
     turn that raises inside `graph.astream` (a bad provider API key here,
     but any unhandled exception behaves the same) left its own `turn/start`
@@ -605,22 +672,34 @@ def test_a_crashed_turn_self_heals_instead_of_wedging_the_conversation(client, m
     monkeypatch.setattr(graph_build, "call_model", boom)
 
     conversation_id = "dm-rex"
-    first = client.post(
-        f"/api/conversations/{conversation_id}/messages", json={"text": "first"}
-    )
-    assert first.status_code == 201
+    with caplog.at_level(logging.ERROR, logger="tapestry.web_adapter"):
+        first = client.post(
+            f"/api/conversations/{conversation_id}/messages", json={"text": "first"}
+        )
+        assert first.status_code == 201
 
-    import time
+        import time
 
-    for _ in range(50):
-        logged = events_module.read_events(conversation_id)
-        if any(e.type == "turn/end" for e in logged):
-            break
-        time.sleep(0.05)
+        for _ in range(50):
+            logged = events_module.read_events(conversation_id)
+            if any(e.type == "turn/end" for e in logged):
+                break
+            time.sleep(0.05)
 
     turn_ends = [e for e in logged if e.type == "turn/end"]
     assert len(turn_ends) == 1
     assert turn_ends[0].payload["reason"] == events_module.TURN_ERROR_REASON
+
+    # Found via live testing: a turn/error was only ever broadcast over WS
+    # (unreachable after the fact) -- the actual exception must land in the
+    # durable process log too, or a real failure is undiagnosable once the
+    # live client disconnects.
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("turn failed" in r.message for r in error_records)
+    assert any(
+        "simulated provider failure" in r.exc_text if r.exc_text else False
+        for r in error_records
+    )
 
     # Without the fix, this second send 409s ("turn in progress") forever --
     # the crashed turn's own `turn/start` was never matched, so
@@ -1483,7 +1562,19 @@ def test_tag_all_fanout_legs_run_one_at_a_time_so_later_personas_see_earlier_rep
     call_order: list[str] = []
     captured_messages: dict[str, list[dict]] = {}
 
+    def _is_continuation_round(tools) -> bool:
+        # Round-continuation now follows round 1 automatically (see
+        # `api._run_continuation_session`); `pass_turn` is only ever
+        # offered starting round 2 (`build._build_tool_schemas`'s
+        # `include_pass_turn`). Both personas below pass as soon as it's
+        # offered, so this test's own concern -- round 1's ordering -- is
+        # observed in isolation rather than racing 10 rounds of noise.
+        names = {t["function"]["name"] for t in (tools or [])}
+        return graph_build.PASS_TURN_TOOL_NAME in names
+
     async def smart_call_model(model, messages, tools=None, **kwargs):
+        if _is_continuation_round(tools):
+            return _tool_call_response("", graph_build.PASS_TURN_TOOL_NAME, {})
         call_order.append(model)
         captured_messages[model] = messages
         if model == "openrouter/meta-llama/llama-3.3-70b-instruct":  # ada
@@ -1527,6 +1618,304 @@ def test_tag_all_fanout_legs_run_one_at_a_time_so_later_personas_see_earlier_rep
     assert "Ada says hi first." in rex_history_text, (
         "rex's own prompt must include ada's already-written reply from this same round"
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-continuation: the group keeps talking on its own after round 1,
+# gated by pass_turn, a per-round pause, a new-human-message check, and
+# MAX_CONTINUATION_ROUNDS. See api._run_continuation_session.
+# ---------------------------------------------------------------------------
+
+
+def test_round_continuation_only_reinvites_personas_who_actually_replied(client, monkeypatch):
+    conversation_id = _make_group(client, ["ada", "rex"])
+    call_counts: dict[str, int] = {}
+
+    async def smart_call_model(model, messages, tools=None, **kwargs):
+        call_counts[model] = call_counts.get(model, 0) + 1
+        n = call_counts[model]
+        if model == "openrouter/meta-llama/llama-3.3-70b-instruct":  # ada
+            if n == 1:
+                return _plain_response("Ada round 1.")
+            return _tool_call_response("", "pass_turn", {})  # passes starting round 2
+        if model == "deepseek/deepseek-chat":  # rex
+            if n <= 2:
+                return _plain_response(f"Rex round {n}.")
+            return _tool_call_response("", "pass_turn", {})  # passes starting round 3
+        raise AssertionError(f"unexpected model {model!r}")
+
+    monkeypatch.setattr(graph_build, "call_model", smart_call_model)
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "@all let's talk"}
+    )
+    assert res.status_code == 201
+
+    for _ in range(100):
+        logged = events_module.read_events(conversation_id)
+        if sum(1 for e in logged if e.type == "persona/passed") >= 2:
+            break
+        time.sleep(0.05)
+
+    logged = events_module.read_events(conversation_id)
+    passed_actors = [e.actor for e in logged if e.type == "persona/passed"]
+    assert passed_actors == ["ada", "rex"], "ada passes in round 2, rex passes (only) in round 3"
+
+    ada_msgs = [e for e in logged if e.type == "assistant/message" and e.actor == "ada"]
+    rex_msgs = [e for e in logged if e.type == "assistant/message" and e.actor == "rex"]
+    assert len(ada_msgs) == 1, "ada must not be reinvited after passing in round 2"
+    assert len(rex_msgs) == 2, "rex keeps replying through round 2, then passes in round 3"
+
+    thread_ids = {e.payload.get("graph_thread_id") for e in logged if e.type == "turn/start"}
+    assert any(t and t.endswith("::r3") for t in thread_ids), "round 3 must have run (for rex)"
+    assert not any(t and t.endswith("::r4") for t in thread_ids), (
+        "round 4 must never start once everyone has passed"
+    )
+
+
+def test_round_continuation_stops_at_the_ten_round_cap(client, monkeypatch):
+    conversation_id = _make_group(client, ["ada"])
+    call_count = 0
+
+    async def always_replies(model, messages, tools=None, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return _plain_response(f"Ada round {call_count}.")
+
+    monkeypatch.setattr(graph_build, "call_model", always_replies)
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "@all keep going forever"}
+    )
+    assert res.status_code == 201
+
+    for _ in range(300):
+        logged = events_module.read_events(conversation_id)
+        if sum(1 for e in logged if e.type == "assistant/message") >= api.MAX_CONTINUATION_ROUNDS:
+            break
+        time.sleep(0.05)
+
+    # A round-11 leg, if the cap were broken, would need one more real
+    # round-trip through this same fast, all-mocked path -- give it a
+    # moment it doesn't need if the cap actually holds.
+    time.sleep(0.3)
+
+    logged = events_module.read_events(conversation_id)
+    ada_msgs = sum(1 for e in logged if e.type == "assistant/message" and e.actor == "ada")
+    assert ada_msgs == api.MAX_CONTINUATION_ROUNDS, (
+        "a persona that never passes must still be capped at MAX_CONTINUATION_ROUNDS replies"
+    )
+    thread_ids = {e.payload.get("graph_thread_id") for e in logged if e.type == "turn/start"}
+    assert any(t and t.endswith(f"::r{api.MAX_CONTINUATION_ROUNDS}") for t in thread_ids)
+    assert not any(t and t.endswith(f"::r{api.MAX_CONTINUATION_ROUNDS + 1}") for t in thread_ids)
+
+
+def test_a_new_human_message_stops_the_autonomous_continuation(client, monkeypatch):
+    conversation_id = _make_group(client, ["ada"])
+
+    async def always_replies(model, messages, tools=None, **kwargs):
+        return _plain_response("Ada keeps talking.")
+
+    monkeypatch.setattr(graph_build, "call_model", always_replies)
+
+    # A real (but short) pause between rounds -- long enough to reliably
+    # land a genuine POST in the gap between round 1 finishing and round
+    # 2's own re-check of the latest human message, short enough to keep
+    # this test fast. Overrides this file's own autouse no-op patch.
+    async def short_real_pause(seconds: float) -> None:
+        await asyncio.sleep(0.5)
+
+    monkeypatch.setattr(api, "_breathing_pause", short_real_pause)
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "@all keep it going"}
+    )
+    assert res.status_code == 201
+
+    for _ in range(100):
+        logged = events_module.read_events(conversation_id)
+        if any(e.type == "assistant/message" for e in logged):
+            break
+        time.sleep(0.05)
+    assert any(
+        e.type == "assistant/message" for e in events_module.read_events(conversation_id)
+    ), "round 1 must have completed before this test's own follow-up message"
+
+    follow_up = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "actually never mind"}
+    )
+    assert follow_up.status_code == 201
+
+    time.sleep(1.0)  # a real chance for a (should-be-stopped) round 2 to have started
+
+    logged = events_module.read_events(conversation_id)
+    thread_ids = {e.payload.get("graph_thread_id") for e in logged if e.type == "turn/start"}
+    assert not any(t and "::r2" in t for t in thread_ids), (
+        "a genuinely new human message must stop the autonomous continuation before round 2"
+    )
+
+
+def test_stop_cancels_the_whole_continuation_session_not_just_one_leg(client, monkeypatch):
+    conversation_id = _make_group(client, ["ada", "rex"])
+
+    async def always_replies(model, messages, tools=None, **kwargs):
+        name = "Ada" if "llama" in model else "Rex"
+        return _plain_response(f"{name} keeps talking.")
+
+    monkeypatch.setattr(graph_build, "call_model", always_replies)
+
+    async def short_real_pause(seconds: float) -> None:
+        await asyncio.sleep(0.5)
+
+    monkeypatch.setattr(api, "_breathing_pause", short_real_pause)
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "@all keep it going"}
+    )
+    assert res.status_code == 201
+
+    for _ in range(100):
+        logged = events_module.read_events(conversation_id)
+        if sum(1 for e in logged if e.type == "assistant/message") >= 2:
+            break
+        time.sleep(0.05)
+    assert (
+        sum(1 for e in events_module.read_events(conversation_id) if e.type == "assistant/message")
+        >= 2
+    ), "round 1 must have completed (both personas) before this test stops the session"
+
+    # We're now inside the pause between round 1 and round 2.
+    stop_res = client.post(f"/api/conversations/{conversation_id}/stop")
+    assert stop_res.status_code == 204
+
+    time.sleep(1.0)  # a real chance for a (should-be-cancelled) round 2 to have started
+
+    logged = events_module.read_events(conversation_id)
+    thread_ids = {e.payload.get("graph_thread_id") for e in logged if e.type == "turn/start"}
+    assert not any(t and "::r2" in t for t in thread_ids), (
+        "Stop must cancel the whole continuation session, not just let round 2 fire anyway"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Proactive check-in eligibility (api._proactive_checkin_targets) -- pure
+# decision logic, deliberately tested without spawning a real graph turn.
+# `idle_threshold=0`/a very large number is used instead of backdating
+# event timestamps or waiting real time -- events.append_event always
+# stamps "now", so controlling the threshold is the only lever available.
+# ---------------------------------------------------------------------------
+
+
+def test_proactive_checkin_targets_a_dm_idle_since_the_humans_last_message(client, personas_dir):
+    conversation_id = "dm-sage"
+    api._create_conversation(conversation_id, kind="dm", name=None, persona_ids=["sage"])
+    events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "hey"})
+
+    targets = api._proactive_checkin_targets(turns_in_flight=set(), idle_threshold=0)
+
+    assert (conversation_id, "sage") in targets
+
+
+def test_proactive_checkin_skips_a_dm_with_no_messages_yet(client, personas_dir):
+    # _lazy_vivify_dm creates the conversations ROW the instant the route
+    # is merely opened -- an empty DM is not a relationship to check in on.
+    conversation_id = "dm-sage"
+    api._create_conversation(conversation_id, kind="dm", name=None, persona_ids=["sage"])
+
+    targets = api._proactive_checkin_targets(turns_in_flight=set(), idle_threshold=0)
+
+    assert targets == []
+
+
+def test_proactive_checkin_skips_a_dm_already_nudged_and_awaiting_reply(client, personas_dir):
+    conversation_id = "dm-sage"
+    api._create_conversation(conversation_id, kind="dm", name=None, persona_ids=["sage"])
+    events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "hey"})
+    # payload["proactive"]=True is exactly what graph.build.persona_node's
+    # plain-reply branch stamps on the message a nudge itself produces --
+    # this is the ONLY thing that distinguishes an unanswered nudge from
+    # an ordinary reactive reply (see test right below this one).
+    events_module.append_event(
+        conversation_id,
+        "assistant/message",
+        actor="sage",
+        payload={"text": "hi, thinking of you", "proactive": True},
+    )
+
+    targets = api._proactive_checkin_targets(turns_in_flight=set(), idle_threshold=0)
+
+    assert targets == [], "sage already reached out and hasn't heard back -- must not nudge again"
+
+
+def test_proactive_checkin_fires_again_after_an_ordinary_reply_goes_quiet(client, personas_dir):
+    """The bug this guards against, caught live: every human message is
+    always answered immediately, so gating on "the human spoke last"
+    would mean this could basically never re-fire after the very first
+    exchange in a DM -- the persona's own ORDINARY reply (no `proactive`
+    marker) becomes the most recent message within seconds, long before
+    any idle threshold could ever be crossed with the human's message
+    still "last." A normal reply must be a valid launchpad for a LATER
+    nudge, once the conversation has actually gone quiet since it.
+    """
+    conversation_id = "dm-sage"
+    api._create_conversation(conversation_id, kind="dm", name=None, persona_ids=["sage"])
+    events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "hey"})
+    events_module.append_event(
+        conversation_id, "assistant/message", actor="sage", payload={"text": "hey! how's it going?"}
+    )
+
+    targets = api._proactive_checkin_targets(turns_in_flight=set(), idle_threshold=0)
+
+    assert (conversation_id, "sage") in targets
+
+
+def test_proactive_checkin_respects_the_idle_threshold(client, personas_dir):
+    conversation_id = "dm-sage"
+    api._create_conversation(conversation_id, kind="dm", name=None, persona_ids=["sage"])
+    events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "hey"})
+
+    targets = api._proactive_checkin_targets(turns_in_flight=set(), idle_threshold=999_999)
+
+    assert targets == [], "a message sent moments ago must not satisfy a huge idle threshold"
+
+
+def test_proactive_checkin_ignores_a_non_proactive_persona(client, personas_dir):
+    # kai.yaml ships proactive: false (the default) -- a non-dev persona is
+    # not automatically a check-in persona.
+    conversation_id = "dm-kai"
+    api._create_conversation(conversation_id, kind="dm", name=None, persona_ids=["kai"])
+    events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "hey"})
+
+    targets = api._proactive_checkin_targets(turns_in_flight=set(), idle_threshold=0)
+
+    assert targets == []
+
+
+def test_proactive_checkin_ignores_a_group_even_with_a_proactive_member(client, personas_dir):
+    conversation_id = "grp-sage-team"
+    api._create_conversation(
+        conversation_id, kind="group", name="#sage-team", persona_ids=["sage", "ada"]
+    )
+    events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "hey"})
+
+    targets = api._proactive_checkin_targets(turns_in_flight=set(), idle_threshold=0)
+
+    assert targets == [], (
+        "proactive is scoped to DMs only -- a group member's own flag has no per-conversation "
+        "opt-out, so treating groups the same would nudge every group she's ever added to"
+    )
+
+
+def test_proactive_checkin_skips_a_conversation_with_a_turn_already_in_flight(client, personas_dir):
+    conversation_id = "dm-sage"
+    api._create_conversation(conversation_id, kind="dm", name=None, persona_ids=["sage"])
+    events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "hey"})
+
+    targets = api._proactive_checkin_targets(
+        turns_in_flight={conversation_id}, idle_threshold=0
+    )
+
+    assert targets == []
 
 
 # ---------------------------------------------------------------------------

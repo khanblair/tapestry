@@ -160,7 +160,9 @@ Endpoint list
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import random
 import re
 import sqlite3
 import uuid
@@ -178,6 +180,7 @@ from pydantic.alias_generators import to_camel
 
 from tapestry.core import events
 from tapestry.core.ask import AskAnswer
+from tapestry.core.conversations import derive_conversation_context, derive_membership
 from tapestry.core.personas import Mode as PersonaMode
 from tapestry.core.personas import Persona, load_personas, save_persona
 from tapestry.graph import build as graph_build
@@ -185,6 +188,8 @@ from tapestry.storage.db import get_connection
 from tapestry.tools.mcp_client import MetaMCPClient, MetaMCPConfigurationError
 
 __all__ = ["create_app", "start"]
+
+logger = logging.getLogger("tapestry.web_adapter")
 
 # ---------------------------------------------------------------------------
 # Repo-root-anchored paths + env-var configuration. Mirrors graph/build.py's
@@ -246,6 +251,9 @@ class PersonaOut(CamelModel):
     default_mode: str = "manual"
     max_turns: int | None = None
     max_delegation_depth: int | None = None
+    # web_adapter's proactive check-in loop -- see core.personas.Persona's
+    # own field comment.
+    proactive: bool = False
 
 
 class PersonaDraftIn(CamelModel):
@@ -271,6 +279,7 @@ class PersonaDraftIn(CamelModel):
     default_mode: PersonaMode | None = None
     max_turns: int | None = None
     max_delegation_depth: int | None = None
+    proactive: bool | None = None
 
 
 class PersonaUpdateIn(CamelModel):
@@ -298,6 +307,7 @@ class PersonaUpdateIn(CamelModel):
     default_mode: PersonaMode | None = None
     max_turns: int | None = None
     max_delegation_depth: int | None = None
+    proactive: bool | None = None
 
 
 class ConversationOut(CamelModel):
@@ -312,12 +322,27 @@ class ConversationOut(CamelModel):
     # _conversation_row_to_out for how these are resolved.
     mode: str
     model: str
+    # Human-set ground rules for this conversation, rendered into every
+    # member's system prompt above their own persona instructions (see
+    # graph/build.py's _conversation_context_guidance). None when never set.
+    context: str | None = None
 
 
 class ConversationCreateIn(CamelModel):
     kind: Literal["dm", "group"]
     name: str | None = None
     persona_ids: list[str] = Field(default_factory=list)
+    context: str | None = None
+
+
+class ConversationContextIn(CamelModel):
+    """`POST /api/conversations/{id}/context` body -- sets or updates a
+    conversation's ground rules. Same write for "set" and "edit": each call
+    just appends another `conversation/context_set` event, and
+    `derive_conversation_context` resolves to the most recent one.
+    """
+
+    context: str
 
 
 class ModeChangeIn(CamelModel):
@@ -598,6 +623,7 @@ def _persona_to_out(
         default_mode=persona.default_mode,
         max_turns=persona.max_turns,
         max_delegation_depth=persona.max_delegation_depth,
+        proactive=persona.proactive,
     )
 
 
@@ -670,7 +696,11 @@ def _insert_conversation_row(conversation_id: str, kind: str, name: str | None) 
 
 
 def _create_conversation(
-    conversation_id: str, kind: str, name: str | None, persona_ids: list[str]
+    conversation_id: str,
+    kind: str,
+    name: str | None,
+    persona_ids: list[str],
+    context: str | None = None,
 ) -> sqlite3.Row:
     row = _insert_conversation_row(conversation_id, kind, name)
     events.append_event(
@@ -679,6 +709,10 @@ def _create_conversation(
         actor="system",
         payload={"kind": kind, "name": name, "persona_ids": list(persona_ids)},
     )
+    if context:
+        events.append_event(
+            conversation_id, "conversation/context_set", actor="you", payload={"context": context}
+        )
     return row
 
 
@@ -742,6 +776,7 @@ def _conversation_row_to_out(row: sqlite3.Row) -> ConversationOut:
         updated_at=last_timestamp or row["created_at"],
         mode=mode,
         model=model,
+        context=derive_conversation_context(row["id"]),
     )
 
 
@@ -1321,6 +1356,15 @@ async def _drive_turn(
         # and this is the only other place that turn's failure is
         # guaranteed to pass through.
         app.state.running_activity.pop(thread_id, None)
+        # Durable, so a turn failure can actually be diagnosed after the
+        # fact: the WS broadcast below only reaches a client connected at
+        # this exact instant, and str(exc) in that payload is often just
+        # the top-line message with no traceback. logger.exception here
+        # captures the full traceback in the process log, keyed by
+        # conversation/thread, regardless of who's watching.
+        logger.exception(
+            "turn failed on conversation=%s thread=%s", conversation_id, thread_id
+        )
         # Found via real browser testing: a turn that raises here (a bad
         # provider API key, an outage, an unhandled tool error) otherwise
         # leaves its own `turn/start` open forever -- the actor stays
@@ -1366,9 +1410,8 @@ def _spawn_turn(
     conversation_id: str,
     graph_input: Any,
     graph_thread_id: str | None = None,
-    concurrency_gate: asyncio.Semaphore | None = None,
     persona_id: str | None = None,
-) -> None:
+) -> asyncio.Task:
     """Fire-and-forget `_drive_turn`, tracked in `app.state.background_tasks`
     so `create_app`'s lifespan shutdown can cancel and await it instead of
     abandoning it mid-flight. Not just tidiness: an untracked task left
@@ -1382,7 +1425,7 @@ def _spawn_turn(
 
     Also where the target thread is marked in `app.state.turns_in_flight`
     (see `_reject_if_turn_in_progress`) — every path that starts or resumes
-    a turn (`send_message`, `_resume_with_answer`, the fan-out spawner)
+    a turn (`send_message`, `_resume_with_answer`, the fan-out orchestrator)
     goes through here, so marking it once in this shared spot covers all
     of them rather than repeating it at each caller. Marked by
     `graph_thread_id` (defaulting to `conversation_id`, exactly today's
@@ -1393,21 +1436,18 @@ def _spawn_turn(
     `finally` on every exit path (natural end, paused at an interrupt, or
     a raised exception).
 
-    `concurrency_gate`, when given (the fan-out spawner's own bounded
-    semaphore — spec §2.5), is acquired around the actual `_drive_turn`
-    call, not before marking `turns_in_flight` — a leg queued behind the
-    concurrency cap still shows as busy immediately, which is accurate
-    (it HAS been asked, and IS working through the queue), not idle.
+    Returns the created `asyncio.Task` — `_run_fanout_round` (see below)
+    awaits it directly to sequence fan-out legs one at a time, since that's
+    also exactly the signal it needs to know a leg is done before deciding
+    whether to invite it back for another round. Ordinary callers
+    (`send_message`'s plain path, `_resume_with_answer`) simply ignore the
+    return value, same as before this became non-`None`.
     """
     thread_id = graph_thread_id or conversation_id
     app.state.turns_in_flight.add(thread_id)
 
     async def _run() -> None:
-        if concurrency_gate is None:
-            await _drive_turn(app, conversation_id, graph_input, thread_id, persona_id)
-        else:
-            async with concurrency_gate:
-                await _drive_turn(app, conversation_id, graph_input, thread_id, persona_id)
+        await _drive_turn(app, conversation_id, graph_input, thread_id, persona_id)
 
     task = asyncio.create_task(_run())
     app.state.background_tasks.add(task)
@@ -1418,42 +1458,322 @@ def _spawn_turn(
     # for this thread_id is the one a stop request should target.
     app.state.turn_tasks[thread_id] = task
     task.add_done_callback(lambda t: app.state.turn_tasks.pop(thread_id, None) if app.state.turn_tasks.get(thread_id) is t else None)
+    return task
+
+
+# A tag-all continuation session (round 1's mandatory replies, plus
+# however many autonomous follow-up rounds happen on their own) never runs
+# forever unattended — this is the same "10-round cap" already discussed
+# and confirmed for this feature.
+MAX_CONTINUATION_ROUNDS = 10
+
+# Pause BETWEEN continuation rounds (never within round 1, which stays the
+# immediate, mandatory reply to being tagged) — see `_breathing_pause`'s
+# own docstring for why this exists and how it's distinct from `graph.
+# build`'s own per-reply pacing delay.
+_MIN_CONTINUATION_PAUSE_SECONDS = 3.0
+_MAX_CONTINUATION_PAUSE_SECONDS = 8.0
+
+
+async def _breathing_pause(seconds: float) -> None:
+    """Isolated seam so tests can monkeypatch this to a no-op — same
+    reasoning as `graph.build._breathing_pause`, just for the pause
+    BETWEEN continuation rounds rather than before one reply lands. UX
+    ask: without a real gap here, round 2 could start the instant round 1
+    ends, leaving a human essentially no window to type a follow-up before
+    the group is already back-and-forth with itself again.
+    """
+    await asyncio.sleep(seconds)
+
+
+def _leg_outcome(conversation_id: str, graph_thread_id: str) -> str | None:
+    """The final `turn/end` reason recorded for the turn that ran on
+    `graph_thread_id`, or `None` if that turn hasn't closed yet (still
+    paused on an approval interrupt) or never started. Every event a
+    single logical turn appends — including a tool-call loop or a
+    delegation hand-off — shares the SAME `turn_id`, so matching this
+    thread's own `turn/start` id against `turn/end`'s `turn_id` field is
+    exact regardless of how many internal steps happened in between.
+    """
+    turn_id = None
+    for event in events.read_events(conversation_id):
+        if turn_id is None:
+            if event.type == "turn/start" and event.payload.get("graph_thread_id") == graph_thread_id:
+                turn_id = event.id
+        elif event.type == "turn/end" and event.payload.get("turn_id") == turn_id:
+            return event.payload.get("reason")
+    return None
+
+
+def _latest_user_message_id(conversation_id: str) -> str | None:
+    """The most recent `user/message` event's id — used to detect a
+    genuinely NEW message from the human arriving mid-continuation-loop, so
+    the autonomous rounds get out of the way instead of racing whatever
+    now needs to respond to that new message.
+    """
+    latest = None
+    for event in events.read_events(conversation_id):
+        if event.type == "user/message":
+            latest = event.id
+    return latest
+
+
+async def _run_fanout_round(
+    app: FastAPI,
+    conversation_id: str,
+    persona_ids: list[str],
+    trigger_message_id: str,
+    round_num: int,
+) -> list[str]:
+    """Run one round's legs strictly one at a time, in `persona_ids` order
+    — each leg is fully awaited before the next one is even spawned, so
+    its `graph.build._chat_messages_from_log` read (rebuilt from the WHOLE
+    conversation's event log on every new turn) actually includes every
+    earlier leg's reply from this same round. This is the same ordering
+    fix as before, just expressed as a plain sequential loop over
+    `_spawn_turn`'s own returned task instead of a shared semaphore — one
+    leg running at a time falls out for free from awaiting each task
+    before starting the next, with no separate concurrency primitive
+    needed.
+
+    `round_num == 1` is always the mandatory, immediate reply to being
+    tagged — every other round is an autonomous continuation
+    (`is_continuation_round=True`), which is also the only round `pass_
+    turn` is ever offered on.
+
+    Returns the persona_ids that gave a genuine reply ("assistant_reply")
+    this round — the only outcome eligible for another round. A pass, a
+    pause on an approval interrupt, or a raised exception all drop a
+    persona out of the autonomous continuation (a paused leg still
+    resolves completely normally through the human's own answer via
+    `_resume_with_answer`, entirely independent of this loop; an errored
+    leg already self-heals its own turn via `_drive_turn`'s own `except
+    Exception` branch — this just also declines to keep retrying it every
+    round).
+    """
+    replied: list[str] = []
+    is_continuation_round = round_num > 1
+    for persona_id in persona_ids:
+        suffix = "" if round_num == 1 else f"::r{round_num}"
+        graph_thread_id = f"{conversation_id}::mention::{persona_id}::{trigger_message_id}{suffix}"
+        state = graph_build.new_state(
+            conversation_id, persona_id, is_continuation_round=is_continuation_round
+        )
+        task = _spawn_turn(app, conversation_id, state, graph_thread_id, persona_id)
+        try:
+            await task
+        except asyncio.CancelledError:
+            # A human's Stop — propagate all the way out so the WHOLE
+            # session ends here, not just this one leg (see
+            # `_run_continuation_session`).
+            raise
+        except Exception:
+            # Already self-healed and surfaced (turn/error) by _drive_turn
+            # itself; don't let one broken leg abort the rest of the round.
+            continue
+        if _leg_outcome(conversation_id, graph_thread_id) == "assistant_reply":
+            replied.append(persona_id)
+    return replied
+
+
+async def _run_continuation_session(
+    app: FastAPI, conversation_id: str, persona_ids: list[str], trigger_message_id: str
+) -> None:
+    """Round 1 is the mandatory, unchanged reply to every tagged persona.
+    Once it finishes, the group keeps talking on its own: each further
+    round only re-invites personas who actually replied last round (see
+    `_run_fanout_round`), paced by `_breathing_pause` between rounds, until
+    every remaining persona has dropped out, a genuinely new human message
+    arrives (`_latest_user_message_id`), or `MAX_CONTINUATION_ROUNDS` is
+    hit. A human's Stop cancels whichever leg is actively running; that
+    propagates out of `_run_fanout_round` as `CancelledError` and ends the
+    whole session right here — not just that one leg — and cancelling
+    THIS task directly (see `stop_conversation`'s own `app.state.
+    continuation_tasks` check) does the same even while sitting in the
+    inter-round `_breathing_pause`, since asyncio propagates a task's own
+    cancellation into whatever it's currently awaiting.
+    """
+    try:
+        active = await _run_fanout_round(
+            app, conversation_id, persona_ids, trigger_message_id, round_num=1
+        )
+    except asyncio.CancelledError:
+        return
+
+    baseline_message_id = _latest_user_message_id(conversation_id)
+    round_num = 2
+    while active and round_num <= MAX_CONTINUATION_ROUNDS:
+        if _latest_user_message_id(conversation_id) != baseline_message_id:
+            return
+        await _breathing_pause(
+            random.uniform(_MIN_CONTINUATION_PAUSE_SECONDS, _MAX_CONTINUATION_PAUSE_SECONDS)
+        )
+        if _latest_user_message_id(conversation_id) != baseline_message_id:
+            return
+        try:
+            active = await _run_fanout_round(
+                app, conversation_id, active, trigger_message_id, round_num=round_num
+            )
+        except asyncio.CancelledError:
+            return
+        round_num += 1
 
 
 def _spawn_fanout_turns(
     app: FastAPI, conversation_id: str, persona_ids: list[str], trigger_message_id: str
 ) -> None:
-    """Spawn one independent tag-all fan-out leg per persona in
-    `persona_ids`, gated one-at-a-time within THIS round via a
-    `Semaphore(1)` — each still gets its own fresh, single-use LangGraph
-    thread (`f"{conversation_id}::mention::{persona_id}::{trigger_message_id}"`)
-    and never touches the conversation's own main thread at all, but only
-    one leg's `_drive_turn` call runs at a time.
+    """Kick off a whole tag-all session — round 1's mandatory replies, plus
+    however many autonomous continuation rounds follow — as one tracked
+    background task. See `_run_continuation_session` for the actual loop.
 
-    This is a visibility fix, not a resource-throttling one (an earlier
-    version of this ran all legs fully concurrently via a larger
-    semaphore). `graph.persona_node`'s message history is rebuilt fresh
-    from the WHOLE conversation's event log on every new turn
-    (`_chat_messages_from_log`, not scoped to one persona's own thread) —
-    so a persona already sees a sibling's reply once it's actually in the
-    log. The bug was purely timing: with every leg starting at once,
-    nobody had written anything yet by the time any of them read history,
-    so a 3-persona `@all` read as three parallel monologues rather than a
-    conversation. Serializing which leg gets to READ+GENERATE at a time
-    fixes that outright, with no change needed to history assembly.
-
-    Still non-blocking on an approval pause, exactly as before: `_drive_
-    turn` returns — releasing the semaphore — the moment a leg either
-    finishes replying OR pauses at an interrupt (see its own try/except/
-    finally). A leg waiting on a human's approval answer never holds the
-    gate open; the NEXT leg starts as soon as the paused one stops
-    actively generating, not once it's actually approved.
+    Tracked in both `app.state.background_tasks` (so lifespan shutdown can
+    cancel and await it, same as every other background turn) and the
+    conversation-keyed `app.state.continuation_tasks` (so `stop_
+    conversation` can cancel the whole session directly, including while
+    it's paused between rounds with no leg actively "in flight" for `find_
+    open_turns` to catch).
     """
-    semaphore = asyncio.Semaphore(1)
-    for persona_id in persona_ids:
-        graph_thread_id = f"{conversation_id}::mention::{persona_id}::{trigger_message_id}"
-        state = graph_build.new_state(conversation_id, persona_id)
-        _spawn_turn(app, conversation_id, state, graph_thread_id, semaphore, persona_id)
+    task = asyncio.create_task(
+        _run_continuation_session(app, conversation_id, persona_ids, trigger_message_id)
+    )
+    app.state.background_tasks.add(task)
+    task.add_done_callback(app.state.background_tasks.discard)
+    app.state.continuation_tasks[conversation_id] = task
+    task.add_done_callback(
+        lambda t: app.state.continuation_tasks.pop(conversation_id, None)
+        if app.state.continuation_tasks.get(conversation_id) is t
+        else None
+    )
+
+
+# ---------------------------------------------------------------------------
+# Proactive check-in loop -- a `proactive` persona (core.personas.Persona)
+# messaging a human FIRST in a DM, unprompted, once that DM has sat idle
+# since the human's own last message. Dev-scale defaults (a background loop
+# scanning every conversation each tick) match this project's current
+# single-process/sqlite scale; not something to run unmodified against a
+# large multi-tenant deployment.
+# ---------------------------------------------------------------------------
+
+_PROACTIVE_CHECK_INTERVAL_ENV_VAR = "TAPESTRY_PROACTIVE_CHECK_INTERVAL_SECONDS"
+_PROACTIVE_IDLE_ENV_VAR = "TAPESTRY_PROACTIVE_IDLE_SECONDS"
+# Small dev defaults so the loop is actually observable within one test
+# session -- a real deployment should raise TAPESTRY_PROACTIVE_IDLE_SECONDS
+# to something like a few hours; checking in every 60 idle-seconds reads as
+# unhinged outside of testing the mechanism itself.
+_DEFAULT_PROACTIVE_CHECK_INTERVAL_SECONDS = 15.0
+_DEFAULT_PROACTIVE_IDLE_SECONDS = 60.0
+
+
+def _proactive_check_interval_seconds() -> float:
+    return float(
+        os.environ.get(_PROACTIVE_CHECK_INTERVAL_ENV_VAR, _DEFAULT_PROACTIVE_CHECK_INTERVAL_SECONDS)
+    )
+
+
+def _proactive_idle_seconds() -> float:
+    return float(os.environ.get(_PROACTIVE_IDLE_ENV_VAR, _DEFAULT_PROACTIVE_IDLE_SECONDS))
+
+
+def _seconds_since(timestamp_iso: str) -> float:
+    then = datetime.fromisoformat(timestamp_iso)
+    return (datetime.now(timezone.utc) - then).total_seconds()
+
+
+def _proactive_checkin_targets(
+    turns_in_flight: set[str], idle_threshold: float | None = None
+) -> list[tuple[str, str]]:
+    """The `(conversation_id, persona_id)` pairs eligible for a proactive
+    nudge RIGHT NOW -- pure decision logic, deliberately split out from
+    `_run_one_proactive_checkin_pass` so it's testable directly against
+    real event-log data without needing a running graph, a checkpointer,
+    or the app's own event loop at all (every other piece of fan-out/
+    continuation logic in this module needs those; this one doesn't touch
+    the graph until AFTER this function has already decided who to nudge).
+
+    A conversation is eligible when ALL of:
+
+    - it's a DM (`kind == "dm"`) -- proactive is scoped to DMs only; a
+      persona's own `proactive` flag has no per-conversation opt-out yet
+      (see `Persona.proactive`'s own comment), so extending this to groups
+      would nudge every group she's ever added to, which is very likely
+      not what "she checks in on me" means.
+    - its one member persona is marked `proactive`.
+    - it has at least one real message already. `_lazy_vivify_dm` creates
+      a `conversations` ROW the instant a DM route is merely opened (see
+      that function's own docstring) -- an empty DM nobody has ever
+      actually messaged in is not a relationship to check in on, it's a
+      route that happened to get touched once.
+    - the LAST message-shaped event is NOT itself an unanswered proactive
+      nudge from this persona (`payload["proactive"] is True` -- see
+      `graph.build.persona_node`'s plain-reply branch, the only place that
+      flag is ever set). A human message, OR an ORDINARY reply the persona
+      gave reactively, are both fine -- only "she already reached out on
+      her own and hasn't heard back yet" blocks a repeat nudge; without
+      this exact distinction, a normal reply and a nudge look identical by
+      actor alone, and the loop could never fire again after the very
+      first exchange in a DM (every human message is always answered
+      immediately, so "last actor is the human" almost never stays true
+      long enough to cross the idle threshold).
+    - that last message is older than `idle_threshold` (defaults to
+      `_proactive_idle_seconds()` -- overridable so tests don't need a
+      real wall-clock wait to prove the threshold is actually honored).
+    - no turn is already in flight on this conversation's own thread
+      (`turns_in_flight`) -- a DM's ordinary thread_id IS its
+      conversation_id, so this check is exact, not approximate.
+    """
+    personas = _load_personas()
+    proactive_persona_ids = {pid for pid, p in personas.items() if p.proactive}
+    if not proactive_persona_ids:
+        return []
+    if idle_threshold is None:
+        idle_threshold = _proactive_idle_seconds()
+    targets: list[tuple[str, str]] = []
+    for row in _list_conversation_rows():
+        conversation_id = row["id"]
+        if row["kind"] != "dm":
+            continue
+        if conversation_id in turns_in_flight:
+            continue
+        member_ids, _kind = derive_membership(conversation_id)
+        if not member_ids or member_ids[0] not in proactive_persona_ids:
+            continue
+        persona_id = member_ids[0]
+        last_message = None
+        for event in events.read_events(conversation_id):
+            if event.type.endswith("/message"):
+                last_message = event
+        if last_message is None:
+            continue
+        if last_message.actor == persona_id and last_message.payload.get("proactive"):
+            continue
+        if _seconds_since(last_message.timestamp) < idle_threshold:
+            continue
+        targets.append((conversation_id, persona_id))
+    return targets
+
+
+async def _run_one_proactive_checkin_pass(app: FastAPI) -> None:
+    for conversation_id, persona_id in _proactive_checkin_targets(app.state.turns_in_flight):
+        state = graph_build.new_state(conversation_id, persona_id, is_proactive_checkin=True)
+        _spawn_turn(app, conversation_id, state, persona_id=persona_id)
+
+
+async def _run_proactive_checkin_loop(app: FastAPI) -> None:
+    """Fire-and-forget background loop, started once in `create_app`'s
+    lifespan alongside every other `app.state.background_tasks` entry.
+
+    Each pass is wrapped in its own `try/except` -- an unhandled exception
+    inside a bare `while True` would otherwise kill the loop silently for
+    the rest of the process's life, with nothing in the durable log or
+    even stdout to say proactive check-ins quietly stopped happening.
+    """
+    while True:
+        await asyncio.sleep(_proactive_check_interval_seconds())
+        try:
+            await _run_one_proactive_checkin_pass(app)
+        except Exception:
+            logger.exception("proactive check-in pass failed")
 
 
 def _graph_thread_id_for_question(conversation_id: str, question_id: str) -> str:
@@ -1567,6 +1887,20 @@ async def create_app() -> FastAPI:
         # a tag-all fan-out leg has its own entry, so stopping one leg
         # never touches a sibling leg's still-running task.
         app.state.turn_tasks = {}
+        # Keyed by conversation_id (not thread_id): the whole tag-all
+        # continuation session's own orchestrator task (see
+        # `_spawn_fanout_turns`/`_run_continuation_session`), so `POST
+        # .../stop` can cancel the entire autonomous-rounds loop directly —
+        # including while it's sitting in the pause BETWEEN rounds, when no
+        # leg has an open turn/start for `find_open_turns` to catch at all.
+        app.state.continuation_tasks = {}
+        # Proactive check-in loop (see its own docstring) -- one long-lived
+        # background task for the whole process, not spawned per-request
+        # like every other entry in `background_tasks`. Still tracked in
+        # the same set so lifespan shutdown cancels it identically.
+        proactive_task = asyncio.create_task(_run_proactive_checkin_loop(app))
+        app.state.background_tasks.add(proactive_task)
+        proactive_task.add_done_callback(app.state.background_tasks.discard)
         try:
             yield
         finally:
@@ -1614,6 +1948,7 @@ async def create_app() -> FastAPI:
             default_mode=draft.default_mode or "manual",
             max_turns=draft.max_turns,
             max_delegation_depth=draft.max_delegation_depth,
+            proactive=draft.proactive or False,
         )
         save_persona(persona, directory)
         _refresh_graph_personas(directory)
@@ -1640,6 +1975,7 @@ async def create_app() -> FastAPI:
             "default_mode": draft.default_mode,
             "max_turns": draft.max_turns,
             "max_delegation_depth": draft.max_delegation_depth,
+            "proactive": draft.proactive,
         }
         updated = current.model_copy(update={k: v for k, v in updates.items() if v is not None})
         save_persona(updated, directory)
@@ -1683,8 +2019,21 @@ async def create_app() -> FastAPI:
         # erroring.
         row = _get_conversation_row(conversation_id)
         if row is None:
-            row = _create_conversation(conversation_id, draft.kind, draft.name, draft.persona_ids)
+            row = _create_conversation(
+                conversation_id, draft.kind, draft.name, draft.persona_ids, draft.context
+            )
         return _conversation_row_to_out(row)
+
+    @app.post("/api/conversations/{conversation_id}/context", status_code=204)
+    async def set_conversation_context(conversation_id: str, body: ConversationContextIn) -> Response:
+        _ensure_conversation(conversation_id, app)
+        events.append_event(
+            conversation_id,
+            "conversation/context_set",
+            actor="you",
+            payload={"context": body.context},
+        )
+        return Response(status_code=204)
 
     # -- Messages ---------------------------------------------------------
 
@@ -1876,7 +2225,9 @@ async def create_app() -> FastAPI:
         """UX ask, not in the original scope doc: cancel every turn (the
         main thread, and every tag-all fan-out leg) currently running for
         this conversation, right now, rather than waiting for a natural
-        stopping point.
+        stopping point. Also cancels a whole autonomous continuation
+        session (round-continuation, see `_run_continuation_session`) in
+        one shot, including while it's paused BETWEEN rounds.
 
         Finds each open `turn/start`'s `graph_thread_id` from the durable
         log, looks up that thread's live asyncio task in
@@ -1891,6 +2242,17 @@ async def create_app() -> FastAPI:
         approval interrupt with nothing actively running) is silently
         skipped -- "stop the thing that's currently working" has nothing
         to do to it, and that's not an error.
+
+        Separately, `app.state.continuation_tasks` is checked for THIS
+        conversation's own continuation-session task (if any) and
+        cancelled directly, regardless of whether any leg currently has an
+        open turn -- during the pause between rounds nothing does, so
+        relying on `find_open_turns` alone would leave that loop running
+        and about to start another round right after this call returns.
+        Cancelling the orchestrator task itself is enough either way:
+        asyncio propagates a task's cancellation into whatever it's
+        currently awaiting, so this also reaches an actively-running leg
+        exactly like the loop above does.
         """
         _ensure_conversation(conversation_id, app)
         open_starts = events.find_open_turns(events.read_events(conversation_id))
@@ -1899,6 +2261,9 @@ async def create_app() -> FastAPI:
             task = app.state.turn_tasks.get(thread_id)
             if task is not None and not task.done():
                 task.cancel()
+        continuation_task = app.state.continuation_tasks.get(conversation_id)
+        if continuation_task is not None and not continuation_task.done():
+            continuation_task.cancel()
         return Response(status_code=204)
 
     # -- Ask / approvals ---------------------------------------------------

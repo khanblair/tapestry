@@ -28,6 +28,7 @@ export default function NewConversationPage() {
   const [tab, setTab] = useState<Tab>("dm");
   const [personas, setPersonas] = useState<Persona[]>([]);
   const [groupName, setGroupName] = useState("#new-project");
+  const [groupContext, setGroupContext] = useState("");
   const [picked, setPicked] = useState<string[]>([]);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -48,6 +49,7 @@ export default function NewConversationPage() {
         kind: "group",
         name: groupName.trim() || undefined,
         personaIds: picked,
+        context: groupContext.trim() || undefined,
       });
       router.push(`/conversation/${conversation.id}`);
     } catch {
@@ -86,6 +88,22 @@ export default function NewConversationPage() {
               Group name
             </label>
             <input id="group-name" className="input" value={groupName} onChange={(e) => setGroupName(e.target.value)} />
+          </div>
+          <div className="form-row">
+            <label className="field-label" htmlFor="group-context">
+              Ground rules / context (optional)
+            </label>
+            <textarea
+              id="group-context"
+              className="textarea"
+              rows={3}
+              placeholder="e.g. Casual hangout only, no work talk. Keep replies short."
+              value={groupContext}
+              onChange={(e) => setGroupContext(e.target.value)}
+            />
+            <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4 }}>
+              Shown to every member above their own instructions — takes precedence if they conflict.
+            </div>
           </div>
           <label className="field-label">Members</label>
           {personas.map((p) => {

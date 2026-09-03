@@ -42,6 +42,13 @@ class Persona(BaseModel):
     max_delegation_depth: int | None = None
     status: Literal["online", "busy", "paused", "offline"]
     color: str
+    # web_adapter/api.py's proactive check-in loop: when True, this persona
+    # can message a human FIRST in a DM, unprompted, after that DM has sat
+    # idle following the human's own last message. Coarse -- persona-level,
+    # not per-conversation -- so every DM with this persona gets the same
+    # behavior; there is no per-conversation opt-out yet. False (never
+    # initiates) reproduces every existing persona's current behavior.
+    proactive: bool = False
 
 
 def load_personas(directory: str = "personas") -> dict[str, Persona]:

@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from tapestry.core.conversations import Message, TimelineItem, derive_messages, derive_timeline
+from tapestry.core.conversations import (
+    Message,
+    TimelineItem,
+    derive_conversation_context,
+    derive_messages,
+    derive_timeline,
+)
 from tapestry.core.events import append_event
 
 
@@ -101,6 +107,7 @@ def test_derive_timeline_excludes_pure_bookkeeping_events():
     append_event("conv-1", "model/response", "ada", {"cost": 0.01})
     append_event("conv-1", "turn/end", "ada", {"turn_id": "x", "reason": "done"})
     append_event("conv-1", "conversation/created", "system", {"kind": "dm"})
+    append_event("conv-1", "conversation/context_set", "you", {"context": "Keep it casual."})
 
     timeline = derive_timeline("conv-1")
 
@@ -130,3 +137,27 @@ def test_derive_timeline_is_scoped_to_conversation():
 
 def test_derive_timeline_on_empty_conversation_returns_empty_list():
     assert derive_timeline("does-not-exist") == []
+
+
+def test_derive_conversation_context_returns_none_when_never_set():
+    assert derive_conversation_context("conv-1") is None
+
+
+def test_derive_conversation_context_returns_the_set_value():
+    append_event("conv-1", "conversation/context_set", "you", {"context": "Casual hangout only."})
+
+    assert derive_conversation_context("conv-1") == "Casual hangout only."
+
+
+def test_derive_conversation_context_returns_the_most_recent_set():
+    append_event("conv-1", "conversation/context_set", "you", {"context": "First rule."})
+    append_event("conv-1", "conversation/context_set", "you", {"context": "Updated rule."})
+
+    assert derive_conversation_context("conv-1") == "Updated rule."
+
+
+def test_derive_conversation_context_is_scoped_to_conversation():
+    append_event("conv-1", "conversation/context_set", "you", {"context": "conv-1's rule."})
+    append_event("conv-2", "conversation/context_set", "you", {"context": "conv-2's rule."})
+
+    assert derive_conversation_context("conv-1") == "conv-1's rule."

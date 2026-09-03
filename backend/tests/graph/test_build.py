@@ -206,8 +206,8 @@ def test_system_prompt_tells_the_model_not_to_load_skills_for_small_talk():
 def test_system_prompt_lists_conversation_members_with_status():
     ada = build.PERSONAS["ada"]
     prompt = build._build_system_prompt(ada, [], ["ada", "nova"])
-    assert "Ada (Architect) — online [you]" in prompt
-    assert "Nova (DevOps) — paused" in prompt
+    assert "Ada (Architect, online) [you]" in prompt
+    assert "Nova (DevOps, paused)" in prompt
 
 
 def test_system_prompt_distinguishes_non_member_from_nonexistent():
@@ -237,7 +237,7 @@ def test_system_prompt_tells_a_persona_to_acknowledge_siblings_in_a_group():
     ada = build.PERSONAS["ada"]
     prompt = build._build_system_prompt(ada, [], ["ada", "rex"])
     assert "not the only one replying" in prompt
-    assert "actually read and respond to it" in prompt
+    assert "Actually respond to what a sibling just said" in prompt
 
 
 def test_system_prompt_omits_group_dialogue_guidance_in_a_dm():
@@ -246,6 +246,124 @@ def test_system_prompt_omits_group_dialogue_guidance_in_a_dm():
     ada = build.PERSONAS["ada"]
     prompt = build._build_system_prompt(ada, [], ["ada"])
     assert "not the only one replying" not in prompt
+
+
+def test_system_prompt_always_tells_the_model_to_keep_replies_short():
+    # Live-tested UX complaint: a persona's reply for what should have been
+    # a quick reaction ran to several paragraphs. Unlike roster/group
+    # guidance, this applies unconditionally -- not gated on membership or
+    # round.
+    ada = build.PERSONAS["ada"]
+    prompt = build._build_system_prompt(ada, [])
+    assert "keep it short" in prompt.lower()
+    assert "no em dashes" in prompt.lower()
+
+
+def test_system_prompt_adds_continuation_guidance_only_on_a_continuation_round():
+    ada = build.PERSONAS["ada"]
+    normal_prompt = build._build_system_prompt(ada, [], ["ada", "rex"])
+    continuation_prompt = build._build_system_prompt(
+        ada, [], ["ada", "rex"], is_continuation_round=True
+    )
+    assert "autonomous continuation" not in normal_prompt.lower()
+    assert "autonomous continuation" in continuation_prompt.lower()
+    assert "pass_turn" in continuation_prompt
+
+
+def test_continuation_guidance_tells_the_model_not_to_cut_short_a_timed_request():
+    # Live-tested UX complaint: "@all can you hold a 2 minute conversation"
+    # stopped after ~80s once both personas ran out of organic things to
+    # say -- the pass-by-default framing had no exception for a human
+    # asking for an extended/timed exchange, so it under-delivered on a
+    # literal duration ask with zero signal telling the model that
+    # mattered here.
+    ada = build.PERSONAS["ada"]
+    prompt = build._build_system_prompt(ada, [], ["ada", "rex"], is_continuation_round=True)
+    assert "extended or timed exchange" in prompt
+    assert "don't cut it short" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# Proactive check-in -- the one turn web_adapter's proactive check-in loop
+# spawns when a `proactive` persona's DM has sat idle since the human's own
+# last message. See web_adapter/api.py's _proactive_checkin_targets.
+# ---------------------------------------------------------------------------
+
+
+def test_system_prompt_adds_proactive_checkin_guidance_only_when_flagged():
+    ada = build.PERSONAS["ada"]
+    normal_prompt = build._build_system_prompt(ada, [])
+    checkin_prompt = build._build_system_prompt(ada, [], is_proactive_checkin=True)
+    assert "reaching out" not in normal_prompt.lower()
+    assert "reaching out" in checkin_prompt.lower()
+    assert "unprompted" in checkin_prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# conversation_context -- human-set ground rules for a specific conversation
+# ---------------------------------------------------------------------------
+
+
+def test_system_prompt_omits_conversation_context_when_unset():
+    ada = build.PERSONAS["ada"]
+    prompt = build._build_system_prompt(ada, [])
+    assert "ground rules" not in prompt.lower()
+
+
+def test_system_prompt_renders_conversation_context_above_the_personas_own_prompt():
+    ada = build.PERSONAS["ada"]
+    prompt = build._build_system_prompt(
+        ada, [], conversation_context="No programming talk in this thread."
+    )
+    assert "no programming talk in this thread" in prompt.lower()
+    assert prompt.lower().index("no programming talk") < prompt.lower().index(
+        ada.system_prompt.strip().lower()[:30]
+    )
+
+
+def test_system_prompt_frames_conversation_context_as_taking_precedence():
+    ada = build.PERSONAS["ada"]
+    prompt = build._build_system_prompt(ada, [], conversation_context="Keep it casual.")
+    assert "take precedence" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# pass_turn -- only offered on an autonomous continuation round
+# ---------------------------------------------------------------------------
+
+
+def test_build_tool_schemas_omits_pass_turn_by_default():
+    ada = build.PERSONAS["ada"]
+    names = {s["function"]["name"] for s in build._build_tool_schemas(ada.tools)}
+    assert build.PASS_TURN_TOOL_NAME not in names
+
+
+def test_build_tool_schemas_includes_pass_turn_on_a_continuation_round():
+    ada = build.PERSONAS["ada"]
+    names = {
+        s["function"]["name"]
+        for s in build._build_tool_schemas(ada.tools, include_pass_turn=True)
+    }
+    assert build.PASS_TURN_TOOL_NAME in names
+
+
+# ---------------------------------------------------------------------------
+# Reply pacing -- _reply_delay_seconds is a pure function; the actual sleep
+# is a separate, trivially-mockable seam (`_breathing_pause`, disabled for
+# the whole test suite by tests/graph/conftest.py) so no test here should
+# ever have to wait through a real delay.
+# ---------------------------------------------------------------------------
+
+
+def test_reply_delay_is_clamped_to_the_documented_range():
+    assert build._MIN_REPLY_DELAY_SECONDS <= build._reply_delay_seconds("")
+    assert build._reply_delay_seconds("x" * 10_000) <= build._MAX_REPLY_DELAY_SECONDS
+
+
+def test_reply_delay_grows_with_reply_length():
+    short = build._reply_delay_seconds("hi")
+    long = build._reply_delay_seconds("a rather longer reply " * 20)
+    assert long > short
 
 
 async def test_persona_node_wires_real_conversation_membership_into_the_prompt(tmp_path):
@@ -264,8 +382,8 @@ async def test_persona_node_wires_real_conversation_membership_into_the_prompt(t
             await graph.ainvoke(state, config)
 
         system_prompt = call_model_mock.call_args.kwargs["messages"][0]["content"]
-        assert "Rex (Developer) — online [you]" not in system_prompt
-        assert "Ada (Architect) — online [you]" in system_prompt
+        assert "Rex (Developer, online) [you]" not in system_prompt
+        assert "Ada (Architect, online) [you]" in system_prompt
         assert "Nova (DevOps, paused)" in system_prompt  # not a member -- listed as existing elsewhere
     finally:
         await graph.checkpointer.conn.close()
@@ -281,6 +399,18 @@ def test_new_state_fills_documented_defaults():
     assert state["turn_count"] == 0
     assert state["task_id"] is None
     assert state["thread_id"] is None
+    assert state["is_continuation_round"] is False
+    assert state["is_proactive_checkin"] is False
+
+
+def test_new_state_can_be_built_as_a_continuation_round():
+    state = build.new_state("conv-1", "rex", is_continuation_round=True)
+    assert state["is_continuation_round"] is True
+
+
+def test_new_state_can_be_built_as_a_proactive_checkin():
+    state = build.new_state("conv-1", "rex", is_proactive_checkin=True)
+    assert state["is_proactive_checkin"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -759,6 +889,21 @@ async def test_task_complete_failing_verification_loops_back_to_persona(tmp_path
         assert any(e.type == "task/verification_failed" for e in logged)
         assert not any(e.type == "task/completed" for e in logged)
         assert call_model_mock.await_count == 2
+
+        # Found live (2026-09-03, a companion persona's DeepSeek call
+        # 400'd): the retry's own message list must satisfy every
+        # OpenAI-compatible provider's own contract -- an assistant message
+        # with tool_calls has to be immediately followed by a tool-role
+        # message carrying a matching tool_call_id, never a bare "user"
+        # message, or the SECOND call_model invocation itself is malformed
+        # and the provider rejects the whole request.
+        second_call_messages = call_model_mock.await_args_list[1].kwargs["messages"]
+        tool_call_message = next(m for m in second_call_messages if m.get("tool_calls"))
+        index = second_call_messages.index(tool_call_message)
+        feedback_message = second_call_messages[index + 1]
+        assert feedback_message["role"] == "tool"
+        assert feedback_message["tool_call_id"] == tool_call_message["tool_calls"][0]["id"]
+        assert "tests were never actually run" in feedback_message["content"]
     finally:
         await graph.checkpointer.conn.close()
 
@@ -782,5 +927,133 @@ async def test_thread_id_is_carried_onto_every_appended_event(tmp_path):
         logged = events_module.read_events(conversation_id)
         assistant_message = next(e for e in logged if e.type == "assistant/message")
         assert assistant_message.payload["thread_id"] == "thread-abc"
+    finally:
+        await graph.checkpointer.conn.close()
+
+
+# ---------------------------------------------------------------------------
+# pass_turn -- round-continuation's opt-out (web_adapter/api.py's
+# _run_continuation_session is what actually offers this each round after
+# the first; this covers the tool's own effect on the event log/graph).
+# ---------------------------------------------------------------------------
+
+
+async def test_pass_turn_logs_a_pass_not_a_message_and_ends_the_turn(tmp_path):
+    conversation_id = "conv-pass-1"
+    passes = _tool_call_response("", "pass_turn", {})
+    call_model_mock = AsyncMock(return_value=passes)
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        with patch.object(build, "call_model", call_model_mock):
+            state = build.new_state(conversation_id, "rex", is_continuation_round=True)
+            result = await graph.ainvoke(state, config)
+
+        assert result["next_node"] == "end"
+        logged = events_module.read_events(conversation_id)
+        types = [e.type for e in logged]
+        assert "persona/passed" in types
+        # A pass has nothing for a human to read as a chat bubble -- must
+        # never be projected as one (see core.conversations.derive_messages'
+        # own "/message"-suffix check).
+        assert "assistant/message" not in types
+        turn_end = next(e for e in logged if e.type == "turn/end")
+        assert turn_end.payload["reason"] == "passed"
+    finally:
+        await graph.checkpointer.conn.close()
+
+
+async def test_pass_turn_is_not_offered_outside_a_continuation_round(tmp_path):
+    """Round 1 (the mandatory reply to being tagged) must never see
+    pass_turn as an available tool at all -- confirmed here by asserting
+    the model was never even given the option, not just that it didn't
+    take it.
+    """
+    conversation_id = "conv-pass-2"
+    call_model_mock = AsyncMock(return_value=_plain_response("hi"))
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        with patch.object(build, "call_model", call_model_mock):
+            state = build.new_state(conversation_id, "rex")  # is_continuation_round defaults False
+            await graph.ainvoke(state, config)
+
+        offered_tools = call_model_mock.call_args.kwargs["tools"]
+        names = {t["function"]["name"] for t in offered_tools}
+        assert build.PASS_TURN_TOOL_NAME not in names
+    finally:
+        await graph.checkpointer.conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Proactive check-in -- graph-level: does the ONE turn is_proactive_checkin
+# spawns actually mark its own message so web_adapter/api.py's eligibility
+# check (_proactive_checkin_targets) can tell a nudge apart from a normal
+# reply. See that function's own docstring for why the distinction exists.
+# ---------------------------------------------------------------------------
+
+
+async def test_proactive_checkin_reply_is_marked_so_it_wont_be_re_nudged(tmp_path):
+    conversation_id = "conv-proactive-1"
+    call_model_mock = AsyncMock(return_value=_plain_response("hey, thinking of you today"))
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        with patch.object(build, "call_model", call_model_mock):
+            state = build.new_state(conversation_id, "rex", is_proactive_checkin=True)
+            await graph.ainvoke(state, config)
+
+        logged = events_module.read_events(conversation_id)
+        message = next(e for e in logged if e.type == "assistant/message")
+        assert message.payload["proactive"] is True
+    finally:
+        await graph.checkpointer.conn.close()
+
+
+async def test_ordinary_reply_is_not_marked_proactive(tmp_path):
+    conversation_id = "conv-proactive-2"
+    call_model_mock = AsyncMock(return_value=_plain_response("hi there"))
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        with patch.object(build, "call_model", call_model_mock):
+            state = build.new_state(conversation_id, "rex")  # is_proactive_checkin defaults False
+            await graph.ainvoke(state, config)
+
+        logged = events_module.read_events(conversation_id)
+        message = next(e for e in logged if e.type == "assistant/message")
+        assert "proactive" not in message.payload
+    finally:
+        await graph.checkpointer.conn.close()
+
+
+async def test_proactive_checkin_appends_a_synthetic_trailing_turn(tmp_path):
+    """Live-tested failure: a DM's own history, from the persona's own
+    point of view, ends with HER prior reply (role "assistant") -- unlike
+    a continuation round, where a sibling's message remaps to role "user"
+    (_chat_messages_from_log), a DM has nobody else to remap. Calling the
+    model on a list ending in "assistant" with nothing after it produced a
+    real litellm.EmptyResponseError (3/3 empty completions) for one model.
+    This proves the fix: a synthetic trailing "user"-role turn is appended
+    so the shape stays a normal, alternating conversation.
+    """
+    conversation_id = "conv-proactive-3"
+    events_module.append_event(
+        conversation_id, "user/message", actor="you", payload={"text": "hey"}
+    )
+    events_module.append_event(
+        conversation_id, "assistant/message", actor="rex", payload={"text": "hi there"}
+    )
+    call_model_mock = AsyncMock(return_value=_plain_response("thinking of you"))
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        with patch.object(build, "call_model", call_model_mock):
+            state = build.new_state(conversation_id, "rex", is_proactive_checkin=True)
+            await graph.ainvoke(state, config)
+
+        sent_messages = call_model_mock.call_args.kwargs["messages"]
+        assert sent_messages[-1]["role"] == "user"
+        assert sent_messages[-2]["role"] == "assistant"  # rex's own prior reply, unchanged
     finally:
         await graph.checkpointer.conn.close()
