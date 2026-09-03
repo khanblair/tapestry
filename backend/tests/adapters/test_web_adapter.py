@@ -1380,17 +1380,24 @@ def test_activity_running_reflects_a_real_in_flight_tool_call(client, monkeypatc
 
 def test_activity_running_survives_two_concurrent_fanout_legs(client, monkeypatch):
     """Caught in review: keying `running_activity` by `conversation_id`
-    means two fan-out legs of the SAME conversation running tools at once
-    corrupt each other -- the second leg's write clobbers the first's (one
-    shared key), and whichever leg finishes first pops the row out from
-    under the leg still running. Both legs' entries must coexist and clear
+    means two fan-out legs running tools at once corrupt each other -- the
+    second leg's write clobbers the first's (one shared key), and
+    whichever leg finishes first pops the row out from under the leg
+    still running. Both legs' entries must coexist and clear
     independently.
+
+    Sourced from two DIFFERENT conversations' fan-out legs, not two legs
+    of the SAME round: `_spawn_fanout_turns` now gates legs one-at-a-time
+    WITHIN a round (see that function's own docstring -- the actual fix
+    for the "parallel monologues" bug), so two legs of one round no
+    longer run concurrently with each other on purpose. Two separate
+    `@all`s in two separate conversations still genuinely overlap --
+    each `_spawn_fanout_turns` call creates its own semaphore, scoped to
+    that one call -- which is exactly what this test needs to prove the
+    per-thread keying invariant still holds.
     """
-    # ada and vex are the only two seed personas that share a common,
-    # NOT-approval-gated tool (`terminal_read_only`) -- needed so both
-    # legs reach execute_node directly, with no interrupt to negotiate,
-    # keeping this test to one exchange per leg.
-    conversation_id = _make_group(client, ["ada", "vex"])
+    ada_conversation_id = _make_group(client, ["ada"])
+    vex_conversation_id = _make_group(client, ["vex"])
     ada_hang = asyncio.Event()
     vex_hang = asyncio.Event()
 
@@ -1419,22 +1426,24 @@ def test_activity_running_survives_two_concurrent_fanout_legs(client, monkeypatc
     monkeypatch.setattr(graph_build, "call_model", smart_call_model)
     monkeypatch.setitem(graph_build.TOOL_REGISTRY, "terminal_read_only", slow_terminal_read_only)
 
-    res = client.post(
-        f"/api/conversations/{conversation_id}/messages", json={"text": "@ada @vex check status"}
+    res_ada = client.post(
+        f"/api/conversations/{ada_conversation_id}/messages", json={"text": "@all check status"}
     )
-    assert res.status_code == 201
+    assert res_ada.status_code == 201
+    res_vex = client.post(
+        f"/api/conversations/{vex_conversation_id}/messages", json={"text": "@all check status"}
+    )
+    assert res_vex.status_code == 201
+
+    both_ids = (ada_conversation_id, vex_conversation_id)
 
     # Both legs' running entries must appear as two DISTINCT rows -- if
     # keyed by conversation_id alone, the second leg's write would
-    # clobber the first's and only one row would ever be visible. (Both
-    # legs' `actor`/`label` are identical here -- `_record_running_
-    # activity`'s own documented, separate simplification always
-    # attributes to the conversation's lead persona -- so distinctness is
-    # asserted by count, the only thing that actually differs.)
+    # clobber the first's and only one row would ever be visible.
     running_count = 0
     for _ in range(100):
         activity = client.get("/api/activity").json()
-        running = [r for r in activity["running"] if r["conversationId"] == conversation_id]
+        running = [r for r in activity["running"] if r["conversationId"] in both_ids]
         running_count = len(running)
         if running_count == 2:
             break
@@ -1448,15 +1457,76 @@ def test_activity_running_survives_two_concurrent_fanout_legs(client, monkeypatc
     # clears whichever leg happens to share that key).
     for _ in range(50):
         activity = client.get("/api/activity").json()
-        running = [r for r in activity["running"] if r["conversationId"] == conversation_id]
+        running = [r for r in activity["running"] if r["conversationId"] in both_ids]
         if len(running) == 1:
             break
         time.sleep(0.05)
     activity = client.get("/api/activity").json()
-    running = [r for r in activity["running"] if r["conversationId"] == conversation_id]
-    assert len(running) == 1, "vex's entry must survive rex's leg finishing"
+    running = [r for r in activity["running"] if r["conversationId"] in both_ids]
+    assert len(running) == 1, "vex's entry must survive ada's leg finishing"
 
     vex_hang.set()  # let vex's leg finish too, unwinding cleanly
+
+
+def test_tag_all_fanout_legs_run_one_at_a_time_so_later_personas_see_earlier_replies(client, monkeypatch):
+    """The actual fix for the "parallel monologues" bug (live-tested: a
+    3-persona `@all` produced three independent replies that never
+    acknowledged each other). `_spawn_fanout_turns` now gates legs
+    one-at-a-time per round; `graph.build._chat_messages_from_log`
+    already rebuilds a persona's history from the WHOLE conversation's
+    event log on every new turn, not just her own thread -- so once
+    ordering is fixed, visibility falls out for free with no separate
+    "inject sibling context" mechanism needed.
+    """
+    conversation_id = _make_group(client, ["ada", "rex"])
+
+    call_order: list[str] = []
+    captured_messages: dict[str, list[dict]] = {}
+
+    async def smart_call_model(model, messages, tools=None, **kwargs):
+        call_order.append(model)
+        captured_messages[model] = messages
+        if model == "openrouter/meta-llama/llama-3.3-70b-instruct":  # ada
+            # A real network round-trip, not an instant mock return -- this
+            # is what actually forces the race: without it, ada's whole
+            # turn runs to completion in one uninterrupted stretch of the
+            # event loop regardless of the semaphore size, and this test
+            # would pass even against the old, broken fully-concurrent
+            # code (verified: it did, before this sleep was added). With
+            # a real await point here, rex's leg genuinely gets a chance
+            # to start and read history WHILE ada is still "generating" --
+            # exactly the race a Semaphore(10) would allow and a
+            # Semaphore(1) forecloses.
+            await asyncio.sleep(0.05)
+            return _plain_response("Ada says hi first.")
+        if model == "deepseek/deepseek-chat":  # rex
+            return _plain_response("Rex replies second.")
+        raise AssertionError(f"unexpected model {model!r}")
+
+    monkeypatch.setattr(graph_build, "call_model", smart_call_model)
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "@all quick check-in"}
+    )
+    assert res.status_code == 201
+
+    for _ in range(100):
+        if len(call_order) >= 2:
+            break
+        time.sleep(0.05)
+
+    assert call_order == [
+        "openrouter/meta-llama/llama-3.3-70b-instruct",
+        "deepseek/deepseek-chat",
+    ], "ada (listed first in this group's persona_ids) must fully complete before rex's leg even starts"
+
+    rex_messages = captured_messages["deepseek/deepseek-chat"]
+    rex_history_text = " ".join(
+        m["content"] for m in rex_messages if isinstance(m.get("content"), str)
+    )
+    assert "Ada says hi first." in rex_history_text, (
+        "rex's own prompt must include ada's already-written reply from this same round"
+    )
 
 
 # ---------------------------------------------------------------------------

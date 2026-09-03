@@ -367,7 +367,6 @@ class MessageDiffOut(CamelModel):
 # against, not a claim about what's correct for every deployment. Declared
 # here (ahead of MessageOut/SendMessageIn below, which reference the
 # threshold) rather than down with the rest of §2's helpers.
-FANOUT_CONCURRENCY_LIMIT = 10
 FANOUT_CONFIRM_THRESHOLD = 5
 FANOUT_HARD_CAP = 50
 
@@ -1425,15 +1424,32 @@ def _spawn_fanout_turns(
     app: FastAPI, conversation_id: str, persona_ids: list[str], trigger_message_id: str
 ) -> None:
     """Spawn one independent tag-all fan-out leg per persona in
-    `persona_ids`, concurrently — spec §2.2. Each gets its own fresh,
-    single-use LangGraph thread
-    (`f"{conversation_id}::mention::{persona_id}::{trigger_message_id}"`),
-    so a rare approval pause on one leg never blocks any other, and never
-    touches the conversation's own main thread at all. Bounded by
-    `FANOUT_CONCURRENCY_LIMIT` (spec §2.5) so a large `@all` completes in
-    waves rather than firing every completion at once.
+    `persona_ids`, gated one-at-a-time within THIS round via a
+    `Semaphore(1)` — each still gets its own fresh, single-use LangGraph
+    thread (`f"{conversation_id}::mention::{persona_id}::{trigger_message_id}"`)
+    and never touches the conversation's own main thread at all, but only
+    one leg's `_drive_turn` call runs at a time.
+
+    This is a visibility fix, not a resource-throttling one (an earlier
+    version of this ran all legs fully concurrently via a larger
+    semaphore). `graph.persona_node`'s message history is rebuilt fresh
+    from the WHOLE conversation's event log on every new turn
+    (`_chat_messages_from_log`, not scoped to one persona's own thread) —
+    so a persona already sees a sibling's reply once it's actually in the
+    log. The bug was purely timing: with every leg starting at once,
+    nobody had written anything yet by the time any of them read history,
+    so a 3-persona `@all` read as three parallel monologues rather than a
+    conversation. Serializing which leg gets to READ+GENERATE at a time
+    fixes that outright, with no change needed to history assembly.
+
+    Still non-blocking on an approval pause, exactly as before: `_drive_
+    turn` returns — releasing the semaphore — the moment a leg either
+    finishes replying OR pauses at an interrupt (see its own try/except/
+    finally). A leg waiting on a human's approval answer never holds the
+    gate open; the NEXT leg starts as soon as the paused one stops
+    actively generating, not once it's actually approved.
     """
-    semaphore = asyncio.Semaphore(FANOUT_CONCURRENCY_LIMIT)
+    semaphore = asyncio.Semaphore(1)
     for persona_id in persona_ids:
         graph_thread_id = f"{conversation_id}::mention::{persona_id}::{trigger_message_id}"
         state = graph_build.new_state(conversation_id, persona_id)

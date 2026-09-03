@@ -229,6 +229,25 @@ def test_system_prompt_omits_roster_when_membership_is_unset():
     assert "Conversation roster" not in prompt
 
 
+def test_system_prompt_tells_a_persona_to_acknowledge_siblings_in_a_group():
+    # The other half of the fan-out visibility fix: seeing a sibling's
+    # reply in history is necessary but not sufficient -- something has to
+    # tell the model that reading it matters, or it just answers the human
+    # independently as if it were the only persona in the room.
+    ada = build.PERSONAS["ada"]
+    prompt = build._build_system_prompt(ada, [], ["ada", "rex"])
+    assert "not the only one replying" in prompt
+    assert "actually read and respond to it" in prompt
+
+
+def test_system_prompt_omits_group_dialogue_guidance_in_a_dm():
+    # A DM has exactly one persona -- "acknowledge other personas" is
+    # meaningless noise there, not a helpful instruction.
+    ada = build.PERSONAS["ada"]
+    prompt = build._build_system_prompt(ada, [], ["ada"])
+    assert "not the only one replying" not in prompt
+
+
 async def test_persona_node_wires_real_conversation_membership_into_the_prompt(tmp_path):
     conversation_id = "conv-roster-1"
     events_module.append_event(

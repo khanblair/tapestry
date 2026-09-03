@@ -806,6 +806,30 @@ def _roster_lines(persona: Persona, member_ids: list[str]) -> list[str]:
     return lines
 
 
+def _group_dialogue_guidance() -> list[str]:
+    """Only rendered for a real multi-persona conversation (more than one
+    member). The fan-out fix (`web_adapter/api.py`'s `_spawn_fanout_turns`,
+    now one leg at a time per round) makes a sibling's reply actually
+    present in this persona's own history by the time she generates --
+    this is the other half: telling her to actually use it, instead of
+    answering the human as if she were the only one who replied. Without
+    this, a same-round conversation history existing is necessary but not
+    sufficient -- nothing tells the model that reading it matters.
+    """
+    return [
+        "You are one of several personas in this conversation, not the only "
+        "one replying. If another persona has already said something in "
+        "this exchange, actually read and respond to it -- agree, disagree, "
+        "add something specific, or build on their point -- rather than "
+        "answering the human independently as if you hadn't seen it. Sound "
+        "like a person in a group chat, not several copies of the same "
+        "assistant: don't repeat a greeting someone already gave, don't "
+        "over-agree with what a sibling just said, and don't restate "
+        "context someone else already covered.",
+        "",
+    ]
+
+
 def _build_system_prompt(
     persona: Persona, catalog: list[SkillSummary], member_ids: list[str] | None = None
 ) -> str:
@@ -813,6 +837,8 @@ def _build_system_prompt(
     if member_ids is not None:
         lines.extend(_roster_lines(persona, member_ids))
         lines.append("")
+        if len(member_ids) > 1:
+            lines.extend(_group_dialogue_guidance())
     if catalog:
         lines.append(
             f"Available skills (call the {SKILL_LOADER_TOOL_NAME!r} tool with "
