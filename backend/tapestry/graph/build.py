@@ -137,6 +137,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
 from tapestry.core import events
+from tapestry.core import reactions
 from tapestry.core.ask import AskQuestion
 from tapestry.core.conversations import (
     derive_conversation_context,
@@ -347,6 +348,14 @@ SKILL_LOADER_TOOL_NAME = "skill_loader"
 # `_run_continuation_session` for the rest of the round-continuation
 # mechanism this exists for.
 PASS_TURN_TOOL_NAME = "pass_turn"
+# Unlike PASS_TURN_TOOL_NAME, offered unconditionally (see
+# _build_tool_schemas) -- reacting isn't specific to an autonomous
+# continuation round, a persona can react to a message on any ordinary
+# turn too, same as a human can. Handled the same way delegate/
+# task_complete are: intercepted directly in persona_node, loops back to
+# "persona" afterward (not "end") so reacting never uses up the turn's
+# one chance at a real reply -- see _handle_react_to_message.
+REACT_TO_MESSAGE_TOOL_NAME = "react_to_message"
 
 # Tools whose proposal must go through approval_node's interrupt() gate
 # before execute_node ever runs them -- anything that mutates files,
@@ -816,6 +825,36 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "contribute. Call this instead of manufacturing a reply.",
         {"type": "object", "properties": {}, "required": []},
     ),
+    REACT_TO_MESSAGE_TOOL_NAME: _function_schema(
+        REACT_TO_MESSAGE_TOOL_NAME,
+        "React to an earlier message with a single emoji, the way a person "
+        "taps a quick reaction in a chat app. Use sparingly -- only when an "
+        "emoji genuinely says something a reply wouldn't add to, not on "
+        "every message. Calling this does not use up your turn: you can "
+        "still send a real reply in the same turn, before or after. You do "
+        "NOT know real message ids, so don't guess one -- instead say WHO "
+        "you're reacting to (target_actor) or leave both fields blank to "
+        "react to whatever was most recently said to you.",
+        {
+            "type": "object",
+            "properties": {
+                "target_actor": {
+                    "type": "string",
+                    "description": (
+                        "Whose message to react to: 'you' for the human, or another "
+                        "persona's name. Omit to react to the most recent message "
+                        "from anyone but yourself."
+                    ),
+                },
+                "message_id": {
+                    "type": "string",
+                    "description": "Only set this if you actually have a real message id -- otherwise omit it.",
+                },
+                "emoji": {"type": "string", "description": "A single emoji, e.g. \"\U0001F44D\"."},
+            },
+            "required": ["emoji"],
+        },
+    ),
 }
 
 
@@ -901,6 +940,15 @@ def _continuation_guidance() -> list[str]:
         "minutes\"), don't cut it short just because you personally are "
         "out of ideas -- stay in it and keep it moving until that request "
         "is reasonably satisfied.",
+        "If you or anyone else already wound the conversation down -- a "
+        "goodbye, \"good chat,\" \"catch you later,\" a thumbs-up on someone "
+        "else's sign-off -- that conversation is OVER. Do not send another "
+        "farewell of your own on top of it, even a different-sounding one. "
+        "A second, third, or further goodbye is not politeness, it's a "
+        "loop -- call pass_turn instead. This applies even if the round's "
+        "starting message asked for an extended conversation: once both "
+        "sides have actually said goodbye, that request has been "
+        "satisfied and the exception above no longer applies.",
         "",
     ]
 
@@ -986,6 +1034,7 @@ def _build_tool_schemas(tool_names: list[str], *, include_pass_turn: bool = Fals
     schemas.append(TOOL_SCHEMAS[SKILL_LOADER_TOOL_NAME])
     schemas.append(TOOL_SCHEMAS[DELEGATE_TOOL_NAME])
     schemas.append(TOOL_SCHEMAS[TASK_COMPLETE_TOOL_NAME])
+    schemas.append(TOOL_SCHEMAS[REACT_TO_MESSAGE_TOOL_NAME])
     if include_pass_turn:
         schemas.append(TOOL_SCHEMAS[PASS_TURN_TOOL_NAME])
     return schemas
@@ -1307,6 +1356,11 @@ async def persona_node(state: TapestryGraphState, config: RunnableConfig) -> dic
     if tool_name == PASS_TURN_TOOL_NAME:
         return _finish(await _handle_pass_turn(state, persona, turn_id, new_messages))
 
+    if tool_name == REACT_TO_MESSAGE_TOOL_NAME:
+        return _finish(
+            await _handle_react_to_message(state, persona, turn_id, arguments, new_messages)
+        )
+
     if tool_name not in TOOL_REGISTRY or (
         tool_name != SKILL_LOADER_TOOL_NAME and tool_name not in effective_tools
     ):
@@ -1578,6 +1632,103 @@ async def _handle_pass_turn(
         payload={"turn_id": turn_id, "reason": "passed"},
     )
     return {"messages": new_messages, "turn_id": turn_id, "next_node": "end"}
+
+
+_HUMAN_ACTOR_ALIASES = frozenset({"you", "human", "user", "the human", "me"})
+
+
+def _resolve_react_target(conversation_id: str, persona: Persona, message_id: str, target_actor: str):
+    """Resolves what react_to_message should actually react to. Found live:
+    a real model has no way to know a message's actual id -- ids never
+    appear anywhere in a persona's own visible history
+    (_chat_messages_from_log renders text only) or system prompt -- so
+    requiring an exact `message_id` made the tool call fail every single
+    time in practice (confirmed: two personas, several attempts each, all
+    "no such message"). This resolves from what a model actually has:
+    - `message_id`, if it happens to be a real one (kept for a future
+      caller that DOES have it, e.g. a richer client-side integration).
+    - `target_actor`, matched loosely against "you"/"human"/"user" or a
+      persona's own id/name -- the most recent message from THAT actor.
+    - Neither (or no match): the most recent message from anyone other
+      than the reacting persona itself -- "the last thing said to me",
+      the overwhelmingly common real case ("react to that" with no
+      further specifics).
+    Returns None only when the conversation has no reactable message at
+    all.
+    """
+    messages = derive_messages(conversation_id)
+    if not messages:
+        return None
+
+    if message_id:
+        exact = next((m for m in messages if m.id == message_id), None)
+        if exact is not None:
+            return exact
+
+    if target_actor:
+        normalized = target_actor.strip().lower()
+        if normalized in _HUMAN_ACTOR_ALIASES:
+            resolved_actor = "you"
+        else:
+            resolved_actor = next(
+                (
+                    pid
+                    for pid, p in PERSONAS.items()
+                    if pid.lower() == normalized or p.name.lower() == normalized
+                ),
+                None,
+            )
+        if resolved_actor:
+            by_actor = [m for m in messages if m.actor == resolved_actor]
+            if by_actor:
+                return by_actor[-1]
+
+    others = [m for m in messages if m.actor != persona.id]
+    if others:
+        return others[-1]
+    return messages[-1]
+
+
+async def _handle_react_to_message(
+    state: TapestryGraphState, persona: Persona, turn_id: str, arguments: dict, new_messages: list[dict]
+) -> dict:
+    """Unlike delegate/task_complete/pass_turn, this always routes back to
+    "persona" (never "end") and never appends its own turn/end -- reacting
+    is a lightweight side action, not a way to conclude a turn. The
+    `role: "tool"` feedback message below must carry the react_to_message
+    call's own tool_call_id, exactly the bug just fixed in
+    _handle_task_complete's verification-failed path: every OpenAI-
+    compatible provider rejects a request where an assistant's tool_calls
+    message isn't immediately followed by a matching tool-role response.
+    """
+    conversation_id = state["conversation_id"]
+    turn_count = state.get("turn_count", 0)
+    call_id = ""
+    if new_messages and new_messages[-1].get("tool_calls"):
+        call_id = new_messages[-1]["tool_calls"][0].get("id", "")
+
+    message_id = str(arguments.get("message_id", "") or "")
+    target_actor = str(arguments.get("target_actor", "") or "")
+    emoji = str(arguments.get("emoji", "")).strip()
+    target = _resolve_react_target(conversation_id, persona, message_id, target_actor)
+
+    if target is None or not emoji:
+        content = (
+            "Nothing to react to yet -- this conversation has no messages."
+            if target is None
+            else "No emoji given -- nothing reacted to."
+        )
+    else:
+        reactions.toggle_reaction(conversation_id, target.id, actor=persona.id, emoji=emoji)
+        content = f"Reacted {emoji} to {target.actor}'s message: {target.text[:60]!r}"
+
+    feedback = {"role": "tool", "tool_call_id": call_id, "content": content}
+    return {
+        "messages": new_messages + [feedback],
+        "turn_id": turn_id,
+        "turn_count": turn_count + 1,
+        "next_node": "persona",
+    }
 
 
 def _route_from_persona(state: TapestryGraphState) -> str:

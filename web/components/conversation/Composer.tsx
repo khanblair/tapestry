@@ -1,9 +1,10 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
 import type { Message, Persona } from "@/lib/api";
 import { sendMessage } from "@/lib/api";
-import { SendIcon } from "@/components/ui/icons";
+import { SendIcon, SmileIcon, XIcon } from "@/components/ui/icons";
 import {
   MentionAutocomplete,
   filterMentionCandidates,
@@ -11,6 +12,10 @@ import {
   mentionInsertText,
   type MentionCandidate,
 } from "./MentionAutocomplete";
+
+// Same lazy-load rationale as MessageBubble's own reaction picker: a full
+// emoji data set has no business in the initial bundle.
+const EmojiPicker = dynamic(() => import("emoji-picker-react"), { ssr: false });
 
 export interface ComposerProps {
   conversationId: string;
@@ -20,6 +25,9 @@ export interface ComposerProps {
   personas?: Persona[];
   /** Called with the sent message once the backend confirms it, so the caller can append it optimistically. */
   onSent?: (message: Message) => void;
+  /** Set when the human tapped Reply on an earlier message — shown as a dismissible quoted strip above the input. */
+  replyingTo?: { message: Message; actorName: string };
+  onCancelReply?: () => void;
 }
 
 /** An active "@token" ending at the cursor, e.g. typing "hey @re" -> {start: 4, query: "re"} ("start" is the index of "@" itself). Not a match mid-word (an email address, "foo@bar") since it requires a space or start-of-text right before the "@". */
@@ -43,12 +51,32 @@ function activeMentionAt(text: string, cursor: number): { start: number; query: 
  * insertion aid -- the actual `@handle` parsing/resolution already lives
  * in the backend (`api.py`'s `_resolve_mentions`), unaffected by this.
  */
-export function Composer({ conversationId, recipientName, personas, onSent }: ComposerProps) {
+export function Composer({
+  conversationId,
+  recipientName,
+  personas,
+  onSent,
+  replyingTo,
+  onCancelReply,
+}: ComposerProps) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [mention, setMention] = useState<{ start: number; query: string } | null>(null);
   const [activeIndex, setActiveIndex] = useState(0);
+  const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const emojiPopoverRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!emojiPickerOpen) return;
+    function handleClick(event: MouseEvent) {
+      if (emojiPopoverRef.current && !emojiPopoverRef.current.contains(event.target as Node)) {
+        setEmojiPickerOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [emojiPickerOpen]);
 
   const candidates = useMemo(() => mentionCandidates(personas ?? []), [personas]);
   const filtered = useMemo(
@@ -62,16 +90,34 @@ export function Composer({ conversationId, recipientName, personas, onSent }: Co
     if (!trimmed || sending) return;
     setSending(true);
     try {
-      const message = await sendMessage(conversationId, trimmed);
+      const message = await sendMessage(conversationId, trimmed, replyingTo?.message.id);
       setText("");
       setMention(null);
       onSent?.(message);
+      onCancelReply?.();
     } catch (error) {
       console.error("Failed to send message", error);
     } finally {
       setSending(false);
       textareaRef.current?.focus();
     }
+  }
+
+  // Inserts at the textarea's own cursor position (not just appended to
+  // the end) -- the picker stays open across multiple picks, same as
+  // emoji-picker-react's own default click behavior, so someone can drop
+  // in a few emojis in a row without reopening it each time.
+  function insertEmoji(emoji: string) {
+    const el = textareaRef.current;
+    const cursor = el?.selectionStart ?? text.length;
+    const before = text.slice(0, cursor);
+    const after = text.slice(cursor);
+    setText(`${before}${emoji}${after}`);
+    requestAnimationFrame(() => {
+      const pos = cursor + emoji.length;
+      el?.focus();
+      el?.setSelectionRange(pos, pos);
+    });
   }
 
   function selectMention(candidate: MentionCandidate) {
@@ -91,7 +137,23 @@ export function Composer({ conversationId, recipientName, personas, onSent }: Co
   }
 
   return (
-    <div className="composer">
+    <>
+      {replyingTo && (
+        <div className="reply-preview-strip">
+          <div className="body">
+            <div className="who">Replying to {replyingTo.actorName}</div>
+            <div className="snippet">
+              {replyingTo.message.deleted
+                ? "This message was deleted."
+                : replyingTo.message.text.replace(/\s+/g, " ")}
+            </div>
+          </div>
+          <button type="button" className="icon-btn" aria-label="Cancel reply" onClick={onCancelReply}>
+            <XIcon size={14} />
+          </button>
+        </div>
+      )}
+      <div className="composer">
       {mentionOpen && (
         <MentionAutocomplete
           candidates={filtered}
@@ -100,6 +162,22 @@ export function Composer({ conversationId, recipientName, personas, onSent }: Co
           onHover={setActiveIndex}
         />
       )}
+      <div className="composer-emoji-anchor" ref={emojiPopoverRef}>
+        {emojiPickerOpen && (
+          <div className="composer-emoji-popover">
+            <EmojiPicker onEmojiClick={(data: { emoji: string }) => insertEmoji(data.emoji)} />
+          </div>
+        )}
+        <button
+          type="button"
+          className="icon-btn composer-emoji-btn"
+          aria-label="Add emoji"
+          disabled={sending}
+          onClick={() => setEmojiPickerOpen((open) => !open)}
+        >
+          <SmileIcon size={18} />
+        </button>
+      </div>
       <textarea
         ref={textareaRef}
         className="field"
@@ -152,6 +230,7 @@ export function Composer({ conversationId, recipientName, personas, onSent }: Co
       >
         <SendIcon size={15} />
       </button>
-    </div>
+      </div>
+    </>
   );
 }

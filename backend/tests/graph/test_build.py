@@ -283,6 +283,21 @@ def test_continuation_guidance_tells_the_model_not_to_cut_short_a_timed_request(
     assert "don't cut it short" in prompt.lower()
 
 
+def test_continuation_guidance_tells_the_model_not_to_repeat_a_goodbye():
+    # Live-tested UX complaint: once both personas had already said
+    # goodbye, the round-continuation loop kept going for 10+ more rounds
+    # of "good chat, catch you later" / "ha, you got the last word in
+    # again" -- the pass-by-default framing never told the model that a
+    # SECOND farewell is redundant, not a genuine continuation, even
+    # though the timed-exchange exception right above this rule could
+    # otherwise be read as license to keep manufacturing replies.
+    ada = build.PERSONAS["ada"]
+    prompt = build._build_system_prompt(ada, [], ["ada", "rex"], is_continuation_round=True)
+    assert "already wound the conversation down" in prompt.lower()
+    assert "second, third, or further goodbye" in prompt.lower()
+    assert "no longer applies" in prompt.lower()
+
+
 # ---------------------------------------------------------------------------
 # Proactive check-in -- the one turn web_adapter's proactive check-in loop
 # spawns when a `proactive` persona's DM has sat idle since the human's own
@@ -345,6 +360,218 @@ def test_build_tool_schemas_includes_pass_turn_on_a_continuation_round():
         for s in build._build_tool_schemas(ada.tools, include_pass_turn=True)
     }
     assert build.PASS_TURN_TOOL_NAME in names
+
+
+# ---------------------------------------------------------------------------
+# react_to_message -- offered unconditionally (unlike pass_turn), never ends
+# the turn on its own: loops back to "persona" so a reaction and a real
+# reply can both happen in one turn.
+# ---------------------------------------------------------------------------
+
+
+def test_build_tool_schemas_includes_react_to_message_unconditionally():
+    ada = build.PERSONAS["ada"]
+    names = {s["function"]["name"] for s in build._build_tool_schemas(ada.tools)}
+    assert build.REACT_TO_MESSAGE_TOOL_NAME in names
+
+
+async def test_react_to_message_appends_reaction_and_loops_back_for_a_real_reply(tmp_path):
+    conversation_id = "conv-react-1"
+    target = events_module.append_event(
+        conversation_id, "user/message", actor="you", payload={"text": "how's everyone doing?"}
+    )
+
+    reacts = _tool_call_response(
+        "", "react_to_message", {"message_id": target.id, "emoji": "\U0001F44D"}
+    )
+    replies = _plain_response("Doing well, thanks for asking!")
+    call_model_mock = AsyncMock(side_effect=[reacts, replies])
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        with patch.object(build, "call_model", call_model_mock):
+            state = build.new_state(conversation_id, "rex")
+            result = await graph.ainvoke(state, config)
+
+        assert result["next_node"] == "end"
+        assert call_model_mock.await_count == 2
+
+        logged = events_module.read_events(conversation_id)
+        reaction_events = [e for e in logged if e.type == "reaction/added"]
+        assert len(reaction_events) == 1
+        assert reaction_events[0].actor == "rex"
+        assert reaction_events[0].payload == {"message_id": target.id, "emoji": "\U0001F44D"}
+
+        # Loop-back, not turn-ending: a real assistant/message follows the
+        # reaction, in the SAME turn (only one turn/end -- reacting never
+        # appended its own).
+        assert any(
+            e.type == "assistant/message" and e.payload["text"] == "Doing well, thanks for asking!"
+            for e in logged
+        )
+        turn_ends = [e for e in logged if e.type == "turn/end"]
+        assert len(turn_ends) == 1
+        assert turn_ends[0].payload["reason"] == "assistant_reply"
+    finally:
+        await graph.checkpointer.conn.close()
+
+
+async def test_react_to_message_retry_satisfies_the_tool_response_contract(tmp_path):
+    """Same bug class just fixed in _handle_task_complete: the retry's own
+    message list must satisfy every OpenAI-compatible provider's contract
+    -- an assistant message with tool_calls immediately followed by a
+    tool-role message carrying the SAME tool_call_id, never any other role.
+    """
+    conversation_id = "conv-react-2"
+    target = events_module.append_event(
+        conversation_id, "user/message", actor="you", payload={"text": "hello"}
+    )
+
+    reacts = _tool_call_response("", "react_to_message", {"message_id": target.id, "emoji": "\U0001F389"})
+    replies = _plain_response("Congrats!")
+    call_model_mock = AsyncMock(side_effect=[reacts, replies])
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        with patch.object(build, "call_model", call_model_mock):
+            state = build.new_state(conversation_id, "rex")
+            await graph.ainvoke(state, config)
+
+        second_call_messages = call_model_mock.await_args_list[1].kwargs["messages"]
+        tool_call_message = next(m for m in second_call_messages if m.get("tool_calls"))
+        index = second_call_messages.index(tool_call_message)
+        feedback_message = second_call_messages[index + 1]
+        assert feedback_message["role"] == "tool"
+        assert feedback_message["tool_call_id"] == tool_call_message["tool_calls"][0]["id"]
+    finally:
+        await graph.checkpointer.conn.close()
+
+
+async def test_react_to_message_on_unknown_message_id_does_not_crash(tmp_path):
+    conversation_id = "conv-react-3"
+    reacts = _tool_call_response("", "react_to_message", {"message_id": "no-such-id", "emoji": "\U0001F44D"})
+    replies = _plain_response("Anyway, how can I help?")
+    call_model_mock = AsyncMock(side_effect=[reacts, replies])
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        with patch.object(build, "call_model", call_model_mock):
+            state = build.new_state(conversation_id, "rex")
+            result = await graph.ainvoke(state, config)
+
+        assert result["next_node"] == "end"
+        logged = events_module.read_events(conversation_id)
+        assert not any(e.type == "reaction/added" for e in logged)
+    finally:
+        await graph.checkpointer.conn.close()
+
+
+# Found live: a real model has no way to know a message's actual id (never
+# rendered anywhere in its own history or system prompt) -- confirmed by
+# watching two personas repeatedly guess wrong ids and fail. The tests
+# below cover the fix: resolving a react target from what a model actually
+# has (who said it, or nothing at all) instead of requiring an exact id.
+
+
+async def test_react_to_message_resolves_target_actor_you_to_the_humans_last_message(tmp_path):
+    conversation_id = "conv-react-4"
+    events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "first"})
+    target = events_module.append_event(
+        conversation_id, "user/message", actor="you", payload={"text": "second, react to this"}
+    )
+
+    reacts = _tool_call_response("", "react_to_message", {"target_actor": "you", "emoji": "\U0001F44D"})
+    replies = _plain_response("Done!")
+    call_model_mock = AsyncMock(side_effect=[reacts, replies])
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        with patch.object(build, "call_model", call_model_mock):
+            state = build.new_state(conversation_id, "rex")
+            await graph.ainvoke(state, config)
+
+        logged = events_module.read_events(conversation_id)
+        reaction = next(e for e in logged if e.type == "reaction/added")
+        assert reaction.payload["message_id"] == target.id
+    finally:
+        await graph.checkpointer.conn.close()
+
+
+async def test_react_to_message_resolves_target_actor_by_persona_name_case_insensitive(tmp_path):
+    conversation_id = "conv-react-5"
+    events_module.append_event(conversation_id, "conversation/created", actor="system", payload={
+        "kind": "group", "persona_ids": ["ada", "rex"],
+    })
+    ada_message = events_module.append_event(
+        conversation_id, "assistant/message", actor="ada", payload={"text": "here's my proposal"}
+    )
+
+    reacts = _tool_call_response("", "react_to_message", {"target_actor": "Ada", "emoji": "\U0001F389"})
+    replies = _plain_response("Nice work Ada.")
+    call_model_mock = AsyncMock(side_effect=[reacts, replies])
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        with patch.object(build, "call_model", call_model_mock):
+            state = build.new_state(conversation_id, "rex")
+            await graph.ainvoke(state, config)
+
+        logged = events_module.read_events(conversation_id)
+        reaction = next(e for e in logged if e.type == "reaction/added")
+        assert reaction.payload["message_id"] == ada_message.id
+    finally:
+        await graph.checkpointer.conn.close()
+
+
+async def test_react_to_message_with_no_target_falls_back_to_most_recent_other_message(tmp_path):
+    conversation_id = "conv-react-6"
+    events_module.append_event(conversation_id, "user/message", actor="you", payload={"text": "hi"})
+    latest = events_module.append_event(
+        conversation_id, "user/message", actor="you", payload={"text": "react to whatever's freshest"}
+    )
+
+    reacts = _tool_call_response("", "react_to_message", {"emoji": "\U0001F44D"})
+    replies = _plain_response("Done!")
+    call_model_mock = AsyncMock(side_effect=[reacts, replies])
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        with patch.object(build, "call_model", call_model_mock):
+            state = build.new_state(conversation_id, "rex")
+            await graph.ainvoke(state, config)
+
+        logged = events_module.read_events(conversation_id)
+        reaction = next(e for e in logged if e.type == "reaction/added")
+        assert reaction.payload["message_id"] == latest.id
+    finally:
+        await graph.checkpointer.conn.close()
+
+
+async def test_react_to_message_target_actor_unresolvable_falls_back_to_most_recent_other_message(tmp_path):
+    conversation_id = "conv-react-7"
+    latest = events_module.append_event(
+        conversation_id, "user/message", actor="you", payload={"text": "hello"}
+    )
+
+    # "the previous speaker" isn't a real actor id, alias, or persona name
+    # -- the fallback still finds something reasonable rather than failing.
+    reacts = _tool_call_response(
+        "", "react_to_message", {"target_actor": "the previous speaker", "emoji": "\U0001F44D"}
+    )
+    replies = _plain_response("Done!")
+    call_model_mock = AsyncMock(side_effect=[reacts, replies])
+
+    graph, config = await _run_graph(tmp_path, conversation_id)
+    try:
+        with patch.object(build, "call_model", call_model_mock):
+            state = build.new_state(conversation_id, "rex")
+            await graph.ainvoke(state, config)
+
+        logged = events_module.read_events(conversation_id)
+        reaction = next(e for e in logged if e.type == "reaction/added")
+        assert reaction.payload["message_id"] == latest.id
+    finally:
+        await graph.checkpointer.conn.close()
 
 
 # ---------------------------------------------------------------------------

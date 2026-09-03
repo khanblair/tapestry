@@ -64,6 +64,12 @@ export interface Conversation {
   // member's system prompt above their own persona instructions. undefined
   // when never set.
   context?: string;
+  archived: boolean;
+}
+
+export interface MessageReaction {
+  emoji: string;
+  actor: string;
 }
 
 export interface Message {
@@ -73,6 +79,13 @@ export interface Message {
   text: string;
   timestamp: string;
   eventType: string;
+  // WhatsApp-style quote-reply: the id of the message this one replies
+  // to, or undefined. Look it up in the already-loaded messages list —
+  // there is no separate fetch for it.
+  replyToId?: string;
+  edited?: boolean;
+  deleted?: boolean;
+  reactions?: MessageReaction[];
   // --- additive (optional) — structured payloads the prototype renders
   // inline under a message. ActivityBlock/DiffChip need these to have
   // anything to render; a plain text message simply omits them.
@@ -366,10 +379,61 @@ export async function getMessages(conversationId: string): Promise<Message[]> {
   return request<Message[]>(`/api/conversations/${encodeURIComponent(conversationId)}/messages`);
 }
 
-export async function sendMessage(conversationId: string, text: string): Promise<Message> {
+export async function sendMessage(
+  conversationId: string,
+  text: string,
+  replyToId?: string,
+): Promise<Message> {
   return request<Message>(`/api/conversations/${encodeURIComponent(conversationId)}/messages`, {
     method: "POST",
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text, replyToId }),
+  });
+}
+
+export async function editMessage(
+  conversationId: string,
+  messageId: string,
+  text: string,
+): Promise<Message> {
+  return request<Message>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}`,
+    { method: "PATCH", body: JSON.stringify({ text }) },
+  );
+}
+
+export async function deleteMessage(conversationId: string, messageId: string): Promise<Message> {
+  return request<Message>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}`,
+    { method: "DELETE" },
+  );
+}
+
+// Toggles: reacting again with the same emoji removes it, matching a
+// WhatsApp-style tap-to-react/tap-to-remove gesture. Returns the message's
+// full new reaction list, not just the one that changed.
+export async function reactToMessage(
+  conversationId: string,
+  messageId: string,
+  emoji: string,
+): Promise<Message> {
+  return request<Message>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/reactions`,
+    { method: "POST", body: JSON.stringify({ emoji }) },
+  );
+}
+
+export async function setConversationArchived(conversationId: string, archived: boolean): Promise<void> {
+  await request<void>(`/api/conversations/${encodeURIComponent(conversationId)}/archive`, {
+    method: "POST",
+    body: JSON.stringify({ archived }),
+  });
+}
+
+// Soft-delete: hides the conversation from getConversations, nothing in
+// the underlying log is destroyed.
+export async function deleteConversation(conversationId: string): Promise<void> {
+  await request<void>(`/api/conversations/${encodeURIComponent(conversationId)}`, {
+    method: "DELETE",
   });
 }
 

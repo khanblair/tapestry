@@ -180,7 +180,13 @@ from pydantic.alias_generators import to_camel
 
 from tapestry.core import events
 from tapestry.core.ask import AskAnswer
-from tapestry.core.conversations import derive_conversation_context, derive_membership
+from tapestry.core.conversations import (
+    derive_conversation_archived,
+    derive_conversation_context,
+    derive_conversation_deleted,
+    derive_membership,
+)
+from tapestry.core import reactions as reactions_module
 from tapestry.core.personas import Mode as PersonaMode
 from tapestry.core.personas import Persona, load_personas, save_persona
 from tapestry.graph import build as graph_build
@@ -326,6 +332,11 @@ class ConversationOut(CamelModel):
     # member's system prompt above their own persona instructions (see
     # graph/build.py's _conversation_context_guidance). None when never set.
     context: str | None = None
+    # Archived stays visible (just filterable/segregated in the roster UI).
+    # Deleted has no field here at all -- list_conversations filters those
+    # out entirely (see that endpoint) rather than exposing a "deleted"
+    # flag with no UI that does anything with it.
+    archived: bool = False
 
 
 class ConversationCreateIn(CamelModel):
@@ -396,6 +407,11 @@ FANOUT_CONFIRM_THRESHOLD = 5
 FANOUT_HARD_CAP = 50
 
 
+class ReactionOut(CamelModel):
+    emoji: str
+    actor: str
+
+
 class MessageOut(CamelModel):
     id: str
     conversation_id: str
@@ -404,6 +420,20 @@ class MessageOut(CamelModel):
     timestamp: str
     event_type: str
     thread_id: str | None = None
+    # WhatsApp-style quote-reply target -- the id of the message this one
+    # is replying to, or None. A SEPARATE concept from thread_id above
+    # (that field is the abandoned spun-off thread-pane scaffold).
+    reply_to_id: str | None = None
+    # True once this message has been edited/deleted (message/edited,
+    # message/deleted). `text` is already the latest edit's text, or ""
+    # when deleted -- deleted content never reaches the wire at all, see
+    # _project_messages.
+    edited: bool = False
+    deleted: bool = False
+    # Current reactions on this message, net of every reaction/added and
+    # reaction/removed event targeting it. Empty list, not None, when
+    # there are none -- simpler for the frontend to group/render.
+    reactions: list[ReactionOut] = []
     # Populated for synthetic tool/result and task/diff_ready entries only
     # — see module docstring judgment call 6 and _project_messages below.
     activity: MessageActivityOut | None = None
@@ -424,6 +454,21 @@ class SendMessageIn(CamelModel):
     # existing client (which never sends this field) exactly as
     # frictionless as before for the common, small-mention-count case.
     confirm_fan_out: bool = False
+    # WhatsApp-style quote-reply -- the message this send is replying to.
+    # Human-initiated only for now: nothing on the persona side sets this.
+    reply_to_id: str | None = None
+
+
+class MessageEditIn(CamelModel):
+    text: str
+
+
+class ReactionIn(CamelModel):
+    emoji: str
+
+
+class ArchiveIn(CamelModel):
+    archived: bool
 
 
 class FanOutConfirmationOut(CamelModel):
@@ -777,6 +822,7 @@ def _conversation_row_to_out(row: sqlite3.Row) -> ConversationOut:
         mode=mode,
         model=model,
         context=derive_conversation_context(row["id"]),
+        archived=derive_conversation_archived(row["id"]),
     )
 
 
@@ -1060,21 +1106,29 @@ def _project_messages(conversation_id: str) -> list[MessageOut]:
     }
 
     out: list[MessageOut] = []
+    # Real chat-message entries only (never an ask/tool-result/diff
+    # synthetic entry, which never carries an editable/deletable/
+    # reactable identity of its own) -- id -> index into `out`, so the
+    # second pass below can apply message/edited, message/deleted, and
+    # reaction/added|removed events by simple index lookup, same
+    # technique as core.conversations.derive_messages.
+    message_index_by_id: dict[str, int] = {}
     for event in all_events:
         if event.type.endswith("/message"):
-            out.append(
-                MessageOut(
-                    id=event.id,
-                    conversation_id=event.conversation_id,
-                    actor=event.actor,
-                    text=event.payload.get("text", ""),
-                    timestamp=event.timestamp,
-                    event_type=event.type,
-                    thread_id=event.payload.get("thread_id"),
-                    mentioned_persona_ids=event.payload.get("mentioned_persona_ids"),
-                    skipped_persona_ids=event.payload.get("skipped_persona_ids"),
-                )
+            message = MessageOut(
+                id=event.id,
+                conversation_id=event.conversation_id,
+                actor=event.actor,
+                text=event.payload.get("text", ""),
+                timestamp=event.timestamp,
+                event_type=event.type,
+                thread_id=event.payload.get("thread_id"),
+                reply_to_id=event.payload.get("reply_to_id"),
+                mentioned_persona_ids=event.payload.get("mentioned_persona_ids"),
+                skipped_persona_ids=event.payload.get("skipped_persona_ids"),
             )
+            message_index_by_id[message.id] = len(out)
+            out.append(message)
         elif event.type == "ask/requested" and event.id not in answered_request_ids:
             questions = event.payload.get("questions") or []
             multiple = len(questions) > 1
@@ -1097,6 +1151,35 @@ def _project_messages(conversation_id: str) -> list[MessageOut]:
             diff_message = _diff_ready_message(event)
             if diff_message is not None:
                 out.append(diff_message)
+
+    reactions_by_message: dict[str, dict[tuple[str, str], bool]] = {}
+    for event in all_events:
+        target_id = event.payload.get("message_id")
+        index = message_index_by_id.get(target_id) if target_id else None
+        if index is None:
+            continue
+        if event.type == "message/edited":
+            out[index] = out[index].model_copy(
+                update={"text": event.payload.get("text", out[index].text), "edited": True}
+            )
+        elif event.type == "message/deleted":
+            # Redacted here, at the API boundary, not in the underlying
+            # event -- nothing in the log is ever erased, but a deleted
+            # message's content must never actually reach the wire.
+            out[index] = out[index].model_copy(update={"text": "", "deleted": True})
+        elif event.type in ("reaction/added", "reaction/removed"):
+            active = reactions_by_message.setdefault(target_id, {})
+            active[(event.actor, event.payload.get("emoji", ""))] = event.type == "reaction/added"
+
+    for target_id, active in reactions_by_message.items():
+        index = message_index_by_id.get(target_id)
+        if index is None:
+            continue
+        reactions = [
+            ReactionOut(actor=actor, emoji=emoji) for (actor, emoji), on in active.items() if on
+        ]
+        out[index] = out[index].model_copy(update={"reactions": reactions})
+
     return out
 
 
@@ -1105,6 +1188,7 @@ def _append_user_message(
     text: str,
     mentioned_persona_ids: list[str] | None = None,
     skipped_persona_ids: list[str] | None = None,
+    reply_to_id: str | None = None,
 ) -> MessageOut:
     """`mentioned_persona_ids`/`skipped_persona_ids` are written straight
     into the event payload (not just set on the returned `MessageOut`) so
@@ -1120,6 +1204,8 @@ def _append_user_message(
         payload["mentioned_persona_ids"] = mentioned_persona_ids
     if skipped_persona_ids is not None:
         payload["skipped_persona_ids"] = skipped_persona_ids
+    if reply_to_id is not None:
+        payload["reply_to_id"] = reply_to_id
     event = events.append_event(conversation_id, "user/message", actor="you", payload=payload)
     return MessageOut(
         id=event.id,
@@ -1128,6 +1214,7 @@ def _append_user_message(
         text=text,
         timestamp=event.timestamp,
         event_type=event.type,
+        reply_to_id=reply_to_id,
         mentioned_persona_ids=mentioned_persona_ids,
         skipped_persona_ids=skipped_persona_ids,
     )
@@ -1994,7 +2081,14 @@ async def create_app() -> FastAPI:
 
     @app.get("/api/conversations", response_model=list[ConversationOut])
     async def list_conversations() -> list[ConversationOut]:
-        return [_conversation_row_to_out(row) for row in _list_conversation_rows()]
+        # Deleted conversations never appear here -- there is no "trash"
+        # screen to list them for. Archived ones still do; the roster UI
+        # is what segregates archived from active, not this endpoint.
+        return [
+            _conversation_row_to_out(row)
+            for row in _list_conversation_rows()
+            if not derive_conversation_deleted(row["id"])
+        ]
 
     @app.post("/api/conversations", response_model=ConversationOut, status_code=201)
     async def create_conversation(draft: ConversationCreateIn) -> ConversationOut:
@@ -2035,6 +2129,28 @@ async def create_app() -> FastAPI:
         )
         return Response(status_code=204)
 
+    @app.post("/api/conversations/{conversation_id}/archive", status_code=204)
+    async def set_conversation_archived(conversation_id: str, body: ArchiveIn) -> Response:
+        _ensure_conversation(conversation_id, app)
+        events.append_event(
+            conversation_id,
+            "conversation/archive_changed",
+            actor="you",
+            payload={"archived": body.archived},
+        )
+        return Response(status_code=204)
+
+    @app.delete("/api/conversations/{conversation_id}", status_code=204)
+    async def delete_conversation(conversation_id: str) -> Response:
+        # Same self-heal courtesy every other mutating endpoint gets from
+        # _ensure_conversation -- 404 on an id with no row and no valid
+        # dm-<persona> lazy-vivify match, rather than silently appending a
+        # conversation/deleted event for a conversation that (from the
+        # log's point of view) never existed.
+        _ensure_conversation(conversation_id, app)
+        events.append_event(conversation_id, "conversation/deleted", actor="you", payload={})
+        return Response(status_code=204)
+
     # -- Messages ---------------------------------------------------------
 
     @app.get(
@@ -2069,7 +2185,7 @@ async def create_app() -> FastAPI:
             # "no mention at all -> today's behavior, unchanged."
             _reject_if_persona_paused(persona_ids[0])
             _reject_if_turn_in_progress(app, conversation_id)
-            message = _append_user_message(conversation_id, body.text)
+            message = _append_user_message(conversation_id, body.text, reply_to_id=body.reply_to_id)
             state = graph_build.new_state(conversation_id, persona_ids[0])
             _spawn_turn(app, conversation_id, state, persona_id=persona_ids[0])
             return message
@@ -2114,9 +2230,95 @@ async def create_app() -> FastAPI:
             body.text,
             mentioned_persona_ids=active,
             skipped_persona_ids=skipped,
+            reply_to_id=body.reply_to_id,
         )
         _spawn_fanout_turns(app, conversation_id, active, message.id)
         return message
+
+    def _find_own_message(conversation_id: str, message_id: str) -> events.TapestryEvent:
+        """The original `*/message` event for `message_id` in this
+        conversation, only if it was authored by "you" -- the human is the
+        only actor who can edit/delete a message through this HTTP surface
+        (a persona editing or deleting its own past reply isn't something
+        anything calls into yet). 404 if no such message exists at all,
+        403 if it exists but belongs to someone else, so a client can tell
+        "wrong id" apart from "not yours" rather than both looking like a
+        plain 404.
+        """
+        for event in events.read_events(conversation_id):
+            if event.id == message_id and event.type.endswith("/message"):
+                if event.actor != "you":
+                    raise HTTPException(
+                        status_code=403, detail="you can only edit or delete your own messages"
+                    )
+                return event
+        raise HTTPException(status_code=404, detail=f"message {message_id!r} not found")
+
+    @app.patch(
+        "/api/conversations/{conversation_id}/messages/{message_id}",
+        response_model=MessageOut,
+    )
+    async def edit_message(
+        conversation_id: str, message_id: str, body: MessageEditIn
+    ) -> MessageOut:
+        _ensure_conversation(conversation_id, app)
+        _find_own_message(conversation_id, message_id)
+        events.append_event(
+            conversation_id,
+            "message/edited",
+            actor="you",
+            payload={"message_id": message_id, "text": body.text},
+        )
+        updated = next(m for m in _project_messages(conversation_id) if m.id == message_id)
+        await _broadcast(
+            app, conversation_id, {"type": "message/edited", "payload": updated.model_dump(by_alias=True)}
+        )
+        return updated
+
+    @app.delete(
+        "/api/conversations/{conversation_id}/messages/{message_id}",
+        response_model=MessageOut,
+    )
+    async def delete_message(conversation_id: str, message_id: str) -> MessageOut:
+        _ensure_conversation(conversation_id, app)
+        _find_own_message(conversation_id, message_id)
+        events.append_event(
+            conversation_id, "message/deleted", actor="you", payload={"message_id": message_id}
+        )
+        # Returns the redacted MessageOut (text=="", deleted=True), same
+        # shape as edit/react below -- so a client can merge-by-id off one
+        # uniform WS payload shape for all three "a message changed" frame
+        # types, rather than delete alone carrying a bespoke shape.
+        updated = next(m for m in _project_messages(conversation_id) if m.id == message_id)
+        await _broadcast(
+            app, conversation_id, {"type": "message/deleted", "payload": updated.model_dump(by_alias=True)}
+        )
+        return updated
+
+    @app.post(
+        "/api/conversations/{conversation_id}/messages/{message_id}/reactions",
+        response_model=MessageOut,
+    )
+    async def react_to_message(
+        conversation_id: str, message_id: str, body: ReactionIn
+    ) -> MessageOut:
+        # Any conversation member may react to any real message -- unlike
+        # edit/delete, reacting isn't ownership-gated (see design: reacting
+        # to your own vs. someone else's message is normal in every chat
+        # app this is modeled on). Still must be a genuine message, not a
+        # synthetic ask/tool-result/diff entry with no reaction identity.
+        _ensure_conversation(conversation_id, app)
+        target_exists = any(
+            e.id == message_id and e.type.endswith("/message") for e in events.read_events(conversation_id)
+        )
+        if not target_exists:
+            raise HTTPException(status_code=404, detail=f"message {message_id!r} not found")
+        reactions_module.toggle_reaction(conversation_id, message_id, actor="you", emoji=body.emoji)
+        updated = next(m for m in _project_messages(conversation_id) if m.id == message_id)
+        await _broadcast(
+            app, conversation_id, {"type": "message/reacted", "payload": updated.model_dump(by_alias=True)}
+        )
+        return updated
 
     @app.get(
         "/api/conversations/{conversation_id}/diff/{task_id}", response_model=DiffDetailOut

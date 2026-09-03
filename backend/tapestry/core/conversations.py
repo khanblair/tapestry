@@ -23,6 +23,11 @@ from pydantic import BaseModel
 from tapestry.core import events
 
 
+class Reaction(BaseModel):
+    emoji: str
+    actor: str
+
+
 class Message(BaseModel):
     id: str
     conversation_id: str
@@ -40,6 +45,29 @@ class Message(BaseModel):
     # deliberately left for whoever builds that screen's data layer next —
     # this only guarantees the data is actually there to filter on.
     thread_id: str | None = None
+    # ADDITIVE: WhatsApp-style quote-reply -- the id of the message this
+    # one is replying to, or None for an ordinary message. Deliberately a
+    # SEPARATE concept from thread_id above (that's the abandoned spun-off
+    # thread-pane scaffold; this is one message pointing at one earlier
+    # message, inline in the same stream, never its own sub-thread).
+    reply_to_id: str | None = None
+    # ADDITIVE: True once at least one message/edited event has targeted
+    # this message. The projected `text` is always the LATEST edit's text
+    # (or the original, if never edited) -- history isn't erased from the
+    # log, just not surfaced as separate versions here.
+    edited: bool = False
+    # ADDITIVE: True once a message/deleted event has targeted this
+    # message. `text` is left as the original/last-edited text on the
+    # Message object itself (nothing is destroyed in an event-sourced
+    # log) -- callers that must not display a deleted message's content
+    # (the API layer, going out over the wire) are responsible for
+    # redacting `text` themselves when `deleted` is True; core stays a
+    # pure, non-lossy projection.
+    deleted: bool = False
+    # ADDITIVE: current reactions on this message, net of every
+    # reaction/added and reaction/removed event that targeted it, applied
+    # in log order via core.reactions' toggle convention.
+    reactions: list[Reaction] = []
 
 
 def derive_messages(conversation_id: str) -> list[Message]:
@@ -52,23 +80,57 @@ def derive_messages(conversation_id: str) -> list[Message]:
     is read from `payload["text"]`; an event missing that key projects as
     an empty string rather than raising, since a malformed historical event
     shouldn't take down the whole conversation view.
+
+    A second pass over the same already-fetched event list then applies
+    message/edited, message/deleted, and reaction/added|removed events by
+    looking their target message up in `by_id` -- these three event types
+    never themselves satisfy the `.endswith("/message")` check above, so
+    they're invisible to a persona's own history (`graph/build.py`'s
+    `_chat_messages_from_log`) while still updating the human-facing
+    projection here.
     """
     all_events = events.read_events(conversation_id)
     messages: list[Message] = []
+    index_by_id: dict[str, int] = {}
     for event in all_events:
         if not event.type.endswith("/message"):
             continue
-        messages.append(
-            Message(
-                id=event.id,
-                conversation_id=event.conversation_id,
-                actor=event.actor,
-                text=event.payload.get("text", ""),
-                timestamp=event.timestamp,
-                event_type=event.type,
-                thread_id=event.payload.get("thread_id"),
-            )
+        message = Message(
+            id=event.id,
+            conversation_id=event.conversation_id,
+            actor=event.actor,
+            text=event.payload.get("text", ""),
+            timestamp=event.timestamp,
+            event_type=event.type,
+            thread_id=event.payload.get("thread_id"),
+            reply_to_id=event.payload.get("reply_to_id"),
         )
+        index_by_id[message.id] = len(messages)
+        messages.append(message)
+
+    reactions_by_message: dict[str, dict[tuple[str, str], bool]] = {}
+    for event in all_events:
+        target_id = event.payload.get("message_id")
+        index = index_by_id.get(target_id) if target_id else None
+        if index is None:
+            continue
+        if event.type == "message/edited":
+            messages[index] = messages[index].model_copy(
+                update={"text": event.payload.get("text", messages[index].text), "edited": True}
+            )
+        elif event.type == "message/deleted":
+            messages[index] = messages[index].model_copy(update={"deleted": True})
+        elif event.type in ("reaction/added", "reaction/removed"):
+            active = reactions_by_message.setdefault(target_id, {})
+            active[(event.actor, event.payload.get("emoji", ""))] = event.type == "reaction/added"
+
+    for target_id, active in reactions_by_message.items():
+        index = index_by_id.get(target_id)
+        if index is None:
+            continue
+        reactions = [Reaction(actor=actor, emoji=emoji) for (actor, emoji), on in active.items() if on]
+        messages[index] = messages[index].model_copy(update={"reactions": reactions})
+
     return messages
 
 
@@ -121,6 +183,33 @@ def derive_conversation_context(conversation_id: str) -> str | None:
         if event.type == "conversation/context_set":
             return event.payload.get("context") or None
     return None
+
+
+def derive_conversation_archived(conversation_id: str) -> bool:
+    """Whether this conversation is currently archived -- reverse-scan for
+    the most recent `conversation/archive_changed` event, same toggle
+    convention as reactions (`core.reactions`): the event itself carries
+    the target state (`payload["archived"]`), so this is a plain
+    last-write-wins read, not a running toggle count. False (not
+    archived) when never set.
+    """
+    for event in reversed(events.read_events(conversation_id)):
+        if event.type == "conversation/archive_changed":
+            return bool(event.payload.get("archived", False))
+    return False
+
+
+def derive_conversation_deleted(conversation_id: str) -> bool:
+    """Whether this conversation has been deleted. One-way: there is no
+    "undelete" UI, so unlike archive this is a plain "has a
+    conversation/deleted event ever been appended" check, not a toggle --
+    scanning forward or backward makes no difference, but reversed matches
+    every other derive_conversation_* function's own convention here.
+    """
+    for event in reversed(events.read_events(conversation_id)):
+        if event.type == "conversation/deleted":
+            return True
+    return False
 
 
 def derive_timeline(conversation_id: str) -> list[TimelineItem]:

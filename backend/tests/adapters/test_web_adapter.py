@@ -517,6 +517,183 @@ def test_send_message_persists_and_appears_in_get_messages(client, monkeypatch):
     assert "hi from rex" in texts
 
 
+def test_send_message_with_reply_to_id_is_reflected_back(client, monkeypatch):
+    monkeypatch.setattr(graph_build, "call_model", AsyncMock(return_value=_plain_response("ok")))
+    original = client.post("/api/conversations/dm-rex/messages", json={"text": "first"}).json()
+
+    # The first send's turn is fire-and-forget (asyncio.create_task) --
+    # send the reply too soon and it 409s ("turn in progress"), same as
+    # every other test here that sends twice in a row. Wait for it to
+    # clear first, same polling pattern as
+    # test_send_message_persists_and_appears_in_get_messages above.
+    import time
+
+    for _ in range(50):
+        if any(m["actor"] == "rex" for m in client.get("/api/conversations/dm-rex/messages").json()):
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("rex never replied")
+
+    reply = client.post(
+        "/api/conversations/dm-rex/messages",
+        json={"text": "replying to that", "replyToId": original["id"]},
+    ).json()
+
+    assert reply["replyToId"] == original["id"]
+    listed = client.get("/api/conversations/dm-rex/messages").json()
+    assert next(m for m in listed if m["id"] == reply["id"])["replyToId"] == original["id"]
+
+
+# ---------------------------------------------------------------------------
+# Message edit / delete -- your own messages only.
+# ---------------------------------------------------------------------------
+
+
+def test_edit_message_updates_text_and_marks_edited(client):
+    original = client.post("/api/conversations/dm-rex/messages", json={"text": "hello"}).json()
+
+    res = client.patch(
+        f"/api/conversations/dm-rex/messages/{original['id']}", json={"text": "hello there"}
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["text"] == "hello there"
+    assert body["edited"] is True
+
+    listed = client.get("/api/conversations/dm-rex/messages").json()
+    updated = next(m for m in listed if m["id"] == original["id"])
+    assert updated["text"] == "hello there"
+    assert updated["edited"] is True
+
+
+def test_edit_message_rejects_a_message_you_did_not_author(client, monkeypatch):
+    monkeypatch.setattr(graph_build, "call_model", AsyncMock(return_value=_plain_response("hi from rex")))
+    client.post("/api/conversations/dm-rex/messages", json={"text": "ping"})
+    import time
+
+    for _ in range(50):
+        messages = client.get("/api/conversations/dm-rex/messages").json()
+        rex_message = next((m for m in messages if m["actor"] == "rex"), None)
+        if rex_message:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("rex never replied")
+
+    res = client.patch(
+        f"/api/conversations/dm-rex/messages/{rex_message['id']}", json={"text": "hacked"}
+    )
+    assert res.status_code == 403
+
+
+def test_edit_message_404s_for_unknown_message_id(client):
+    client.post("/api/conversations/dm-rex/messages", json={"text": "hello"})
+    res = client.patch("/api/conversations/dm-rex/messages/no-such-id", json={"text": "x"})
+    assert res.status_code == 404
+
+
+def test_delete_message_redacts_text_and_marks_deleted(client):
+    original = client.post("/api/conversations/dm-rex/messages", json={"text": "oops"}).json()
+
+    res = client.delete(f"/api/conversations/dm-rex/messages/{original['id']}")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["deleted"] is True
+    assert body["text"] == ""
+
+    listed = client.get("/api/conversations/dm-rex/messages").json()
+    updated = next(m for m in listed if m["id"] == original["id"])
+    assert updated["deleted"] is True
+    assert updated["text"] == ""
+
+
+def test_delete_message_rejects_a_message_you_did_not_author(client, monkeypatch):
+    monkeypatch.setattr(graph_build, "call_model", AsyncMock(return_value=_plain_response("hi from rex")))
+    client.post("/api/conversations/dm-rex/messages", json={"text": "ping"})
+    import time
+
+    for _ in range(50):
+        messages = client.get("/api/conversations/dm-rex/messages").json()
+        rex_message = next((m for m in messages if m["actor"] == "rex"), None)
+        if rex_message:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("rex never replied")
+
+    res = client.delete(f"/api/conversations/dm-rex/messages/{rex_message['id']}")
+    assert res.status_code == 403
+
+
+def test_delete_message_404s_for_unknown_message_id(client):
+    client.post("/api/conversations/dm-rex/messages", json={"text": "hello"})
+    res = client.delete("/api/conversations/dm-rex/messages/no-such-id")
+    assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Reactions -- any conversation member, toggled by tapping the same emoji
+# again.
+# ---------------------------------------------------------------------------
+
+
+def test_react_to_message_adds_then_toggles_off(client):
+    original = client.post("/api/conversations/dm-rex/messages", json={"text": "hi"}).json()
+
+    added = client.post(
+        f"/api/conversations/dm-rex/messages/{original['id']}/reactions", json={"emoji": "\U0001F44D"}
+    )
+    assert added.status_code == 200
+    assert added.json()["reactions"] == [{"emoji": "\U0001F44D", "actor": "you"}]
+
+    removed = client.post(
+        f"/api/conversations/dm-rex/messages/{original['id']}/reactions", json={"emoji": "\U0001F44D"}
+    )
+    assert removed.status_code == 200
+    assert removed.json()["reactions"] == []
+
+
+def test_react_to_message_404s_for_unknown_message_id(client):
+    client.post("/api/conversations/dm-rex/messages", json={"text": "hi"})
+    res = client.post(
+        "/api/conversations/dm-rex/messages/no-such-id/reactions", json={"emoji": "\U0001F44D"}
+    )
+    assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Archive / delete a conversation.
+# ---------------------------------------------------------------------------
+
+
+def test_archive_conversation_toggles_and_is_reflected_in_list(client):
+    client.post("/api/conversations", json={"kind": "dm", "personaIds": ["rex"]})
+
+    res = client.post("/api/conversations/dm-rex/archive", json={"archived": True})
+    assert res.status_code == 204
+    listed = client.get("/api/conversations").json()
+    assert next(c for c in listed if c["id"] == "dm-rex")["archived"] is True
+
+    client.post("/api/conversations/dm-rex/archive", json={"archived": False})
+    listed = client.get("/api/conversations").json()
+    assert next(c for c in listed if c["id"] == "dm-rex")["archived"] is False
+
+
+def test_delete_conversation_removes_it_from_the_list(client):
+    client.post("/api/conversations", json={"kind": "dm", "personaIds": ["rex"]})
+    assert any(c["id"] == "dm-rex" for c in client.get("/api/conversations").json())
+
+    res = client.delete("/api/conversations/dm-rex")
+    assert res.status_code == 204
+    assert not any(c["id"] == "dm-rex" for c in client.get("/api/conversations").json())
+
+
+def test_delete_conversation_404s_for_an_unknown_group_conversation(client):
+    res = client.delete("/api/conversations/grp-does-not-exist")
+    assert res.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # The critical end-to-end path: send -> WS "message" frames -> interrupt
 # surfaces -> answer -> resume -> tool runs exactly once -> final reply

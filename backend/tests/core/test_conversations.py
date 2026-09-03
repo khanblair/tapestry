@@ -3,7 +3,9 @@ from __future__ import annotations
 from tapestry.core.conversations import (
     Message,
     TimelineItem,
+    derive_conversation_archived,
     derive_conversation_context,
+    derive_conversation_deleted,
     derive_messages,
     derive_timeline,
 )
@@ -161,3 +163,83 @@ def test_derive_conversation_context_is_scoped_to_conversation():
     append_event("conv-2", "conversation/context_set", "you", {"context": "conv-2's rule."})
 
     assert derive_conversation_context("conv-1") == "conv-1's rule."
+
+
+def test_derive_conversation_archived_defaults_false():
+    assert derive_conversation_archived("conv-1") is False
+
+
+def test_derive_conversation_archived_reflects_the_latest_toggle():
+    append_event("conv-1", "conversation/archive_changed", "you", {"archived": True})
+    assert derive_conversation_archived("conv-1") is True
+
+    append_event("conv-1", "conversation/archive_changed", "you", {"archived": False})
+    assert derive_conversation_archived("conv-1") is False
+
+
+def test_derive_conversation_deleted_defaults_false():
+    assert derive_conversation_deleted("conv-1") is False
+
+
+def test_derive_conversation_deleted_true_once_deleted():
+    append_event("conv-1", "conversation/deleted", "you", {})
+    assert derive_conversation_deleted("conv-1") is True
+
+
+def test_derive_messages_reflects_the_latest_edit():
+    original = append_event("conv-1", "user/message", "human", {"text": "hello"})
+    append_event("conv-1", "message/edited", "you", {"message_id": original.id, "text": "hello there"})
+    append_event("conv-1", "message/edited", "you", {"message_id": original.id, "text": "hello there!"})
+
+    messages = derive_messages("conv-1")
+
+    assert len(messages) == 1
+    assert messages[0].text == "hello there!"
+    assert messages[0].edited is True
+
+
+def test_derive_messages_marks_a_deleted_message_but_keeps_its_text():
+    original = append_event("conv-1", "user/message", "human", {"text": "oops"})
+    append_event("conv-1", "message/deleted", "you", {"message_id": original.id})
+
+    messages = derive_messages("conv-1")
+
+    assert messages[0].deleted is True
+    # core stays a non-lossy projection -- redaction is the API layer's job.
+    assert messages[0].text == "oops"
+
+
+def test_derive_messages_edit_and_delete_are_scoped_by_message_id():
+    first = append_event("conv-1", "user/message", "human", {"text": "first"})
+    second = append_event("conv-1", "user/message", "human", {"text": "second"})
+    append_event("conv-1", "message/edited", "you", {"message_id": first.id, "text": "first, edited"})
+    append_event("conv-1", "message/deleted", "you", {"message_id": second.id})
+
+    messages = derive_messages("conv-1")
+
+    assert messages[0].text == "first, edited"
+    assert messages[0].edited is True
+    assert messages[0].deleted is False
+    assert messages[1].deleted is True
+    assert messages[1].edited is False
+
+
+def test_derive_messages_aggregates_net_reactions():
+    original = append_event("conv-1", "user/message", "human", {"text": "hi"})
+    append_event("conv-1", "reaction/added", "ada", {"message_id": original.id, "emoji": "\U0001F44D"})
+    append_event("conv-1", "reaction/added", "rex", {"message_id": original.id, "emoji": "\U0001F389"})
+
+    messages = derive_messages("conv-1")
+
+    reactions = {(r.actor, r.emoji) for r in messages[0].reactions}
+    assert reactions == {("ada", "\U0001F44D"), ("rex", "\U0001F389")}
+
+
+def test_derive_messages_a_removed_reaction_does_not_appear():
+    original = append_event("conv-1", "user/message", "human", {"text": "hi"})
+    append_event("conv-1", "reaction/added", "ada", {"message_id": original.id, "emoji": "\U0001F44D"})
+    append_event("conv-1", "reaction/removed", "ada", {"message_id": original.id, "emoji": "\U0001F44D"})
+
+    messages = derive_messages("conv-1")
+
+    assert messages[0].reactions == []

@@ -77,10 +77,10 @@ export const MOCK_PERSONAS: Persona[] = [
 // above, since no `mode/changed` or `persona/model_switched` event exists
 // for any of these conversations yet.
 export const MOCK_CONVERSATIONS: Conversation[] = [
-  { id: "dm-ada", kind: "dm", personaIds: ["ada"], lastPreview: "Sent the auth architecture proposal", updatedAt: minutesAgo(2), mode: "manual", model: "Claude Opus 4.8" },
-  { id: "dm-rex", kind: "dm", personaIds: ["rex"], lastPreview: "Fixed — re-running tests now", updatedAt: minutesAgo(4), mode: "manual", model: "DeepSeek V3.2" },
-  { id: "dm-vex", kind: "dm", personaIds: ["vex"], lastPreview: "Token scoping looks right now", updatedAt: minutesAgo(6), mode: "manual", model: "Claude Sonnet 5" },
-  { id: "dm-nova", kind: "dm", personaIds: ["nova"], lastPreview: "Standing by for the deploy", updatedAt: minutesAgo(60), mode: "manual", model: "Gemini 3 Pro" },
+  { id: "dm-ada", kind: "dm", personaIds: ["ada"], lastPreview: "Sent the auth architecture proposal", updatedAt: minutesAgo(2), mode: "manual", model: "Claude Opus 4.8", archived: false },
+  { id: "dm-rex", kind: "dm", personaIds: ["rex"], lastPreview: "Fixed — re-running tests now", updatedAt: minutesAgo(4), mode: "manual", model: "DeepSeek V3.2", archived: false },
+  { id: "dm-vex", kind: "dm", personaIds: ["vex"], lastPreview: "Token scoping looks right now", updatedAt: minutesAgo(6), mode: "manual", model: "Claude Sonnet 5", archived: false },
+  { id: "dm-nova", kind: "dm", personaIds: ["nova"], lastPreview: "Standing by for the deploy", updatedAt: minutesAgo(60), mode: "manual", model: "Gemini 3 Pro", archived: false },
   {
     id: "grp-auth",
     kind: "group",
@@ -90,6 +90,7 @@ export const MOCK_CONVERSATIONS: Conversation[] = [
     updatedAt: minutesAgo(4),
     mode: "manual",
     model: "Claude Opus 4.8",
+    archived: false,
   },
 ];
 

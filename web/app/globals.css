@@ -240,6 +240,16 @@ button {
     flex-basis: 270px;
   }
 }
+@media (min-width: 900px) {
+  /* Resizable sidebar (RosterList.tsx) -- only at the width where the
+     roster is a real, independently-sized pane rather than a full-width
+     mobile view or the fixed 270px tablet compromise above. Falls back
+     to 300px if the custom property was never set (SSR, or before the
+     mount-time localStorage read below applies it). */
+  .pane-roster {
+    flex-basis: var(--sidebar-width, 300px);
+  }
+}
 
 .topbar {
   height: 56px;
@@ -1208,4 +1218,359 @@ select.input {
     z-index: auto;
     flex: 0 0 320px;
   }
+}
+
+/* ---------- conversation menu (3-dot dropdown: settings/archive/delete) ---
+ * Same absolutely-positioned-popover pattern as .scope-picker above --
+ * anchored off the topbar's own DotsIcon button, which needs
+ * position:relative for this to place correctly.
+ */
+.conv-menu-anchor {
+  position: relative;
+}
+.conv-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
+  z-index: 30;
+  min-width: 180px;
+}
+.conv-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 7px;
+  padding: 8px 9px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text);
+  cursor: pointer;
+}
+.conv-menu-item:hover {
+  background: var(--surface-hover);
+}
+.conv-menu-item.danger {
+  color: var(--danger);
+}
+
+/* ---------- sidebar: resizable + collapsible ---------- */
+.pane-roster {
+  position: relative;
+}
+.sidebar-resize-handle {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 5;
+}
+.sidebar-resize-handle:hover,
+.sidebar-resize-handle.active {
+  background: var(--accent);
+  opacity: 0.35;
+}
+/* Both the collapse effect and the floating expand button are gated to
+   900px+ -- below that, the EXISTING mobile/tablet rules above
+   (flex:1 1 100%, [data-route="conversation"] .pane-roster{display:none},
+   the fixed 270px tablet width) already own roster visibility entirely.
+   A `collapsed=true` value persisted from a wide screen must never affect
+   a narrower one: found live, an earlier version applied `.collapsed`
+   unconditionally and, combined with the button being always
+   `position:fixed` regardless of width, produced a real bug at <768px --
+   the roster panel vanished (no CSS rule left to show it) and the
+   floating expand button landed directly on the conversation topbar's
+   own back arrow, both drawing in the same top-left corner. */
+.sidebar-expand-btn,
+.sidebar-collapse-btn {
+  display: none;
+}
+@media (min-width: 900px) {
+  .sidebar-collapse-btn {
+    display: flex;
+  }
+  .pane-roster.collapsed {
+    flex: 0 0 0px;
+    width: 0;
+    overflow: hidden;
+    border-right: none;
+  }
+  .sidebar-expand-btn.visible {
+    display: flex;
+    position: fixed;
+    top: 14px;
+    left: 10px;
+    z-index: 15;
+  }
+}
+
+/* ---------- scroll-to-bottom ---------- */
+.scroll-to-bottom-btn {
+  position: absolute;
+  bottom: 84px;
+  right: 22px;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text);
+}
+.scroll-to-bottom-btn:hover {
+  background: var(--surface-hover);
+}
+.scroll-to-bottom-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 99px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.pane-conversation .scroll {
+  position: relative;
+}
+
+/* ---------- message hover actions (reply / react / edit / delete) ---------- */
+.msg {
+  position: relative;
+}
+.msg-actions {
+  position: absolute;
+  top: -14px;
+  right: 8px;
+  display: none;
+  align-items: center;
+  gap: 2px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 2px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  z-index: 4;
+}
+.msg:hover .msg-actions,
+.msg-actions.open {
+  display: flex;
+}
+.msg-action-btn {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text-muted);
+}
+.msg-action-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.msg-action-btn.danger:hover {
+  color: var(--danger);
+}
+
+/* ---------- reply quote (composer strip + inline bubble preview) ---------- */
+.reply-preview-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  margin: 0 10px 6px;
+  background: var(--surface-2);
+  border-left: 3px solid var(--border-strong);
+  border-radius: 6px;
+  font-size: 12px;
+}
+.reply-preview-strip .body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.reply-preview-strip .who {
+  font-weight: 700;
+  color: var(--text);
+}
+.reply-preview-strip .snippet {
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.msg-reply-quote {
+  display: block;
+  padding: 5px 8px;
+  margin-bottom: 4px;
+  background: var(--surface-2);
+  border-left: 3px solid var(--border-strong);
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.msg-reply-quote .who {
+  font-weight: 700;
+  color: var(--text);
+  display: block;
+}
+.msg-reply-quote .snippet {
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: block;
+}
+
+/* ---------- edited / deleted ---------- */
+.msg-edited-tag {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  margin-left: 4px;
+}
+.msg-deleted-text {
+  font-size: 13.5px;
+  font-style: italic;
+  color: var(--text-faint);
+}
+.msg-edit-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.msg-edit-box textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 44px;
+  font-size: 13.5px;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 7px 9px;
+}
+.msg-edit-box .actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* ---------- reactions ---------- */
+.reaction-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 5px;
+}
+.reaction-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 99px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  font-size: 12px;
+  cursor: pointer;
+  line-height: 1.6;
+}
+.reaction-chip:hover {
+  background: var(--surface-hover);
+}
+.reaction-chip.mine {
+  border-color: var(--border-strong);
+  background: var(--danger-wash);
+}
+.reaction-chip .count {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.emoji-popover {
+  position: absolute;
+  top: -8px;
+  right: 8px;
+  /* emoji-picker-react's own default size (both the full picker and the
+     reactionsDefaultOpen quick-pick bar) reads oversized next to a chat
+     bubble -- scaled down uniformly rather than fighting the library's
+     internal sizing props/classnames, which differ between its two modes. */
+  transform-origin: bottom right;
+  transform: translateY(-100%) scale(0.72);
+  z-index: 30;
+}
+.quick-reactions {
+  position: absolute;
+  top: -46px;
+  right: 8px;
+  display: none;
+  align-items: center;
+  gap: 2px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 4px 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  z-index: 6;
+}
+.quick-reactions.open {
+  display: flex;
+}
+.quick-reactions button {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  border-radius: 50%;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.quick-reactions button:hover {
+  background: var(--surface-hover);
+}
+
+/* ---------- composer emoji picker (send-a-message emoji, distinct from
+   the per-message reaction picker above) ---------- */
+.composer-emoji-anchor {
+  position: relative;
+  flex: 0 0 auto;
+}
+.composer-emoji-btn {
+  color: var(--text-muted);
+}
+.composer-emoji-popover {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  margin-bottom: 6px;
+  transform-origin: bottom left;
+  transform: scale(0.85);
+  z-index: 30;
 }
