@@ -826,16 +826,19 @@ button {
   gap: 8px;
   border: 1px solid var(--border);
   background: var(--surface);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   padding: 8px 12px;
   font-size: 12px;
   cursor: pointer;
-  transition: border-color 0.15s;
+  transition: border-color var(--ease-spring), transform var(--ease-spring);
   color: var(--text);
   text-decoration: none;
 }
 .diff-chip:hover {
   border-color: var(--border-strong);
+}
+.diff-chip:active {
+  transform: scale(0.97);
 }
 .diff-chip .plus {
   color: var(--diff-add-fg);
@@ -1233,7 +1236,7 @@ select.input {
 .diff-tabs {
   display: flex;
   gap: 4px;
-  padding: 10px 14px 0;
+  padding: var(--space-3) var(--space-4) 0;
   border-bottom: 1px solid var(--border);
   overflow-x: auto;
 }
@@ -1249,6 +1252,10 @@ select.input {
   border-left: none;
   border-right: none;
   border-top: none;
+  transition: color var(--ease-spring), border-color var(--ease-spring), transform var(--ease-spring);
+}
+.diff-tab:active {
+  transform: scale(0.97);
 }
 .diff-tab.active {
   color: var(--text);

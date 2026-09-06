@@ -38,7 +38,7 @@ export function DiffViewer({ files, additions, deletions, fileCount, initialTab 
 
   return (
     <div className="diff-viewer">
-      <div className="crumbs" style={{ padding: "10px 14px 0" }}>
+      <div className="crumbs" style={{ padding: "var(--space-3) var(--space-4) 0" }}>
         <span>{count} file{count === 1 ? "" : "s"}</span>
         <span>·</span>
         <span className="plus" style={{ color: "var(--diff-add-fg)" }}>
@@ -64,7 +64,7 @@ export function DiffViewer({ files, additions, deletions, fileCount, initialTab 
         ))}
       </div>
 
-      <div style={{ padding: "14px 0" }} role="tabpanel">
+      <div style={{ padding: "var(--space-4) 0" }} role="tabpanel">
         {file?.lines.map((line, idx) => {
           const sign = line.type === "add" ? "+" : line.type === "del" ? "-" : " ";
           return (
