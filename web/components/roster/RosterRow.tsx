@@ -1,6 +1,6 @@
 import Link from "next/link";
 import type { Conversation, Persona } from "@/lib/api";
-import { GroupAvatar, PersonaAvatar } from "@/components/persona/PersonaAvatar";
+import { AvatarGroup, PersonaAvatar } from "@/components/persona/PersonaAvatar";
 import { RelativeTime } from "@/components/roster/RelativeTime";
 
 export interface RosterRowProps {
@@ -14,6 +14,9 @@ export interface RosterRowProps {
 export function RosterRow({ conversation, personas, active }: RosterRowProps) {
   const isGroup = conversation.kind === "group";
   const primaryPersona = personas.find((p) => p.id === conversation.personaIds[0]);
+  const groupMembers = conversation.personaIds
+    .map((id) => personas.find((p) => p.id === id))
+    .filter((p): p is Persona => p !== undefined);
 
   const name = isGroup
     ? conversation.name ?? "Group"
@@ -21,7 +24,11 @@ export function RosterRow({ conversation, personas, active }: RosterRowProps) {
 
   return (
     <Link href={`/conversation/${conversation.id}`} className={`roster-row${active ? " active" : ""}`}>
-      {isGroup || !primaryPersona ? <GroupAvatar /> : <PersonaAvatar persona={primaryPersona} />}
+      {isGroup || !primaryPersona ? (
+        <AvatarGroup personas={groupMembers} />
+      ) : (
+        <PersonaAvatar persona={primaryPersona} />
+      )}
       <div style={{ minWidth: 0, flex: 1 }}>
         <div className="rname">{name}</div>
         {conversation.lastPreview && <div className="rprev">{conversation.lastPreview}</div>}

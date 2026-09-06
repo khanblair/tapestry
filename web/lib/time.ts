@@ -38,3 +38,36 @@ export function formatClockTime(iso: string): string {
   if (Number.isNaN(date.getTime())) return "";
   return date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
 }
+
+/**
+ * True if two message timestamps fall on the same calendar day in the
+ * viewer's local timezone — used to decide where a day-chip divider goes
+ * in the message list. Plain "HH:MM" fixture timestamps (see
+ * formatClockTime above) have no date component at all, so they always
+ * count as the same day as each other; a day-chip still renders once,
+ * above the very first message, via the `previous === undefined` case at
+ * the call site.
+ */
+export function isSameCalendarDay(isoA: string, isoB: string): boolean {
+  const a = new Date(isoA);
+  const b = new Date(isoB);
+  if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return true;
+  return a.toDateString() === b.toDateString();
+}
+
+/** Formats a message timestamp as a day-chip label: "Today", "Yesterday", or a full date. */
+export function formatDayLabel(iso: string, now: Date = new Date()): string {
+  if (/^\d{1,2}:\d{2}$/.test(iso)) return "Today";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  if (date.toDateString() === now.toDateString()) return "Today";
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return "Yesterday";
+  const sameYear = date.getFullYear() === now.getFullYear();
+  return date.toLocaleDateString(undefined, {
+    month: "long",
+    day: "numeric",
+    year: sameYear ? undefined : "numeric",
+  });
+}

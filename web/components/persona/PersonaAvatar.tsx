@@ -42,12 +42,39 @@ export function YouAvatar({ size = "default" }: { size?: AvatarSize }) {
   );
 }
 
-/** The gradient group-conversation avatar (prototype: linear-gradient(135deg,#3B82F6,#8B5CF6) with a users icon). */
+/** The gradient group-conversation avatar (prototype: linear-gradient(135deg,#3B82F6,#8B5CF6) with a users icon). Used where a specific conversation's members aren't the point — e.g. the "@all" mention option. */
 export function GroupAvatar({ size = "default" }: { size?: AvatarSize }) {
   const classes = ["avatar", SIZE_CLASS[size]].filter(Boolean).join(" ");
   return (
     <div className={classes} style={{ background: "linear-gradient(135deg,#3B82F6,#8B5CF6)" }}>
       <UsersIcon size={size === "sm" ? 13 : 17} />
+    </div>
+  );
+}
+
+/**
+ * Overlapping stack of each group conversation's actual member avatars
+ * (Liquid Glass: real personas, not a generic group glyph) — falls back to
+ * GroupAvatar when no members resolved yet (e.g. personas still loading).
+ */
+export function AvatarGroup({
+  personas,
+  size = "default",
+  max = 3,
+}: {
+  personas: Pick<Persona, "name" | "color">[];
+  size?: AvatarSize;
+  max?: number;
+}) {
+  if (personas.length === 0) return <GroupAvatar size={size} />;
+  const classes = ["avatar", SIZE_CLASS[size]].filter(Boolean).join(" ");
+  return (
+    <div className="avatar-group">
+      {personas.slice(0, max).map((persona, i) => (
+        <div key={i} className={classes} style={{ background: persona.color }}>
+          {initials(persona.name)}
+        </div>
+      ))}
     </div>
   );
 }

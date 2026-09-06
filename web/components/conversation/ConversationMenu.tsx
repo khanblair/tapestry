@@ -26,7 +26,13 @@ export function ConversationMenu({
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
   const anchorRef = useRef<HTMLDivElement>(null);
+
+  function showToast(message: string) {
+    setToast(message);
+    setTimeout(() => setToast(null), 1400);
+  }
 
   useEffect(() => {
     if (!open) return;
@@ -41,9 +47,11 @@ export function ConversationMenu({
     if (busy) return;
     setBusy(true);
     try {
-      await setConversationArchived(conversationId, !archived);
-      onArchivedChanged(!archived);
+      const nextArchived = !archived;
+      await setConversationArchived(conversationId, nextArchived);
+      onArchivedChanged(nextArchived);
       setOpen(false);
+      showToast(nextArchived ? "Conversation archived" : "Conversation unarchived");
       // RosterList is a SEPARATE server-fetched component (app/conversation/
       // [id]/page.tsx) -- this only updates ConversationView's own local
       // `archived` state, which the sidebar has no way to see. Found live:
@@ -103,6 +111,7 @@ export function ConversationMenu({
           </button>
         </div>
       )}
+      {toast && <div className="toast show">{toast}</div>}
     </div>
   );
 }

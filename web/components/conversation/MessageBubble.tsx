@@ -131,7 +131,7 @@ export function MessageBubble({
   }
 
   return (
-    <div className={`msg${isYou ? " msg-mine" : ""}`}>
+    <div className={`msg${isYou ? " msg-mine" : ""}${editing ? " editing" : ""}`}>
       {isYou ? <YouAvatar size="sm" /> : <PersonaAvatar persona={actorPersona} size="sm" />}
       <div className="body">
         <div className="msg-head">
@@ -229,56 +229,56 @@ export function MessageBubble({
             ))}
           </div>
         )}
-      </div>
 
-      {!editing && (
-        <div className={`msg-actions${pickerOpen ? " open" : ""}`}>
-          {onReact && (
-            <button
-              type="button"
-              className="msg-action-btn"
-              aria-label="React"
-              onClick={() => setPickerOpen((open) => !open)}
-            >
-              <SmileIcon size={15} />
-            </button>
-          )}
-          {onReply && (
-            <button type="button" className="msg-action-btn" aria-label="Reply" onClick={() => onReply(message)}>
-              <ReplyIcon size={15} />
-            </button>
-          )}
-          {isYou && onEdit && (
-            <button type="button" className="msg-action-btn" aria-label="Edit" onClick={() => setEditing(true)}>
-              <EditIcon size={14} />
-            </button>
-          )}
-          {isYou && onDelete && (
-            <button
-              type="button"
-              className="msg-action-btn danger"
-              aria-label="Delete"
-              onClick={() => {
-                if (window.confirm("Delete this message?")) void onDelete(message.id);
+        {!editing && (
+          <div className={`msg-actions${pickerOpen ? " open" : ""}`}>
+            {onReact && (
+              <button
+                type="button"
+                className="msg-action-btn"
+                aria-label="React"
+                onClick={() => setPickerOpen((open) => !open)}
+              >
+                <SmileIcon size={15} />
+              </button>
+            )}
+            {onReply && (
+              <button type="button" className="msg-action-btn" aria-label="Reply" onClick={() => onReply(message)}>
+                <ReplyIcon size={15} />
+              </button>
+            )}
+            {isYou && onEdit && (
+              <button type="button" className="msg-action-btn" aria-label="Edit" onClick={() => setEditing(true)}>
+                <EditIcon size={14} />
+              </button>
+            )}
+            {isYou && onDelete && (
+              <button
+                type="button"
+                className="msg-action-btn danger"
+                aria-label="Delete"
+                onClick={() => {
+                  if (window.confirm("Delete this message?")) void onDelete(message.id);
+                }}
+              >
+                <TrashIcon size={14} />
+              </button>
+            )}
+          </div>
+        )}
+
+        {pickerOpen && (
+          <div className="emoji-popover">
+            <EmojiPicker
+              reactionsDefaultOpen
+              onEmojiClick={(data: { emoji: string }) => {
+                void onReact?.(message.id, data.emoji);
+                setPickerOpen(false);
               }}
-            >
-              <TrashIcon size={14} />
-            </button>
-          )}
-        </div>
-      )}
-
-      {pickerOpen && (
-        <div className="emoji-popover">
-          <EmojiPicker
-            reactionsDefaultOpen
-            onEmojiClick={(data: { emoji: string }) => {
-              void onReact?.(message.id, data.emoji);
-              setPickerOpen(false);
-            }}
-          />
-        </div>
-      )}
+            />
+          </div>
+        )}
+      </div>
     </div>
   );
 }

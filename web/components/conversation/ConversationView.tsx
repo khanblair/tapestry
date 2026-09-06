@@ -10,9 +10,11 @@ import {
   subscribeToConversation,
   stopConversation,
 } from "@/lib/api";
-import { PersonaAvatar, GroupAvatar } from "@/components/persona/PersonaAvatar";
+import { AvatarGroup, PersonaAvatar } from "@/components/persona/PersonaAvatar";
 import { StatusPill } from "@/components/persona/StatusDot";
 import { ArrowDownIcon, BackIcon, FolderIcon, StopIcon } from "@/components/ui/icons";
+import { isSameCalendarDay } from "@/lib/time";
+import { DayChip } from "./DayChip";
 import { MessageBubble } from "./MessageBubble";
 import { Composer } from "./Composer";
 import { ApprovalCard } from "@/components/approvals/ApprovalCard";
@@ -240,7 +242,7 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
 
         {isGroup ? (
           <>
-            <GroupAvatar size="sm" />
+            <AvatarGroup personas={groupPersonas} size="sm" max={2} />
             <div>
               <h2>{headerName}</h2>
               <div className="sub">{groupPersonas.map((p) => p.name).join(", ")}</div>
@@ -288,13 +290,16 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
                 This is the start of {isGroup ? headerName : `your DM with ${headerName}`}.
               </div>
             )}
-            {messages.map((message) => {
+            {messages.map((message, index) => {
               const replyTarget = message.replyToId ? messageById.get(message.replyToId) : undefined;
+              const previous = messages[index - 1];
+              const showDayChip = !previous || !isSameCalendarDay(previous.timestamp, message.timestamp);
               return (
                 <div key={message.id} ref={(el) => {
                   if (el) messageRefs.current.set(message.id, el);
                   else messageRefs.current.delete(message.id);
                 }}>
+                  {showDayChip && <DayChip iso={message.timestamp} />}
                   <MessageBubble
                     message={message}
                     actorPersona={message.actor === "you" ? undefined : personaById.get(message.actor)}
