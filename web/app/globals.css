@@ -423,7 +423,7 @@ button {
   width: 100%;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 9px;
+  border-radius: var(--radius-sm);
   padding: 8px 10px 8px 34px;
   font-size: 13px;
   color: var(--text);
@@ -453,14 +453,17 @@ button {
   gap: 10px;
   padding: 9px 12px;
   margin: 0 6px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   cursor: pointer;
-  transition: background 0.12s;
+  transition: background 0.15s var(--ease-spring), transform 0.15s var(--ease-spring);
   text-decoration: none;
   color: inherit;
 }
 .roster-row:hover {
   background: var(--surface-hover);
+}
+.roster-row:active {
+  transform: scale(0.985);
 }
 .roster-row.active {
   background: var(--accent-wash);
@@ -1373,10 +1376,12 @@ select.input {
   height: 100%;
   cursor: col-resize;
   z-index: 5;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity 0.16s var(--ease-spring);
 }
 .sidebar-resize-handle:hover,
 .sidebar-resize-handle.active {
-  background: var(--accent);
   opacity: 0.35;
 }
 /* Both the collapse effect and the floating expand button are gated to
