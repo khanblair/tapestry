@@ -526,7 +526,8 @@ async def _mode_requires_approval(
     return True
 
 # Interim permission-wrapping guard, NOT a sandbox — the real sandbox
-# boundary is the Phase 4 Docker tool-runner (see project_structure.md).
+# boundary is the still-unbuilt Phase 4 tool-runner (see project_structure.md's
+# Docker section for why that's no longer planned as a Docker container).
 # Rejects the obvious ways a "read only"/"git only"/"test only" tool could
 # be walked into running something else via shell metacharacters.
 _SHELL_METACHARACTERS = (";", "&&", "||", "|", "`", "$(")

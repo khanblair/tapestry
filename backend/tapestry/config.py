@@ -43,9 +43,8 @@ from dotenv import load_dotenv
 
 # Idempotent — safe to import this module more than once (e.g. from both
 # main.py and a test). Does not override a variable already set in the
-# real environment, so `docker-compose.yml`'s env_file mechanism (which
-# sets real env vars before the process even starts) always wins over a
-# stale .env file that happened to also be present.
+# real environment, so an env var exported before the process starts
+# always wins over a stale .env file that happened to also be present.
 load_dotenv()
 
 

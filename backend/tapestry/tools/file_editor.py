@@ -20,11 +20,12 @@ to, e.g. ``/etc/hosts``, a sibling project, or ``~/.ssh/authorized_keys``.
 
 The **only** real restriction the library offers is the off-by-default
 ``allowed_edits_files`` allow-list constructor arg. That allow-list is
-this shim's whole security boundary until the Phase 4 Docker tool-runner
-sandbox exists (see ``project_structure.md``'s ``docker/tool-runner/``
-section) — every caller that lets a model choose ``path`` MUST pass
-``allowed_paths`` explicitly. There is no default deny; an unset
-``allowed_paths`` means "edit anything this process can write to."
+this shim's whole security boundary until the Phase 4 sandbox exists
+(see ``project_structure.md``'s Docker section for why that sandbox is
+no longer planned as a Docker container) — every caller that lets a
+model choose ``path`` MUST pass ``allowed_paths`` explicitly. There is
+no default deny; an unset ``allowed_paths`` means "edit anything this
+process can write to."
 
 Verified live: ``allowed_edits_files`` is matched against the exact
 resolved path passed in each ``FileEditorAction`` (not a directory-prefix

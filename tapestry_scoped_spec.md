@@ -59,7 +59,7 @@ More platforms later, added as new adapters against the same core.
 
 ## Docker
 
-A `docker-compose.yml` runs backend + web with one command — real payoff given `openhands-tools`' 186-package footprint, without reversing the local-first decision (it still runs on the user's own machine). Also the intended home for real tool-execution sandboxing later, since `openhands-tools` ships none itself. See `project_structure.md` for the scoping and setup details.
+Tried, then removed for local dev (2026-09-07) — macOS bind-mount file-watching flakiness caused a recurring `next dev` crash-loop. Backend and web now run natively (`uv run` + `pnpm dev`). Real tool-execution sandboxing (since `openhands-tools` ships none itself) is still an open problem, just not necessarily Docker-based. See `project_structure.md`'s Docker section for the full history.
 
 ## Approvals across surfaces
 
