@@ -384,9 +384,11 @@ button {
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
   padding: 8px;
   display: flex;
   flex-direction: column;
@@ -938,9 +940,11 @@ button {
 .composer {
   position: relative;
   flex: 0 0 auto;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--glass-border);
   padding: 10px 14px;
-  background: var(--surface);
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
   display: flex;
   align-items: flex-end;
   gap: 8px;
@@ -953,9 +957,11 @@ button {
   margin-bottom: 6px;
   max-height: 220px;
   overflow-y: auto;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 11px;
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
   padding: 4px;
   display: flex;
@@ -970,11 +976,12 @@ button {
   border: none;
   background: transparent;
   padding: 6px 8px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   text-align: left;
   font-family: inherit;
   color: var(--text);
+  transition: background 0.12s var(--ease-spring);
 }
 .mention-option.active {
   background: var(--surface-2);
@@ -992,12 +999,13 @@ button {
   flex: 1 1 auto;
   background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: 11px;
+  border-radius: var(--radius-md);
   padding: 9px 12px;
   font-size: 13px;
   color: var(--text);
   font-family: inherit;
   resize: none;
+  transition: border-color 0.15s var(--ease-spring);
 }
 .composer .field::placeholder {
   color: var(--text-faint);
@@ -1008,12 +1016,16 @@ button {
   border: none;
   width: 34px;
   height: 34px;
-  border-radius: 9px;
+  border-radius: var(--radius-sm);
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   flex: 0 0 auto;
+  transition: transform 0.15s var(--ease-spring), opacity 0.15s var(--ease-spring);
+}
+.composer .send:active:not(:disabled) {
+  transform: scale(0.9);
 }
 .composer .send:disabled {
   opacity: 0.5;
@@ -1331,9 +1343,11 @@ select.input {
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
   padding: 6px;
   display: flex;
   flex-direction: column;
@@ -1350,12 +1364,13 @@ select.input {
   text-align: left;
   background: none;
   border: none;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   padding: 8px 9px;
   font-size: 13px;
   font-family: inherit;
   color: var(--text);
   cursor: pointer;
+  transition: background 0.12s var(--ease-spring);
 }
 .conv-menu-item:hover {
   background: var(--surface-hover);
@@ -1426,17 +1441,24 @@ select.input {
   width: 30px;
   height: 30px;
   border-radius: 50%;
-  background: var(--surface);
-  border: 1px solid var(--border);
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   color: var(--text);
+  transition: transform 0.16s var(--ease-spring), filter 0.16s var(--ease-spring);
 }
 .scroll-to-bottom-btn:hover {
-  background: var(--surface-hover);
+  filter: brightness(1.1);
+  transform: scale(1.06);
+}
+.scroll-to-bottom-btn:active {
+  transform: scale(0.94);
 }
 .scroll-to-bottom-badge {
   position: absolute;
@@ -1476,9 +1498,11 @@ select.input {
   display: none;
   align-items: center;
   gap: 2px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
   padding: 2px;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
   z-index: 4;
@@ -1511,10 +1535,14 @@ select.input {
   border-radius: 6px;
   cursor: pointer;
   color: var(--text-muted);
+  transition: background 0.15s var(--ease-spring), color 0.15s var(--ease-spring);
 }
 .msg-action-btn:hover {
   background: var(--surface-hover);
   color: var(--text);
+}
+.msg-action-btn:active {
+  transform: scale(0.9);
 }
 .msg-action-btn.danger:hover {
   color: var(--danger);
@@ -1529,7 +1557,7 @@ select.input {
   margin: 0 10px 6px;
   background: var(--surface-2);
   border-left: 3px solid var(--border-strong);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   font-size: 12px;
 }
 .reply-preview-strip .body {
@@ -1614,12 +1642,16 @@ select.input {
   align-items: center;
   gap: 4px;
   padding: 2px 7px;
-  border-radius: 99px;
+  border-radius: var(--radius-pill);
   border: 1px solid var(--border);
   background: var(--surface-2);
   font-size: 12px;
   cursor: pointer;
   line-height: 1.6;
+  transition: background 0.15s var(--ease-spring), transform 0.15s var(--ease-spring);
+}
+.reaction-chip:active {
+  transform: scale(0.92);
 }
 .reaction-chip:hover {
   background: var(--surface-hover);
@@ -1651,9 +1683,11 @@ select.input {
   display: none;
   align-items: center;
   gap: 2px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 20px;
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-pill);
   padding: 4px 6px;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
   z-index: 6;
@@ -1672,9 +1706,14 @@ select.input {
   display: flex;
   align-items: center;
   justify-content: center;
+  transition: background 0.15s var(--ease-spring), transform 0.15s var(--ease-spring);
 }
 .quick-reactions button:hover {
   background: var(--surface-hover);
+  transform: scale(1.15);
+}
+.quick-reactions button:active {
+  transform: scale(0.95);
 }
 
 /* ---------- composer emoji picker (send-a-message emoji, distinct from
