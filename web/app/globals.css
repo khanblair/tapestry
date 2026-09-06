@@ -58,6 +58,48 @@
   --status-paused: #64748b;
   --status-offline: #cbd5e1;
   --shadow: 0 8px 30px rgba(15, 23, 42, 0.12);
+
+  /* ---- Liquid Glass rollout (Phase 0 — foundation) ----
+     Additive only: every existing color token above (accent, status,
+     diff colors) is untouched -- this is a shared material/motion/spacing
+     vocabulary for later phases to draw from, not a re-theme. See
+     apple-skills:design's Liquid Glass rules: glass is for the NAVIGATION
+     layer (bars, toolbars, floating controls) and never the content layer
+     (message rows, list rows) -- these tokens exist so that rule is easy
+     to follow correctly, not easy to break by reaching for a plain
+     rgba()/blur() ad hoc per component. */
+  --glass-bg: rgba(255, 255, 255, 0.72);
+  --glass-border: rgba(15, 23, 42, 0.08);
+  --glass-blur: blur(20px) saturate(160%);
+
+  /* One spring feel for the whole app (never mix curves per-component) --
+     values approximate SwiftUI's `.spring(response: 0.35, dampingFraction:
+     0.8)`, translated to a cubic-bezier since CSS has no true spring
+     timing function. */
+  --ease-spring: cubic-bezier(0.34, 1.4, 0.4, 1);
+
+  /* A small, reused radius scale instead of one-off px values per
+     component -- concentric-shape spirit of the Liquid Glass shape system
+     (a fixed set of steps, not arbitrary radii). */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-pill: 999px;
+
+  /* A small spacing scale for new/touched chrome going forward. Existing
+     hand-tuned spacing elsewhere in this file is untouched by this
+     rollout -- there's no evidence it's actually wrong, only that the
+     Liquid Glass mockup this scale was designed for ran too loose. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --ease-spring: linear;
+  }
 }
 
 @media (prefers-color-scheme: dark) {
@@ -86,6 +128,8 @@
     --status-paused: #94a3b8;
     --status-offline: #475569;
     --shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+    --glass-bg: rgba(27, 35, 54, 0.66);
+    --glass-border: rgba(255, 255, 255, 0.08);
   }
 }
 
@@ -114,6 +158,8 @@
   --status-paused: #94a3b8;
   --status-offline: #475569;
   --shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+  --glass-bg: rgba(27, 35, 54, 0.66);
+  --glass-border: rgba(255, 255, 255, 0.08);
 }
 
 * {
@@ -143,6 +189,17 @@ button {
 }
 .mono {
   font-family: "JetBrains Mono", ui-monospace, "SF Mono", Consolas, monospace;
+}
+
+/* Navigation-layer material only -- bars, toolbars, floating controls.
+   Never apply to a content-layer element (a message row, a list row):
+   per apple-skills:design's Liquid Glass rules, glass never stacks on
+   glass and never sits under/over scrolling content in a way that reads
+   as decoration rather than structure. */
+.glass {
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
 }
 
 /* ---------- layout panes (roster / conversation / thread) ---------- */
@@ -258,8 +315,12 @@ button {
   align-items: center;
   gap: 10px;
   padding: 0 14px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
+  border-bottom: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  position: relative;
+  z-index: 2;
 }
 .topbar h2 {
   font-size: 14.5px;
@@ -281,11 +342,14 @@ button {
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: background 0.15s, color 0.15s;
+  transition: background 0.18s var(--ease-spring), color 0.18s var(--ease-spring), transform 0.18s var(--ease-spring);
 }
 .icon-btn:hover {
   background: var(--surface-hover);
   color: var(--text);
+}
+.icon-btn:active {
+  transform: scale(0.92);
 }
 .icon-btn.danger:hover {
   background: var(--danger-wash);
@@ -817,17 +881,20 @@ button {
   background: var(--surface);
   color: var(--text);
   padding: 7px 13px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   font-size: 12.5px;
   font-weight: 600;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  transition: background 0.15s, border-color 0.15s;
+  transition: background 0.15s var(--ease-spring), border-color 0.15s var(--ease-spring), transform 0.15s var(--ease-spring);
 }
 .btn:hover {
   background: var(--surface-hover);
+}
+.btn:active:not(:disabled) {
+  transform: scale(0.97);
 }
 .btn:disabled {
   opacity: 0.6;
@@ -1026,12 +1093,13 @@ select.input {
 .switch {
   width: 36px;
   height: 21px;
-  border-radius: 99px;
+  border-radius: var(--radius-pill);
   background: var(--border-strong);
   position: relative;
   cursor: pointer;
   flex: 0 0 auto;
   border: none;
+  transition: background 0.2s var(--ease-spring);
 }
 .switch.on {
   background: var(--accent);
@@ -1045,7 +1113,7 @@ select.input {
   background: #fff;
   top: 2px;
   left: 2px;
-  transition: left 0.15s;
+  transition: left 0.22s var(--ease-spring);
 }
 .switch.on::after {
   left: 17px;
@@ -1117,7 +1185,7 @@ select.input {
   .overlay-panel {
     width: min(620px, 100%);
     height: min(640px, 100%);
-    border-radius: 14px;
+    border-radius: var(--radius-lg);
     overflow: hidden;
     border: 1px solid var(--border);
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
