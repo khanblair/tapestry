@@ -1670,9 +1670,10 @@ async def _run_continuation_session(
     Once it finishes, the group keeps talking on its own: each further
     round only re-invites personas who actually replied last round (see
     `_run_fanout_round`), paced by `_breathing_pause` between rounds, until
-    every remaining persona has dropped out, a genuinely new human message
-    arrives (`_latest_user_message_id`), or `MAX_CONTINUATION_ROUNDS` is
-    hit. A human's Stop cancels whichever leg is actively running; that
+    every remaining persona has dropped out, a solo survivor has had its
+    one round alone, a genuinely new human message arrives
+    (`_latest_user_message_id`), or `MAX_CONTINUATION_ROUNDS` is hit. A
+    human's Stop cancels whichever leg is actively running; that
     propagates out of `_run_fanout_round` as `CancelledError` and ends the
     whole session right here — not just that one leg — and cancelling
     THIS task directly (see `stop_conversation`'s own `app.state.
@@ -1689,7 +1690,23 @@ async def _run_continuation_session(
 
     baseline_message_id = _latest_user_message_id(conversation_id)
     round_num = 2
+    # Found live: once every other mentioned persona has passed, a lone
+    # survivor kept getting re-invited round after round -- all the way to
+    # MAX_CONTINUATION_ROUNDS -- because _run_fanout_round only excludes a
+    # persona once THEY call pass_turn, and a solo persona has no sibling
+    # reply to react to, nothing to actually pass on. The system-prompt
+    # guidance telling a model to pass once things wind down (see
+    # _continuation_guidance) is not reliable enough on its own to catch
+    # this -- confirmed by exactly this failure recurring live even with
+    # that guidance in place. One round alone (acknowledging the others
+    # leaving) is normal; a second is a monologue to an empty room, not a
+    # continuation, regardless of what that persona's own reply says.
+    solo_rounds_run = 0
     while active and round_num <= MAX_CONTINUATION_ROUNDS:
+        if len(active) == 1 and len(persona_ids) > 1:
+            solo_rounds_run += 1
+            if solo_rounds_run > 1:
+                return
         if _latest_user_message_id(conversation_id) != baseline_message_id:
             return
         await _breathing_pause(
@@ -2716,7 +2733,7 @@ async def create_app() -> FastAPI:
     return app
 
 
-async def start(host: str = "0.0.0.0", port: int = 8000) -> None:
+async def start(host: str = "0.0.0.0", port: int = 8420) -> None:
     """Serve the app as a sibling asyncio task.
 
     `uvicorn.Server.serve()` awaited directly — NOT `uvicorn.run()`, which

@@ -884,6 +884,22 @@ def _roster_lines(persona: Persona, member_ids: list[str]) -> list[str]:
             "list, say they exist but aren't part of this conversation — never "
             'call them "unrecognized." Only say that about a name in neither list.'
         )
+    # Found live: a persona greeted a FELLOW PERSONA by name in direct
+    # response to the human's own "good morning" -- the roster above only
+    # ever lists personas, so a model reasoning about "who's in this room"
+    # from that list alone has no explicit signal that a THIRD, unnamed
+    # party (the human) is present too. A message with no persona-name
+    # prefix in the history below is always the human, not one of the
+    # names above -- reply to whoever the most recent message actually
+    # came from, not out of habit to a groupmate.
+    lines.append(
+        "The human running this conversation is also present, separate from "
+        "the roster above -- their messages carry no name prefix in the "
+        "history below (a message prefixed with a persona's name is that "
+        "persona speaking, not the human). Reply to whoever the MOST RECENT "
+        "message actually came from -- don't default to addressing a fellow "
+        "persona by name just because a conversation has been going."
+    )
     return lines
 
 

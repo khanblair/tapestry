@@ -229,6 +229,17 @@ def test_system_prompt_omits_roster_when_membership_is_unset():
     assert "Conversation roster" not in prompt
 
 
+def test_system_prompt_tells_a_persona_the_human_is_present_separate_from_the_roster():
+    # Live-tested UX complaint: replying to the human's own "@all good
+    # morning?" a persona greeted a FELLOW PERSONA by name instead ("Morning,
+    # Sage...") -- the roster only ever lists personas, with no explicit
+    # signal that a third, unnamed party (the human) is in the room too.
+    ada = build.PERSONAS["ada"]
+    prompt = build._build_system_prompt(ada, [], ["ada", "rex"])
+    assert "human running this conversation is also present" in prompt.lower()
+    assert "most recent message actually came from" in prompt.lower()
+
+
 def test_system_prompt_tells_a_persona_to_acknowledge_siblings_in_a_group():
     # The other half of the fan-out visibility fix: seeing a sibling's
     # reply in history is necessary but not sufficient -- something has to

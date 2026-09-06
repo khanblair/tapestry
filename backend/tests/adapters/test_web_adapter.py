@@ -1850,6 +1850,60 @@ def test_round_continuation_only_reinvites_personas_who_actually_replied(client,
     )
 
 
+def test_round_continuation_caps_a_solo_survivor_to_one_extra_round(client, monkeypatch):
+    """Live-tested UX complaint: once ada passed, rex (who never calls
+    pass_turn on its own) kept getting reinvited round after round, all
+    the way to MAX_CONTINUATION_ROUNDS -- a monologue to an empty room,
+    not a continuation. `_run_continuation_session`'s own solo-round
+    circuit breaker must catch this even when the model itself never
+    self-regulates (system-prompt guidance alone was tried first and
+    confirmed, live, not reliable enough).
+    """
+    conversation_id = _make_group(client, ["ada", "rex"])
+    call_counts: dict[str, int] = {}
+
+    async def smart_call_model(model, messages, tools=None, **kwargs):
+        call_counts[model] = call_counts.get(model, 0) + 1
+        n = call_counts[model]
+        if model == "openrouter/meta-llama/llama-3.3-70b-instruct":  # ada
+            if n == 1:
+                return _plain_response("Ada round 1.")
+            return _tool_call_response("", "pass_turn", {})  # passes starting round 2
+        if model == "deepseek/deepseek-chat":  # rex -- NEVER passes on its own
+            return _plain_response(f"Rex round {n}.")
+        raise AssertionError(f"unexpected model {model!r}")
+
+    monkeypatch.setattr(graph_build, "call_model", smart_call_model)
+
+    res = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "@all let's talk"}
+    )
+    assert res.status_code == 201
+
+    for _ in range(300):
+        logged = events_module.read_events(conversation_id)
+        thread_ids = {e.payload.get("graph_thread_id") for e in logged if e.type == "turn/start"}
+        if any(t and t.endswith("::r3") for t in thread_ids):
+            break
+        time.sleep(0.05)
+
+    # Give a (should-be-stopped) round 4 a real chance to start if the
+    # circuit breaker didn't hold.
+    time.sleep(0.5)
+
+    logged = events_module.read_events(conversation_id)
+    rex_msgs = [e for e in logged if e.type == "assistant/message" and e.actor == "rex"]
+    assert len(rex_msgs) == 3, (
+        "rex replies in round 1 (mandatory), round 2 (alongside ada), and round 3 "
+        "(its one round alone after ada passed) -- three, not ten"
+    )
+    thread_ids = {e.payload.get("graph_thread_id") for e in logged if e.type == "turn/start"}
+    assert any(t and t.endswith("::r3") for t in thread_ids), "round 3 (rex's one solo round) must run"
+    assert not any(t and t.endswith("::r4") for t in thread_ids), (
+        "round 4 must never start -- that would be rex's SECOND consecutive solo round"
+    )
+
+
 def test_round_continuation_stops_at_the_ten_round_cap(client, monkeypatch):
     conversation_id = _make_group(client, ["ada"])
     call_count = 0
