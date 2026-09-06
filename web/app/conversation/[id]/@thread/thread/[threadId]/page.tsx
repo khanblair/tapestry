@@ -1,9 +1,8 @@
 import { notFound } from "next/navigation";
-import { MessageBubble } from "@/components/conversation/MessageBubble";
 import { Composer } from "@/components/conversation/Composer";
-import { ApprovalCard } from "@/components/approvals/ApprovalCard";
 import { getConversationById, getThreadMessages, safeGetPersonas } from "@/lib/safeApi";
 import { ThreadTopbar } from "./ThreadTopbar";
+import { ThreadMessageList } from "./ThreadMessageList";
 
 /**
  * The spun-off thread view. Lives ONLY under the `@thread` parallel slot
@@ -27,6 +26,14 @@ import { ThreadTopbar } from "./ThreadTopbar";
  * is still wired up so replying is visually functional, but the backend
  * needs a thread-scoped send (or a `threadId` on Message) before this is
  * actually correct.
+ *
+ * Message rendering itself lives in ./ThreadMessageList.tsx, a Client
+ * Component — this file (a Server Component) can't render `MessageBubble`
+ * directly with a `renderApproval` function prop, since React has no wire
+ * format to send a function across the server/client boundary. Passing
+ * `messages`/`personas` (plain, serializable data) across that boundary and
+ * building the callback client-side, same as ConversationView.tsx already
+ * does, is what actually works.
  */
 export default async function ThreadPage({ params }: { params: Promise<{ id: string; threadId: string }> }) {
   const { id, threadId } = await params;
@@ -49,15 +56,7 @@ export default async function ThreadPage({ params }: { params: Promise<{ id: str
 
       <div className="scroll">
         <div className="msg-list">
-          {messages.length === 0 && <div className="empty-hint">Nothing in this thread yet.</div>}
-          {messages.map((message) => (
-            <MessageBubble
-              key={message.id}
-              message={message}
-              actorPersona={message.actor === "you" ? undefined : personaById.get(message.actor)}
-              renderApproval={(approval) => <ApprovalCard conversationId={message.conversationId} question={approval} />}
-            />
-          ))}
+          <ThreadMessageList messages={messages} personas={personas} />
         </div>
       </div>
 
