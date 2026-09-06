@@ -337,9 +337,17 @@ button {
   font-weight: 600;
   padding: 0 2px 2px;
 }
+.scroll-viewport {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0; /* required for a flex child that itself contains an overflow:auto descendant to size correctly, rather than growing to fit all content */
+  display: flex;
+  flex-direction: column;
+}
 .scroll {
   overflow-y: auto;
   flex: 1 1 auto;
+  min-height: 0;
 }
 
 /* ---------- roster ---------- */
@@ -499,6 +507,26 @@ button {
 .msg {
   display: flex;
   gap: 10px;
+}
+/* The human's own messages read right-aligned, WhatsApp/iMessage-style,
+   distinct from every persona's left-aligned reply -- flips the row
+   (avatar to the right of the bubble) and caps .body's width so the block
+   actually sits at the right edge instead of just relocating the avatar
+   while .body's own flex:1 1 auto still fills the full row. Text inside
+   the bubble stays normal reading order (no text-align:right) -- only the
+   block's position in the row changes, not how its own contents read. */
+.msg.msg-mine {
+  flex-direction: row-reverse;
+  /* flex-start, not flex-end: row-reverse also reverses which physical
+     edge counts as the flex "end" -- flex-end here would pack content
+     against the LEFT edge, the opposite of what row-reverse is for.
+     Found live via direct getBoundingClientRect() measurement, not
+     assumed. */
+  justify-content: flex-start;
+}
+.msg.msg-mine .body {
+  flex: 0 1 auto;
+  max-width: 72%;
 }
 .typing-indicator {
   display: flex;
@@ -1320,10 +1348,10 @@ select.input {
 /* ---------- scroll-to-bottom ---------- */
 .scroll-to-bottom-btn {
   position: absolute;
-  bottom: 84px;
-  right: 22px;
-  width: 38px;
-  height: 38px;
+  bottom: 16px;
+  right: 16px;
+  width: 30px;
+  height: 30px;
   border-radius: 50%;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -1353,9 +1381,16 @@ select.input {
   align-items: center;
   justify-content: center;
 }
-.pane-conversation .scroll {
-  position: relative;
-}
+/* Found live: this used to be `.pane-conversation .scroll { position:
+   relative }` -- putting the scroll-to-bottom button's containing block on
+   the SAME element that has `overflow-y: auto` meant `bottom: 84px` below
+   was measured from the bottom of the full scrolled content (thousands of
+   px tall in a long conversation), not the bottom of the visible viewport
+   -- the button appeared to drift up into old messages as you scrolled
+   back through history instead of staying pinned to a corner. Moved to
+   .scroll-viewport (app/components/conversation/ConversationView.tsx), a
+   sibling wrapper that sizes itself identically to .scroll but never
+   scrolls, so the containing block itself never moves. */
 
 /* ---------- message hover actions (reply / react / edit / delete) ---------- */
 .msg {
@@ -1378,6 +1413,19 @@ select.input {
 .msg:hover .msg-actions,
 .msg-actions.open {
   display: flex;
+}
+/* A touch device has no persistent :hover state -- without this, a phone
+   has no way to ever reveal reply/react/edit/delete on a message at all,
+   since the .open class above is only ever added once the reaction picker
+   (itself reached through this same bar) is already open. `(hover: none)`
+   targets touch-primary devices specifically, so mouse users are unaffected. */
+@media (hover: none) {
+  .msg-actions {
+    display: flex;
+    position: static;
+    margin-bottom: 4px;
+    box-shadow: none;
+  }
 }
 .msg-action-btn {
   width: 26px;

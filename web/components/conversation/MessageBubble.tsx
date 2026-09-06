@@ -115,7 +115,7 @@ export function MessageBubble({
 
   if (message.deleted) {
     return (
-      <div className="msg">
+      <div className={`msg${isYou ? " msg-mine" : ""}`}>
         {isYou ? <YouAvatar size="sm" /> : <PersonaAvatar persona={actorPersona} size="sm" />}
         <div className="body">
           <div className="msg-head">
@@ -131,7 +131,7 @@ export function MessageBubble({
   }
 
   return (
-    <div className="msg">
+    <div className={`msg${isYou ? " msg-mine" : ""}`}>
       {isYou ? <YouAvatar size="sm" /> : <PersonaAvatar persona={actorPersona} size="sm" />}
       <div className="body">
         <div className="msg-head">

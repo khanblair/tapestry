@@ -1,10 +1,20 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { ThemeProvider } from "@/components/ui/ThemeProvider";
 import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Tapestry",
   description: "A self-hosted, multi-agent workspace.",
+};
+
+// Next.js supplies width=device-width/initial-scale=1 by default even
+// without this export -- viewportFit: "cover" is the one thing that
+// needs stating explicitly, so content can extend under a phone's
+// notch/home-indicator safe areas instead of leaving a hardcoded gap.
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
 };
 
 // Runs before hydration to avoid a flash of the wrong theme. Deliberately

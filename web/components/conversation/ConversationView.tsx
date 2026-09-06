@@ -280,54 +280,56 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
         )}
       </div>
 
-      <div className="scroll" ref={scrollRef}>
-        <div className="msg-list">
-          {messages.length === 0 && (
-            <div className="empty-hint">
-              This is the start of {isGroup ? headerName : `your DM with ${headerName}`}.
-            </div>
-          )}
-          {messages.map((message) => {
-            const replyTarget = message.replyToId ? messageById.get(message.replyToId) : undefined;
-            return (
-              <div key={message.id} ref={(el) => {
-                if (el) messageRefs.current.set(message.id, el);
-                else messageRefs.current.delete(message.id);
-              }}>
-                <MessageBubble
-                  message={message}
-                  actorPersona={message.actor === "you" ? undefined : personaById.get(message.actor)}
-                  renderApproval={(approval) => <ApprovalCard conversationId={conversation.id} question={approval} />}
-                  replyTarget={replyTarget}
-                  replyTargetName={replyTarget ? resolveActorName(replyTarget.actor) : undefined}
-                  resolveActorName={resolveActorName}
-                  onReply={setReplyingTo}
-                  onJumpToMessage={jumpToMessage}
-                  onEdit={handleEdit}
-                  onDelete={handleDelete}
-                  onReact={handleReact}
-                />
+      <div className="scroll-viewport">
+        <div className="scroll" ref={scrollRef}>
+          <div className="msg-list">
+            {messages.length === 0 && (
+              <div className="empty-hint">
+                This is the start of {isGroup ? headerName : `your DM with ${headerName}`}.
               </div>
-            );
-          })}
-          {typingPersonas.length > 0 && (
-            <div className="typing-row">
-              <TypingIndicator personas={typingPersonas} />
-              <button
-                type="button"
-                className="btn btn-sm btn-danger"
-                onClick={handleStop}
-                disabled={stopping}
-                aria-label="Stop generating"
-              >
-                <StopIcon size={13} /> Stop
-              </button>
-            </div>
-          )}
+            )}
+            {messages.map((message) => {
+              const replyTarget = message.replyToId ? messageById.get(message.replyToId) : undefined;
+              return (
+                <div key={message.id} ref={(el) => {
+                  if (el) messageRefs.current.set(message.id, el);
+                  else messageRefs.current.delete(message.id);
+                }}>
+                  <MessageBubble
+                    message={message}
+                    actorPersona={message.actor === "you" ? undefined : personaById.get(message.actor)}
+                    renderApproval={(approval) => <ApprovalCard conversationId={conversation.id} question={approval} />}
+                    replyTarget={replyTarget}
+                    replyTargetName={replyTarget ? resolveActorName(replyTarget.actor) : undefined}
+                    resolveActorName={resolveActorName}
+                    onReply={setReplyingTo}
+                    onJumpToMessage={jumpToMessage}
+                    onEdit={handleEdit}
+                    onDelete={handleDelete}
+                    onReact={handleReact}
+                  />
+                </div>
+              );
+            })}
+            {typingPersonas.length > 0 && (
+              <div className="typing-row">
+                <TypingIndicator personas={typingPersonas} />
+                <button
+                  type="button"
+                  className="btn btn-sm btn-danger"
+                  onClick={handleStop}
+                  disabled={stopping}
+                  aria-label="Stop generating"
+                >
+                  <StopIcon size={13} /> Stop
+                </button>
+              </div>
+            )}
+          </div>
         </div>
         {showScrollButton && (
           <button type="button" className="scroll-to-bottom-btn" aria-label="Scroll to latest" onClick={scrollToBottom}>
-            <ArrowDownIcon size={17} />
+            <ArrowDownIcon size={14} />
             {unseenCount > 0 && <span className="scroll-to-bottom-badge">{Math.min(unseenCount, 9)}</span>}
           </button>
         )}
