@@ -694,6 +694,61 @@ def test_delete_conversation_404s_for_an_unknown_group_conversation(client):
     assert res.status_code == 404
 
 
+def _wait_for_message_count(client, conversation_id: str, count: int) -> list[dict]:
+    # A send's turn is fire-and-forget (asyncio.create_task) -- sending
+    # again too soon 409s ("turn in progress"), same as every other test
+    # in this file that sends twice in a row (see
+    # test_send_message_with_reply_to_id_is_reflected_back above). Waits
+    # for a message COUNT rather than "does persona X's actor appear at
+    # all", since the latter is already true after the first reply and
+    # can't tell a second reply apart from the first.
+    messages: list[dict] = []
+    for _ in range(50):
+        messages = client.get(f"/api/conversations/{conversation_id}/messages").json()
+        if len(messages) >= count:
+            return messages
+        time.sleep(0.05)
+    raise AssertionError(f"expected >= {count} messages, got {len(messages)}")
+
+
+def test_clear_conversation_empties_messages_but_keeps_the_conversation(client, monkeypatch):
+    monkeypatch.setattr(graph_build, "call_model", AsyncMock(return_value=_plain_response("hi")))
+    client.post("/api/conversations", json={"kind": "dm", "personaIds": ["rex"]})
+    client.post("/api/conversations/dm-rex/messages", json={"text": "hi"})
+    _wait_for_message_count(client, "dm-rex", 2)
+    client.post("/api/conversations/dm-rex/messages", json={"text": "again"})
+    assert len(_wait_for_message_count(client, "dm-rex", 4)) == 4
+
+    res = client.post("/api/conversations/dm-rex/clear")
+    assert res.status_code == 204
+
+    assert client.get("/api/conversations/dm-rex/messages").json() == []
+    listed = client.get("/api/conversations").json()
+    cleared = next(c for c in listed if c["id"] == "dm-rex")
+    # The conversation itself survives -- unlike delete, it's still in the
+    # list -- but with no message left to preview.
+    assert cleared["lastPreview"] is None
+
+
+def test_clear_conversation_only_hides_messages_before_the_clear_point(client, monkeypatch):
+    monkeypatch.setattr(graph_build, "call_model", AsyncMock(return_value=_plain_response("ok")))
+    client.post("/api/conversations", json={"kind": "dm", "personaIds": ["rex"]})
+    client.post("/api/conversations/dm-rex/messages", json={"text": "before"})
+    _wait_for_message_count(client, "dm-rex", 2)
+    client.post("/api/conversations/dm-rex/clear")
+    client.post("/api/conversations/dm-rex/messages", json={"text": "after"})
+
+    messages = _wait_for_message_count(client, "dm-rex", 2)
+    assert [m["text"] for m in messages] == ["after", "ok"]
+    listed = client.get("/api/conversations").json()
+    assert next(c for c in listed if c["id"] == "dm-rex")["lastPreview"] == "ok"
+
+
+def test_clear_conversation_404s_for_an_unknown_conversation(client):
+    res = client.post("/api/conversations/grp-does-not-exist/clear")
+    assert res.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # The critical end-to-end path: send -> WS "message" frames -> interrupt
 # surfaces -> answer -> resume -> tool runs exactly once -> final reply

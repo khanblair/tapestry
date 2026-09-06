@@ -454,6 +454,13 @@ export async function deleteConversation(conversationId: string): Promise<void> 
   });
 }
 
+/** Clears a conversation's message history (group or DM) without deleting the conversation itself. */
+export async function clearConversationMessages(conversationId: string): Promise<void> {
+  await request<void>(`/api/conversations/${encodeURIComponent(conversationId)}/clear`, {
+    method: "POST",
+  });
+}
+
 export async function answerAsk(conversationId: string, answers: AskAnswer[]): Promise<void> {
   await request<void>(`/api/conversations/${encodeURIComponent(conversationId)}/ask/answers`, {
     method: "POST",

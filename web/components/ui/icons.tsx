@@ -63,6 +63,7 @@ export const ReplyIcon = makeIcon('<polyline points="9 6 3 12 9 18"/><path d="M3
 export const EditIcon = makeIcon('<path d="M15.5 4.5 19.5 8.5 8 20H4v-4Z"/>');
 export const TrashIcon = makeIcon('<path d="M4 7h16"/><path d="M9 7V4.5h6V7"/><path d="M6 7l1 12.5a1 1 0 0 0 1 .95h8a1 1 0 0 0 1-.95L18 7"/>');
 export const ArchiveIcon = makeIcon('<rect x="3" y="4" width="18" height="4.5" rx="1"/><path d="M4.5 8.5V19a1 1 0 0 0 1 1h13a1 1 0 0 0 1-1V8.5"/><line x1="10" y1="12.5" x2="14" y2="12.5"/>');
+export const EraserIcon = makeIcon('<path d="M17.5 3.5 20.5 6.5 9 18H4.5v-4.5Z"/><line x1="4.5" y1="20.5" x2="15" y2="20.5"/>');
 export const SmileIcon = makeIcon('<circle cx="12" cy="12" r="9"/><path d="M8.5 14a4 4 0 0 0 7 0"/><line x1="8.5" y1="9.5" x2="8.5" y2="9.6"/><line x1="15.5" y1="9.5" x2="15.5" y2="9.6"/>');
 export const ArrowDownIcon = makeIcon('<line x1="12" y1="4" x2="12" y2="19"/><polyline points="6 13 12 19 18 13"/>');
 export const PanelLeftCloseIcon = makeIcon('<rect x="3" y="4.5" width="18" height="15" rx="2"/><line x1="9.5" y1="4.5" x2="9.5" y2="19.5"/><polyline points="7 9.5 4.5 12 7 14.5"/>');

@@ -770,11 +770,17 @@ def _conversation_meta(conversation_id: str) -> tuple[list[str], str | None, str
     persona_ids: list[str] = []
     last_preview: str | None = None
     last_timestamp: str | None = None
-    for event in events.read_events(conversation_id):
+    all_events = events.read_events(conversation_id)
+    for event in all_events:
+        # last_timestamp deliberately scans the FULL log, not the
+        # since-last-clear slice below: clearing a conversation is itself a
+        # recent action worth keeping it sorted by, even though it leaves
+        # no message behind to preview.
         last_timestamp = event.timestamp
         if event.type == "conversation/created":
             persona_ids = list(event.payload.get("persona_ids") or [])
-        elif event.type.endswith("/message"):
+    for event in _events_since_last_clear(all_events):
+        if event.type.endswith("/message"):
             last_preview = event.payload.get("text", "")
     return persona_ids, last_preview, last_timestamp
 
@@ -1099,8 +1105,28 @@ def _diff_ready_message(event: events.TapestryEvent) -> MessageOut | None:
     )
 
 
+def _events_since_last_clear(all_events: list[events.TapestryEvent]) -> list[events.TapestryEvent]:
+    """Everything after the most recent `conversation/cleared` event, or the
+    whole log if there isn't one.
+
+    Only ever used for the two *message-display* projections below
+    (`_project_messages`, and `_conversation_meta`'s `last_preview`) --
+    never for turn/delegation/ask state, which must keep seeing the full,
+    unfiltered log regardless of a clear. "Clear chat" only resets what a
+    human sees; it must never touch the orchestration's own history.
+    Nothing is erased from the underlying log either way -- same principle
+    as `message/deleted`'s redaction-at-the-boundary in `_project_messages`
+    below.
+    """
+    last_cleared_index = -1
+    for index, event in enumerate(all_events):
+        if event.type == "conversation/cleared":
+            last_cleared_index = index
+    return all_events[last_cleared_index + 1 :]
+
+
 def _project_messages(conversation_id: str) -> list[MessageOut]:
-    all_events = events.read_events(conversation_id)
+    all_events = _events_since_last_clear(events.read_events(conversation_id))
     answered_request_ids = {
         e.payload.get("request_id") for e in all_events if e.type == "ask/answered"
     }
@@ -2190,6 +2216,17 @@ async def create_app() -> FastAPI:
         # log's point of view) never existed.
         _ensure_conversation(conversation_id, app)
         events.append_event(conversation_id, "conversation/deleted", actor="you", payload={})
+        return Response(status_code=204)
+
+    @app.post("/api/conversations/{conversation_id}/clear", status_code=204)
+    async def clear_conversation_messages(conversation_id: str) -> Response:
+        # Works for both a DM and a group -- same conversation_id path every
+        # other per-conversation endpoint here uses, no kind-specific
+        # branching needed. See _events_since_last_clear's docstring: this
+        # resets what _project_messages/_conversation_meta display, never
+        # the underlying log turn/delegation/ask state reads.
+        _ensure_conversation(conversation_id, app)
+        events.append_event(conversation_id, "conversation/cleared", actor="you", payload={})
         return Response(status_code=204)
 
     # -- Messages ---------------------------------------------------------

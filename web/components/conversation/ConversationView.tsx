@@ -258,6 +258,7 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
               archived={archived}
               onArchivedChanged={setArchived}
               onOpenSettings={() => setSettingsOpen(true)}
+              onCleared={() => setMessages([])}
             />
           </>
         ) : primaryPersona ? (
@@ -275,6 +276,7 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
               archived={archived}
               onArchivedChanged={setArchived}
               onOpenSettings={() => setSettingsOpen(true)}
+              onCleared={() => setMessages([])}
             />
           </>
         ) : (
@@ -346,9 +348,16 @@ export function ConversationView({ conversation, personas, initialMessages }: Co
         personas={conversationPersonas}
         replyingTo={replyingTo ? { message: replyingTo, actorName: resolveActorName(replyingTo.actor) } : undefined}
         onCancelReply={() => setReplyingTo(null)}
-        onSent={(message) =>
-          setMessages((prev) => (prev.some((m) => m.id === message.id) ? prev : [...prev, message]))
-        }
+        onSent={(message) => {
+          // Sending is an implicit "scroll me to it" -- without forcing this,
+          // a stale `wasNearBottomRef` (e.g. flipped false by the on-screen
+          // keyboard shrinking the scroll viewport's clientHeight right
+          // before you hit send, on mobile) silently skips the auto-scroll
+          // the effect below would otherwise do, leaving your own just-sent
+          // message off-screen.
+          wasNearBottomRef.current = true;
+          setMessages((prev) => (prev.some((m) => m.id === message.id) ? prev : [...prev, message]));
+        }}
       />
 
       {settingsOpen && (

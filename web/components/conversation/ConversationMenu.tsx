@@ -7,14 +7,18 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { deleteConversation, setConversationArchived } from "@/lib/api";
-import { ArchiveIcon, DotsIcon, SettingsIcon, TrashIcon } from "@/components/ui/icons";
+import { clearConversationMessages, deleteConversation, setConversationArchived } from "@/lib/api";
+import { ArchiveIcon, DotsIcon, EraserIcon, SettingsIcon, TrashIcon } from "@/components/ui/icons";
 
 export interface ConversationMenuProps {
   conversationId: string;
   archived: boolean;
   onArchivedChanged: (archived: boolean) => void;
   onOpenSettings: () => void;
+  /** Called after the message history is cleared, so the conversation pane
+   * (which owns its own `messages` state) can reset to empty immediately
+   * instead of waiting on a refetch. */
+  onCleared: () => void;
 }
 
 export function ConversationMenu({
@@ -22,6 +26,7 @@ export function ConversationMenu({
   archived,
   onArchivedChanged,
   onOpenSettings,
+  onCleared,
 }: ConversationMenuProps) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
@@ -67,6 +72,26 @@ export function ConversationMenu({
     }
   }
 
+  async function handleClear() {
+    if (busy) return;
+    if (!window.confirm("Clear this conversation's message history? The conversation itself stays.")) return;
+    setBusy(true);
+    try {
+      await clearConversationMessages(conversationId);
+      onCleared();
+      setOpen(false);
+      showToast("Chat cleared");
+      // Same reasoning as toggleArchived's own router.refresh() above --
+      // the roster's lastPreview needs the server re-fetched to pick up
+      // the clear.
+      router.refresh();
+    } catch (error) {
+      console.error("Failed to clear conversation", error);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleDelete() {
     if (busy) return;
     if (!window.confirm("Delete this conversation? This hides it from your conversation list.")) return;
@@ -105,6 +130,9 @@ export function ConversationMenu({
           </button>
           <button type="button" className="conv-menu-item" disabled={busy} onClick={() => void toggleArchived()}>
             <ArchiveIcon size={15} /> {archived ? "Unarchive" : "Archive"}
+          </button>
+          <button type="button" className="conv-menu-item" disabled={busy} onClick={() => void handleClear()}>
+            <EraserIcon size={15} /> Clear chat
           </button>
           <button type="button" className="conv-menu-item danger" disabled={busy} onClick={() => void handleDelete()}>
             <TrashIcon size={15} /> Delete
