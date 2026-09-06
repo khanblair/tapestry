@@ -15,6 +15,8 @@
 # instant, no image rebuild, unlike the prod compose file's
 # rebuild-required workflow this was written to replace.
 
+name: tapestry
+
 services:
   backend:
     build:
@@ -23,7 +25,7 @@ services:
     env_file:
       - ../.env
     ports:
-      - "8000:8000"
+      - "8420:8420"
     volumes:
       # Mirrors backend/Dockerfile's host-layout comment: /app plays the
       # role of the repo root inside the container, so these three mounts
@@ -67,8 +69,8 @@ services:
       # every server-rendered page (the roster sidebar, the conversation
       # view) silently fell back to lib/mockData.ts's fixtures, since their
       # fetch to the backend simply failed. See web/lib/api.ts's comment.
-      NEXT_PUBLIC_API_URL: http://localhost:8000
-      INTERNAL_API_URL: http://backend:8000
+      NEXT_PUBLIC_API_URL: http://localhost:8420
+      INTERNAL_API_URL: http://backend:8420
     depends_on:
       - backend
 

@@ -62,5 +62,5 @@ def load_settings() -> Settings:
         discord_bot_token=os.environ.get("DISCORD_BOT_TOKEN") or None,
         telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN") or None,
         api_host=os.environ.get("TAPESTRY_API_HOST", "0.0.0.0"),
-        api_port=int(os.environ.get("TAPESTRY_API_PORT", "8000")),
+        api_port=int(os.environ.get("TAPESTRY_API_PORT", "8420")),
     )

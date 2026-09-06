@@ -28,6 +28,6 @@ RUN uv sync --frozen --no-dev || uv sync --no-dev
 
 COPY backend/tapestry ./tapestry
 
-EXPOSE 8000
+EXPOSE 8420
 
 CMD ["uv", "run", "python", "-m", "tapestry.main"]
