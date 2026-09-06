@@ -28,6 +28,8 @@ pnpm dev
 
 Or, once both `Dockerfile`s exist: `docker compose -f docker/docker-compose.yml up`.
 
+Web runs on `3200`, the API on `8420`. The web app reaches the API dynamically at runtime (no `localhost` hardcoding), so it works unmodified from another device on the same network or Tailscale tailnet too — see `project_structure.md`'s Docker section for the CORS env var that needs setting to allow that origin.
+
 ## Prerequisites
 
 - A Discord bot (Message Content Intent enabled) and/or a Telegram bot (`/setprivacy` disabled) — see

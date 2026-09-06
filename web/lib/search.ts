@@ -5,10 +5,8 @@
 // (lib/mockData.ts, via lib/safeApi.ts) so the Search screen is demoable
 // without a backend.
 
-import type { Persona } from "./api";
+import { API_URL, type Persona } from "./api";
 import { safeGetConversations, safeGetMessages, safeGetPersonas } from "./safeApi";
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
 
 export interface SearchMessageResult {
   kind: "message";

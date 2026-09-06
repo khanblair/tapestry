@@ -2028,8 +2028,52 @@ def test_stop_cancels_the_whole_continuation_session_not_just_one_leg(client, mo
     )
 
 
-# ---------------------------------------------------------------------------
-# Proactive check-in eligibility (api._proactive_checkin_targets) -- pure
+def test_tag_all_paces_different_personas_replies_with_a_short_gap(client, monkeypatch):
+    """Found live: @all tagging two personas gave each one its own "typing
+    time" pause (graph.build._reply_delay_seconds, on THEIR OWN reply) but
+    nothing between them -- one persona's turn/end flowed straight into the
+    next persona's turn/start with only scheduling overhead in between
+    (tens of milliseconds), so two individually-paced replies still read as
+    one instant back-to-back burst. `_run_fanout_round`'s own leg pause
+    (`_MIN_LEG_PAUSE_SECONDS`) must close that gap, distinct from the
+    between-ROUNDS pause covered by the tests above it.
+    """
+    conversation_id = _make_group(client, ["ada", "rex"])
+
+    async def plain_reply(model, messages, tools=None, **kwargs):
+        name = "Ada" if "llama" in model else "Rex"
+        return _plain_response(f"{name} says hi.")
+
+    monkeypatch.setattr(graph_build, "call_model", plain_reply)
+
+    async def short_real_pause(seconds: float) -> None:
+        await asyncio.sleep(0.3)
+
+    monkeypatch.setattr(api, "_breathing_pause", short_real_pause)
+
+    started_at = time.monotonic()
+    res = client.post(f"/api/conversations/{conversation_id}/messages", json={"text": "@all hi broz"})
+    assert res.status_code == 201
+
+    for _ in range(100):
+        logged = events_module.read_events(conversation_id)
+        if sum(1 for e in logged if e.type == "assistant/message") >= 2:
+            break
+        time.sleep(0.05)
+
+    elapsed = time.monotonic() - started_at
+    logged = events_module.read_events(conversation_id)
+    assert sum(1 for e in logged if e.type == "assistant/message") >= 2, (
+        "both tagged personas must reply in round 1"
+    )
+    # Both legs' own real work (mocked call_model, near-instant) plus
+    # exactly one inter-leg pause (~0.3s, patched above) between them --
+    # comfortably more than scheduling overhead alone, comfortably less
+    # than two of them, so this can't pass by accident on either side.
+    assert elapsed > 0.2, (
+        "the second persona's reply landed with no measurable gap after the first -- "
+        "the inter-leg pause isn't firing"
+    )
 # decision logic, deliberately tested without spawning a real graph turn.
 # `idle_threshold=0`/a very large number is used instead of backdating
 # event timestamps or waiting real time -- events.append_event always
@@ -2685,5 +2729,27 @@ def test_no_mention_group_message_still_only_reaches_the_lead_persona(client, mo
 
 
 def test_cors_allows_the_nextjs_dev_origin(client):
-    res = client.get("/api/personas", headers={"Origin": "http://localhost:3000"})
-    assert res.headers.get("access-control-allow-origin") == "http://localhost:3000"
+    res = client.get("/api/personas", headers={"Origin": "http://localhost:3200"})
+    assert res.headers.get("access-control-allow-origin") == "http://localhost:3200"
+
+
+def test_cors_allows_additional_origins_via_env_var(monkeypatch, tmp_path, personas_dir):
+    # TAPESTRY_WEB_ORIGINS lets a deployment add reachability from another
+    # device (e.g. a phone over Tailscale) without loosening CORS to a
+    # wildcard -- see api.py's _cors_origins(). The shared `app`/`client`
+    # fixtures build the app before this test's body runs, which is too
+    # late to affect allow_origins (CORSMiddleware bakes it in once, at
+    # add_middleware() time) -- so this test builds its own app after
+    # setting the env var, same setup the `app` fixture itself does.
+    monkeypatch.setenv("TAPESTRY_DB_PATH", str(tmp_path / "tapestry.sqlite"))
+    monkeypatch.setenv("TAPESTRY_CHECKPOINT_PATH", str(tmp_path / "checkpoints.sqlite"))
+    monkeypatch.setenv("TAPESTRY_PERSONAS_DIR", str(personas_dir))
+    monkeypatch.setenv(
+        "TAPESTRY_WEB_ORIGINS", "http://localhost:3200,http://my-mac.tailnet.ts.net:3200"
+    )
+    built = asyncio.run(api.create_app())
+    with TestClient(built) as scoped_client:
+        res = scoped_client.get(
+            "/api/personas", headers={"Origin": "http://my-mac.tailnet.ts.net:3200"}
+        )
+    assert res.headers.get("access-control-allow-origin") == "http://my-mac.tailnet.ts.net:3200"

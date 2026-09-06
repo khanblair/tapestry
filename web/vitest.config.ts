@@ -22,6 +22,17 @@ export default defineConfig({
     setupFiles: ["./tests/setup.ts"],
     include: ["tests/unit/**/*.test.{ts,tsx}"],
   },
+  // NOTE: window.localStorage in jsdom needs `--no-experimental-webstorage`
+  // on the Node process running vitest (see package.json's "test" script,
+  // not settable from inside this config file since Node's flags are fixed
+  // before this file even loads). Without it, Node's own native
+  // `localStorage` global (added in recent Node versions, undefined unless
+  // `--localstorage-file` is passed) claims the global slot first and
+  // shadows jsdom's real, working implementation with `undefined` --
+  // confirmed live: `typeof window.localStorage` flips from "undefined" to
+  // "object" purely from that one flag, jsdom's own code untouched. Hit
+  // this via RosterList.test.tsx being the first test in this project to
+  // actually touch window.localStorage.
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "."),

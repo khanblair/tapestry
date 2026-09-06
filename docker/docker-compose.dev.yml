@@ -56,20 +56,24 @@ services:
     env_file:
       - ../.env
     ports:
-      - "3000:3000"
+      - "3200:3200"
     volumes:
       - ../web:/app
       - /app/node_modules # anonymous volume: same trick, for pnpm's install
       - /app/.next # anonymous volume: Next's own build cache, not host-shared
     environment:
-      # NEXT_PUBLIC_API_URL is what the BROWSER uses (published port on the
-      # host). INTERNAL_API_URL is what server-rendered pages use instead,
-      # read from inside this container -- "localhost" there is this
-      # container's own loopback, not the backend container. Without this,
-      # every server-rendered page (the roster sidebar, the conversation
-      # view) silently fell back to lib/mockData.ts's fixtures, since their
-      # fetch to the backend simply failed. See web/lib/api.ts's comment.
-      NEXT_PUBLIC_API_URL: http://localhost:8420
+      # INTERNAL_API_URL is what server-rendered pages use, read from
+      # inside this container -- "localhost" there is this container's own
+      # loopback, not the backend container. Without this, every
+      # server-rendered page (the roster sidebar, the conversation view)
+      # silently fell back to lib/mockData.ts's fixtures, since their
+      # fetch to the backend simply failed.
+      #
+      # The BROWSER deliberately gets no NEXT_PUBLIC_API_URL here: it
+      # derives the API's address at runtime from whatever host the page
+      # was loaded from (see web/lib/api.ts's resolveApiUrl()), so the
+      # same built image works from localhost, a LAN IP, or a Tailscale
+      # hostname on a phone -- no per-device config.
       INTERNAL_API_URL: http://backend:8420
     depends_on:
       - backend

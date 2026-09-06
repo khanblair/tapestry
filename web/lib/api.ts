@@ -260,19 +260,36 @@ export async function getStatus(): Promise<SystemStatus> {
 // Server-rendered pages (app/**/page.tsx Server Components) run this
 // module inside the Node process — under Docker that's a SEPARATE
 // container from the browser, so "localhost" means something different in
-// each: to the browser it's the host machine (where the backend's port is
-// published), to the server-side Node process it's that container's own
-// loopback, which the backend container is not on. INTERNAL_API_URL (not
-// NEXT_PUBLIC_-prefixed, so Next.js never inlines it into the client
-// bundle) lets Docker Compose point server-side fetches at the backend
-// service's Compose-internal DNS name, while the browser keeps using
-// NEXT_PUBLIC_API_URL. Outside Docker (native dev, or any single-host
-// setup) the two are simply the same value, so this falls back to
-// NEXT_PUBLIC_API_URL when INTERNAL_API_URL isn't set.
-const API_URL =
-  typeof window === "undefined"
-    ? (process.env.INTERNAL_API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "")
-    : (process.env.NEXT_PUBLIC_API_URL ?? "");
+// each: to the browser it's whatever host the page was loaded from, to the
+// server-side Node process it's that container's own loopback, which the
+// backend container is not on. INTERNAL_API_URL (not NEXT_PUBLIC_-prefixed,
+// so Next.js never inlines it into the client bundle) lets Docker Compose
+// point server-side fetches at the backend service's Compose-internal DNS
+// name.
+//
+// The browser side is resolved DYNAMICALLY at runtime rather than baked in
+// at build time: NEXT_PUBLIC_* vars get inlined into the bundle by
+// `next build`, so a hardcoded NEXT_PUBLIC_API_URL only ever works from
+// whichever single host it was built for. Deriving it instead from
+// `window.location` -- same host the page was actually loaded from, on the
+// backend's port -- means the same build works whether you're on
+// http://localhost:3200, a LAN IP, or a Tailscale hostname on your phone,
+// with zero per-device config. An explicit NEXT_PUBLIC_API_URL still wins
+// when set, for deployments where the API genuinely lives on a different
+// host/domain than the web app (e.g. behind separate reverse-proxy
+// subdomains).
+function resolveApiUrl(): string {
+  if (typeof window === "undefined") {
+    return process.env.INTERNAL_API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "";
+  }
+  if (process.env.NEXT_PUBLIC_API_URL) {
+    return process.env.NEXT_PUBLIC_API_URL;
+  }
+  const port = process.env.NEXT_PUBLIC_API_PORT || "8420";
+  return `${window.location.protocol}//${window.location.hostname}:${port}`;
+}
+
+export const API_URL = resolveApiUrl();
 
 class ApiError extends Error {
   status: number;

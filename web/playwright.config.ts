@@ -7,11 +7,11 @@ export default defineConfig({
   testDir: "./tests/e2e",
   webServer: {
     command: "pnpm dev",
-    url: "http://localhost:3000",
+    url: "http://localhost:3200",
     reuseExistingServer: !process.env.CI,
   },
   use: {
-    baseURL: "http://localhost:3000",
+    baseURL: "http://localhost:3200",
   },
   projects: [
     { name: "mobile", use: { ...devices["iPhone 13"], viewport: { width: 390, height: 844 } } },

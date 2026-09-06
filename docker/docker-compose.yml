@@ -39,16 +39,18 @@ services:
     env_file:
       - ../.env
     ports:
-      - "3000:3000"
+      - "3200:3200"
     environment:
-      # NEXT_PUBLIC_API_URL is what the BROWSER uses (published port on the
-      # host) -- the Docker-internal "backend" hostname doesn't resolve
-      # from outside the Compose network. INTERNAL_API_URL is what
-      # server-rendered pages use instead, from inside this container --
-      # see web/lib/api.ts's own comment for the full explanation. Setting
-      # NEXT_PUBLIC_API_URL to the internal hostname (as this file
-      # previously did) broke every browser-side fetch.
-      NEXT_PUBLIC_API_URL: http://localhost:8420
+      # INTERNAL_API_URL is what server-rendered pages use, from inside
+      # this container -- the Docker-internal "backend" hostname doesn't
+      # resolve from outside the Compose network. The BROWSER gets no
+      # NEXT_PUBLIC_API_URL: it derives the API's address at runtime from
+      # whatever host the page was loaded from (see web/lib/api.ts's
+      # resolveApiUrl()), so the same built image is reachable from
+      # localhost, a LAN IP, or a Tailscale hostname on a phone with no
+      # per-device config. A build-time NEXT_PUBLIC_API_URL wouldn't take
+      # effect here anyway -- `next build` runs during `docker build`,
+      # before this environment block ever applies.
       INTERNAL_API_URL: http://backend:8420
     depends_on:
       - backend

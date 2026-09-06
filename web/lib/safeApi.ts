@@ -8,6 +8,7 @@
 // to calling lib/api.ts directly.
 
 import {
+  API_URL,
   getConversations as apiGetConversations,
   getPersonas as apiGetPersonas,
   getMessages as apiGetMessages,
@@ -177,7 +178,6 @@ export function personaOrYou(actor: string, personas: Map<string, Persona>): Per
 // failure (no backend reachable) so the Activity screen's button stays
 // visually functional rather than throwing.
 export async function pauseAllAgents(): Promise<void> {
-  const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
   try {
     await fetch(`${API_URL}/api/agents/pause-all`, { method: "POST", signal: AbortSignal.timeout(2000) });
   } catch {

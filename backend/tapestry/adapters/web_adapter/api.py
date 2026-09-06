@@ -209,7 +209,7 @@ _DEFAULT_PERSONAS_DIR = _REPO_ROOT / "personas"
 
 PERSONAS_DIR_ENV_VAR = "TAPESTRY_PERSONAS_DIR"
 CORS_ORIGINS_ENV_VAR = "TAPESTRY_WEB_ORIGINS"
-DEFAULT_CORS_ORIGIN = "http://localhost:3000"
+DEFAULT_CORS_ORIGIN = "http://localhost:3200"
 
 
 def _personas_dir() -> str:
@@ -1554,12 +1554,27 @@ def _spawn_turn(
 # and confirmed for this feature.
 MAX_CONTINUATION_ROUNDS = 10
 
-# Pause BETWEEN continuation rounds (never within round 1, which stays the
-# immediate, mandatory reply to being tagged) — see `_breathing_pause`'s
+# Pause BETWEEN continuation rounds as a whole (round 1 itself is always
+# the immediate, mandatory reply to being tagged — see `_breathing_pause`'s
 # own docstring for why this exists and how it's distinct from `graph.
-# build`'s own per-reply pacing delay.
+# build`'s own per-reply pacing delay). Distinct from `_MIN_LEG_PAUSE_
+# SECONDS` below, which paces between individual legs WITHIN one round.
 _MIN_CONTINUATION_PAUSE_SECONDS = 3.0
 _MAX_CONTINUATION_PAUSE_SECONDS = 8.0
+
+# Found live: a single @all message that mentions multiple personas got
+# each one's own "typing time" (graph.build._reply_delay_seconds, applied
+# to that persona's OWN reply) but nothing between them -- one persona's
+# turn/end flowed straight into the next persona's turn/start with only
+# scheduling overhead in between (tens of milliseconds), so two or three
+# individually-paced replies still landed as one instant burst. This is
+# deliberately smaller than the inter-ROUND pause above: that one gives the
+# human room to type a follow-up between full autonomous rounds; this one
+# only spaces out different people's replies to the SAME trigger, within
+# one round -- round 1 is still the mandatory, prompt reply to being
+# tagged, just not a simultaneous one when more than one persona is tagged.
+_MIN_LEG_PAUSE_SECONDS = 1.5
+_MAX_LEG_PAUSE_SECONDS = 4.0
 
 
 async def _breathing_pause(seconds: float) -> None:
@@ -1623,6 +1638,11 @@ async def _run_fanout_round(
     before starting the next, with no separate concurrency primitive
     needed.
 
+    Also paced with a short `_breathing_pause` before every leg after the
+    first (see `_MIN_LEG_PAUSE_SECONDS` above) — without it, several
+    individually "typed" replies still land back to back with nothing but
+    scheduling overhead between them.
+
     `round_num == 1` is always the mandatory, immediate reply to being
     tagged — every other round is an autonomous continuation
     (`is_continuation_round=True`), which is also the only round `pass_
@@ -1640,7 +1660,11 @@ async def _run_fanout_round(
     """
     replied: list[str] = []
     is_continuation_round = round_num > 1
-    for persona_id in persona_ids:
+    for index, persona_id in enumerate(persona_ids):
+        if index > 0:
+            await _breathing_pause(
+                random.uniform(_MIN_LEG_PAUSE_SECONDS, _MAX_LEG_PAUSE_SECONDS)
+            )
         suffix = "" if round_num == 1 else f"::r{round_num}"
         graph_thread_id = f"{conversation_id}::mention::{persona_id}::{trigger_message_id}{suffix}"
         state = graph_build.new_state(
